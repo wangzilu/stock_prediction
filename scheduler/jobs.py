@@ -2,51 +2,90 @@ import logging
 from datetime import datetime
 
 from data.collectors.market import MarketCollector
+from data.collectors.crypto import CryptoCollector
+from data.collectors.gold import GoldCollector
 from data.collectors.sentiment import SentimentCollector
 from factors.sentiment import SentimentScorer
 from signals.scorer import SignalScorer
 from push.wechat import WeChatPusher
 from tracker.verifier import Verifier
-from config.watchlist import WATCHLIST, to_akshare_code
+from config.watchlist import (
+    WATCHLIST, MARKET_STOCK, MARKET_CRYPTO, MARKET_GOLD,
+    to_akshare_code,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class DailyPipeline:
-    """Orchestrates the daily recommendation pipeline."""
+    """Orchestrates the daily recommendation pipeline for all markets."""
 
     def __init__(self):
         self.market_collector = MarketCollector()
+        self.crypto_collector = CryptoCollector()
+        self.gold_collector = GoldCollector()
         self.sentiment_collector = SentimentCollector()
         self.sentiment_scorer = SentimentScorer()
         self.signal_scorer = SignalScorer()
         self.pusher = WeChatPusher()
         self.verifier = Verifier()
 
+    def _get_quote(self, code, market):
+        """Get realtime quote based on market type."""
+        if market == MARKET_STOCK:
+            return self.market_collector.fetch_realtime(to_akshare_code(code))
+        elif market == MARKET_CRYPTO:
+            return self.crypto_collector.fetch_realtime(code)
+        elif market == MARKET_GOLD:
+            return self.gold_collector.fetch_realtime()
+        return {}
+
+    def _get_daily(self, code, market, days=10):
+        """Get daily data based on market type."""
+        if market == MARKET_STOCK:
+            return self.market_collector.fetch_daily(to_akshare_code(code), days)
+        elif market == MARKET_CRYPTO:
+            return self.crypto_collector.fetch_daily(code, days)
+        elif market == MARKET_GOLD:
+            return self.gold_collector.fetch_daily(days)
+        return __import__("pandas").DataFrame()
+
+    def _market_label(self, market):
+        """Get display label for market type."""
+        return {
+            MARKET_STOCK: "A股",
+            MARKET_CRYPTO: "加密货币",
+            MARKET_GOLD: "黄金",
+        }.get(market, "")
+
     def run_daily_recommendation(self):
-        """Run the full daily recommendation pipeline at 14:00."""
+        """Run the full daily recommendation pipeline."""
         logger.info("Starting daily recommendation pipeline...")
         today = datetime.now().strftime("%Y-%m-%d")
         recommendations = []
 
-        for qlib_code, name in WATCHLIST:
+        for code, name, market in WATCHLIST:
             try:
-                ak_code = to_akshare_code(qlib_code)
-                quote = self.market_collector.fetch_realtime(ak_code)
+                quote = self._get_quote(code, market)
                 if not quote:
-                    logger.warning(f"No market data for {qlib_code}, skipping")
+                    logger.warning(f"No market data for {code} ({market}), skipping")
                     continue
 
-                posts = self.sentiment_collector.fetch_all(qlib_code, limit_per_source=20)
-                sentiment = self.sentiment_scorer.score_batch(posts)
+                # Sentiment (only for stocks; crypto/gold use price-only signal)
+                if market == MARKET_STOCK:
+                    posts = self.sentiment_collector.fetch_all(code, limit_per_source=20)
+                    sentiment = self.sentiment_scorer.score_batch(posts)
+                else:
+                    sentiment = {"sentiment_score": 0.0, "heat": 0.0, "post_count": 0}
 
                 # MVP: use price change as model score proxy
                 model_score = quote.get("change_pct", 0) / 10
 
+                display_name = f"[{self._market_label(market)}] {name}"
                 rec = self.signal_scorer.score_stock(
-                    code=qlib_code,
-                    name=name,
+                    code=code,
+                    name=display_name,
                     model_score=model_score,
                     sentiment_score=sentiment["sentiment_score"],
                     sentiment_heat=sentiment["heat"],
@@ -54,7 +93,7 @@ class DailyPipeline:
                 recommendations.append(rec)
 
             except Exception as e:
-                logger.error(f"Error processing {qlib_code}: {e}")
+                logger.error(f"Error processing {code}: {e}")
                 continue
 
         recommendations.sort(key=lambda r: r.final_score, reverse=True)
@@ -69,9 +108,11 @@ class DailyPipeline:
         success = self.pusher.send_recommendation(report)
         logger.info(f"Push {'success' if success else 'failed'}: {len(top_recs)} recommendations")
 
+        # Record for verification
         for rec in top_recs:
-            ak_code = to_akshare_code(rec.code)
-            quote = self.market_collector.fetch_realtime(ak_code)
+            # Find market type for this code
+            market = next((m for c, n, m in WATCHLIST if c == rec.code), MARKET_STOCK)
+            quote = self._get_quote(rec.code, market)
             price = quote.get("price") if quote else None
 
             self.verifier.record_recommendation(
@@ -96,8 +137,9 @@ class DailyPipeline:
 
         for rec in due:
             try:
-                ak_code = to_akshare_code(rec["code"])
-                df = self.market_collector.fetch_daily(ak_code, days=10)
+                code = rec["code"]
+                market = next((m for c, n, m in WATCHLIST if c == code), MARKET_STOCK)
+                df = self._get_daily(code, market, days=10)
 
                 if df.empty:
                     continue
