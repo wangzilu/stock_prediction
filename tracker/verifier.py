@@ -50,7 +50,7 @@ class Verifier:
         """Record a new recommendation."""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
-                """INSERT OR REPLACE INTO recommendations
+                """INSERT OR IGNORE INTO recommendations
                    (rec_date, code, name, signal, score, price_at_rec)
                    VALUES (?, ?, ?, ?, ?, ?)""",
                 (date_str, code, name, signal, score, price_at_rec),
@@ -171,8 +171,10 @@ class Verifier:
 
         for i, rec in enumerate(verified, 1):
             result_icon = "✅" if rec["is_correct"] else "❌"
+            code = rec['code']
+            display_code = code[2:] if code[:2] in ("SH", "SZ") else code
             lines.append(
-                f"{i}. {rec['name']}({rec['code'][2:]}) | 推荐{rec['signal']}"
+                f"{i}. {rec['name']}({display_code}) | 推荐{rec['signal']}"
             )
             lines.append(
                 f"   结果：{rec['return_pct']:+.1f}% {result_icon} | "

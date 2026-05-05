@@ -7,7 +7,7 @@ from qlib.contrib.model.gbdt import LGBModel
 from qlib.utils import init_instance_by_config
 
 from config.settings import QLIB_PROVIDER_URI, PREDICTION_HORIZON_DAYS, TOP_K_STOCKS
-from config.watchlist import WATCHLIST
+from config.watchlist import WATCHLIST_STOCK
 
 
 class ShortTermModel:
@@ -110,8 +110,8 @@ class ShortTermModel:
         latest_date = predictions.index.get_level_values(0).max()
         latest_preds = predictions.loc[latest_date]
 
-        watchlist_codes = {code for code, _ in WATCHLIST}
-        watchlist_map = {code: name for code, name in WATCHLIST}
+        watchlist_codes = {code for code, _ in WATCHLIST_STOCK}
+        watchlist_map = {code: name for code, name in WATCHLIST_STOCK}
 
         results = []
         for code in latest_preds.index:

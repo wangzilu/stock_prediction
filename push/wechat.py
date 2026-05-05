@@ -16,7 +16,7 @@ class WeChatPusher:
                 "Pushplus token is required. "
                 "Set PUSHPLUS_TOKEN environment variable or pass token."
             )
-        self.url = "http://www.pushplus.plus/send"
+        self.url = "https://www.pushplus.plus/send"
 
     def _build_payload(self, content: str, title: str = "股票信号") -> dict:
         """Build pushplus message payload."""

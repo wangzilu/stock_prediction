@@ -103,8 +103,10 @@ class SignalScorer:
 
         for i, rec in enumerate(recommendations, 1):
             score_display = round((rec.final_score + 1) * 5, 1)
+            # Stock codes like SH600519 -> 600519; crypto/gold codes stay as-is
+            display_code = rec.code[2:] if rec.code[:2] in ("SH", "SZ") else rec.code
             lines.append(
-                f"{i}. {rec.name}({rec.code[2:]}) | {rec.signal} | 评分 {score_display}"
+                f"{i}. {rec.name}({display_code}) | {rec.signal} | 评分 {score_display}"
             )
             lines.append(f"   理由：{rec.reason}")
 
