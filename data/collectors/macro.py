@@ -42,6 +42,15 @@ RSS_FEEDS = {
     "us_stocks": "https://news.google.com/rss/search?q=S%26P500+OR+nasdaq+OR+dow+jones+OR+wall+street+OR+US+stock+market&hl=en",
     "europe_stocks": "https://news.google.com/rss/search?q=FTSE+OR+DAX+OR+european+stocks+OR+stoxx&hl=en",
     "asia_stocks": "https://news.google.com/rss/search?q=nikkei+OR+hang+seng+OR+kospi+OR+asia+stocks+OR+asia+markets&hl=en",
+
+    # Top economists & analysts commentary
+    "economist_views": "https://news.google.com/rss/search?q=economist+forecast+OR+analyst+predict+OR+market+outlook+OR+goldman+sachs+OR+morgan+stanley&hl=en",
+    "imf_worldbank": "https://news.google.com/rss/search?q=IMF+OR+world+bank+OR+global+growth+forecast+OR+OECD+outlook&hl=en",
+
+    # Financial media with analyst commentary
+    "bloomberg_views": "https://news.google.com/rss/search?q=site:bloomberg.com+analysis+OR+outlook+OR+forecast&hl=en",
+    "ft_analysis": "https://news.google.com/rss/search?q=site:ft.com+analysis+OR+outlook+OR+economist&hl=en",
+    "reuters_analysis": "https://news.google.com/rss/search?q=site:reuters.com+analysis+OR+forecast+OR+outlook&hl=en",
 }
 
 
