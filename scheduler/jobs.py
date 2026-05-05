@@ -117,28 +117,39 @@ class DailyPipeline:
                 else:
                     sentiment = {"sentiment_score": 0.0, "heat": 0.0, "post_count": 0}
 
-                # Model score: price change as base, adjusted by geo factors
-                model_score = quote.get("change_pct", 0) / 10
+                # Short-term score: price change as proxy
+                short_score = quote.get("change_pct", 0) / 10
 
-                # Adjust model score with geopolitical context
+                # Mid-term score: try LSTM model if price history available
+                mid_score = 0.0
+                try:
+                    df = self._get_daily(code, market, days=30)
+                    if not df.empty and len(df) >= 20:
+                        from models.mid_term import MidTermModel
+                        mid_model = MidTermModel(lookback_days=20)
+                        pred = mid_model.predict(df)
+                        mid_score = pred.get("trend_score", 0.0)
+                except Exception:
+                    pass
+
+                # Macro score: composite from geo factors
+                macro_score = 0.0
                 if market == MARKET_GOLD:
-                    # Gold benefits from safe haven demand
-                    model_score += geo["safe_haven_signal"] * 0.3
+                    macro_score = geo["safe_haven_signal"] * 2 - 1  # [0,1] -> [-1,1]
                 elif market == MARKET_STOCK:
-                    # A-shares affected by China-US relations and policy
-                    model_score += geo["china_us_temperature"] * 0.1
-                    model_score += geo["policy_signal"] * 0.1
+                    macro_score = (geo["china_us_temperature"] + geo["policy_signal"]) / 2
                 elif market == MARKET_CRYPTO:
-                    # Crypto affected by overall risk appetite
-                    model_score += geo["geo_risk_index"] * 0.1
+                    macro_score = geo["geo_risk_index"]
 
                 display_name = f"[{self._market_label(market)}] {name}"
                 rec = self.signal_scorer.score_stock(
                     code=code,
                     name=display_name,
-                    model_score=model_score,
+                    model_score=short_score,
                     sentiment_score=sentiment["sentiment_score"],
                     sentiment_heat=sentiment["heat"],
+                    mid_term_score=mid_score,
+                    macro_score=macro_score,
                 )
                 recommendations.append(rec)
 

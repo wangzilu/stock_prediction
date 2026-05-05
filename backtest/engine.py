@@ -115,6 +115,11 @@ class BacktestEngine:
         trades = []
         daily_returns = []
 
+        # Pre-compute date string sets per stock for O(1) lookup
+        stock_date_sets = {}
+        for code, df in price_data.items():
+            stock_date_sets[code] = set(df.index.strftime("%Y-%m-%d"))
+
         # Iterate through tradeable dates
         for i in range(lookback, len(all_dates) - self.holding_days):
             current_date = all_dates[i]
@@ -123,12 +128,11 @@ class BacktestEngine:
             # Generate signals for all stocks on this date
             signals = []
             for code, df in price_data.items():
-                if current_date not in df.index.strftime("%Y-%m-%d").tolist():
+                if current_date not in stock_date_sets[code]:
                     continue
 
                 # Get data up to current date
-                mask = df.index.strftime("%Y-%m-%d") <= current_date
-                history = df[mask]
+                history = df[df.index <= pd.Timestamp(current_date)]
 
                 if len(history) < lookback:
                     continue
@@ -145,11 +149,14 @@ class BacktestEngine:
             day_return = 0.0
             for code, score, entry_price in top_signals:
                 df = price_data[code]
-                exit_mask = df.index.strftime("%Y-%m-%d") == exit_date
-                if not exit_mask.any():
+                if exit_date not in stock_date_sets[code]:
                     continue
 
-                exit_price = df[exit_mask].iloc[0]["close"]
+                exit_row = df[df.index == pd.Timestamp(exit_date)]
+                if exit_row.empty:
+                    continue
+
+                exit_price = exit_row.iloc[0]["close"]
 
                 # Long if score > 0, short if score < 0
                 if score > 0:

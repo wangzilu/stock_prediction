@@ -9,9 +9,6 @@ Usage:
 """
 import sys
 import logging
-from apscheduler.schedulers.blocking import BlockingScheduler
-from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,6 +44,9 @@ def main():
         return
 
     # Default: start scheduler
+    from apscheduler.schedulers.blocking import BlockingScheduler
+    from apscheduler.triggers.cron import CronTrigger
+
     scheduler = BlockingScheduler()
 
     # Daily recommendation at 14:00 on weekdays

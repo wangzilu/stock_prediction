@@ -88,14 +88,12 @@ class MidTermModel:
         self.model = LSTMAttention(input_size=len(self.FEATURE_NAMES))
         self.model_path = model_path
 
-        if model_path and Path(model_path).exists():
-            self.model.load_state_dict(torch.load(model_path, map_location="cpu"))
-            self.model.eval()
-            logger.info(f"Loaded model from {model_path}")
-
         # Feature normalization stats (updated during training)
         self._feature_means = None
         self._feature_stds = None
+
+        if model_path and Path(model_path).exists():
+            self.load(model_path)
 
     def prepare_features(
         self,
