@@ -90,9 +90,11 @@ class DailyPipeline:
 
         # Filter for conflict-related and china-us-related
         conflict_keywords = {"war", "conflict", "attack", "missile", "iran", "russia", "ukraine",
-                            "military", "strike", "bomb", "nuclear", "hormuz", "blockade", "invasion"}
+                            "military", "strike", "bomb", "nuclear", "hormuz", "blockade", "invasion",
+                            "israel", "gaza", "hezbollah", "taiwan", "strait", "escalat", "crisis"}
         china_us_keywords = {"china", "chinese", "trump", "beijing", "tariff", "trade war",
-                            "xi jinping", "us-china", "sino"}
+                            "xi jinping", "us-china", "sino", "decoupl", "eu tariff",
+                            "sanction", "export ban", "trade deal"}
 
         conflict_articles = [
             a for a in news_as_articles

@@ -5,19 +5,43 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-# RSS feed sources — global mainstream media + policy
+# RSS feed sources — global mainstream media + policy + geopolitics
 RSS_FEEDS = {
     # Central banks
     "fed": "https://www.federalreserve.gov/feeds/press_all.xml",
-    # Google News aggregations (reliable, fast, multi-source)
-    "geopolitics": "https://news.google.com/rss/search?q=war+OR+conflict+OR+military+OR+sanctions+OR+missile&hl=en",
-    "china_us": "https://news.google.com/rss/search?q=china+US+OR+trump+china+OR+trade+war+OR+tariff&hl=en",
-    "markets": "https://news.google.com/rss/search?q=federal+reserve+OR+central+bank+OR+interest+rate+OR+inflation&hl=en",
-    "china_economy": "https://news.google.com/rss/search?q=china+economy+OR+PBOC+OR+yuan+OR+A-shares&hl=en",
-    "middle_east": "https://news.google.com/rss/search?q=iran+OR+israel+OR+hormuz+OR+middle+east+conflict&hl=en",
-    "russia_ukraine": "https://news.google.com/rss/search?q=russia+ukraine+war+OR+zelensky+OR+putin&hl=en",
-    "gold_oil": "https://news.google.com/rss/search?q=gold+price+OR+oil+price+OR+crude+OR+safe+haven&hl=en",
-    "crypto_macro": "https://news.google.com/rss/search?q=bitcoin+OR+crypto+regulation+OR+SEC+crypto&hl=en",
+
+    # Geopolitics & conflicts
+    "russia_ukraine": "https://news.google.com/rss/search?q=russia+ukraine+war+OR+zelensky+OR+putin+offensive&hl=en",
+    "middle_east": "https://news.google.com/rss/search?q=iran+OR+israel+OR+hormuz+strait+OR+gaza+OR+hezbollah&hl=en",
+    "taiwan_strait": "https://news.google.com/rss/search?q=taiwan+strait+OR+taiwan+military+OR+china+taiwan+tension&hl=en",
+    "global_conflict": "https://news.google.com/rss/search?q=war+OR+military+strike+OR+missile+OR+nuclear+threat+OR+invasion&hl=en",
+
+    # Trade & tariffs
+    "trade_war": "https://news.google.com/rss/search?q=tariff+OR+trade+war+OR+EU+tariff+OR+trade+sanction+OR+export+ban&hl=en",
+    "china_us": "https://news.google.com/rss/search?q=china+US+relations+OR+trump+china+OR+trump+xi+OR+decoupling&hl=en",
+
+    # Macro & policy
+    "central_banks": "https://news.google.com/rss/search?q=federal+reserve+OR+ECB+OR+BOJ+OR+PBOC+OR+interest+rate+decision&hl=en",
+    "inflation": "https://news.google.com/rss/search?q=inflation+OR+CPI+OR+recession+OR+economic+slowdown&hl=en",
+    "china_economy": "https://news.google.com/rss/search?q=china+economy+OR+china+GDP+OR+yuan+OR+A-shares+OR+CSI300&hl=en",
+
+    # Safe haven & commodities
+    "gold_oil": "https://news.google.com/rss/search?q=gold+price+OR+oil+price+OR+crude+brent+OR+safe+haven+OR+commodity&hl=en",
+    "crypto_macro": "https://news.google.com/rss/search?q=bitcoin+OR+crypto+regulation+OR+stablecoin+OR+digital+currency&hl=en",
+
+    # EU & global trade
+    "eu_policy": "https://news.google.com/rss/search?q=EU+tariff+OR+european+union+trade+OR+EU+sanction+OR+euro+economy&hl=en",
+
+    # Japan & Asia
+    "japan_asia": "https://news.google.com/rss/search?q=japan+china+relations+OR+BOJ+OR+yen+OR+asia+pacific+trade&hl=en",
+
+    # Global diplomacy
+    "diplomacy": "https://news.google.com/rss/search?q=G7+OR+G20+OR+summit+OR+bilateral+OR+diplomatic+OR+UN+security+council&hl=en",
+
+    # Global stock markets (impact on A-shares)
+    "us_stocks": "https://news.google.com/rss/search?q=S%26P500+OR+nasdaq+OR+dow+jones+OR+wall+street+OR+US+stock+market&hl=en",
+    "europe_stocks": "https://news.google.com/rss/search?q=FTSE+OR+DAX+OR+european+stocks+OR+stoxx&hl=en",
+    "asia_stocks": "https://news.google.com/rss/search?q=nikkei+OR+hang+seng+OR+kospi+OR+asia+stocks+OR+asia+markets&hl=en",
 }
 
 
