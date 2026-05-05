@@ -51,39 +51,50 @@ class GeopoliticalScorer:
         if not conflict_articles:
             return 0.0
 
-        # Average tone from GDELT (already ranges roughly -10 to +10)
         tones = []
         risk_count = 0
 
         for article in conflict_articles:
             tone = article.get("tone", 0)
-            if isinstance(tone, (int, float)):
+            if isinstance(tone, (int, float)) and tone != 0:
                 tones.append(tone)
 
             title = str(article.get("title", "")).lower()
             if any(kw in title for kw in self.RISK_KEYWORDS):
                 risk_count += 1
 
-        if not tones:
-            return 0.0
-
-        # Normalize average tone from [-10, 10] to [-1, 1]
-        avg_tone = np.mean(tones)
-        tone_score = float(np.clip(avg_tone / 10.0, -1.0, 1.0))
-
         # Risk keyword density (0 to 1, higher = more risk)
         risk_density = min(risk_count / max(len(conflict_articles), 1), 1.0)
 
-        # Combine: more negative tone + more risk keywords = lower score
-        score = tone_score * 0.6 + (1.0 - risk_density * 2) * 0.4
+        if tones:
+            # If we have tone data (GDELT), use weighted combo
+            avg_tone = np.mean(tones)
+            tone_score = float(np.clip(avg_tone / 10.0, -1.0, 1.0))
+            score = tone_score * 0.6 + (1.0 - risk_density * 2) * 0.4
+        else:
+            # No tone data (RSS): rely purely on keyword density
+            # More conflict keywords = more risk = more negative
+            score = 1.0 - risk_density * 2  # density=0 → 1.0, density=1 → -1.0
+
         return float(np.clip(score, -1.0, 1.0))
+
+    # Keywords for China-US sentiment analysis
+    CHINA_US_HOSTILE = {
+        "tariff", "trade war", "sanction", "ban", "restrict", "decouple",
+        "military", "tension", "threat", "retaliate", "blacklist",
+        "制裁", "贸易战", "脱钩", "对抗", "威胁",
+    }
+    CHINA_US_FRIENDLY = {
+        "deal", "agreement", "cooperat", "talk", "meeting", "visit",
+        "dialogue", "negotiat", "progress", "partner", "resume",
+        "合作", "会谈", "访问", "对话", "协议", "缓和",
+    }
 
     def compute_china_us_temperature(self, relation_articles: list) -> float:
         """Compute China-US relations temperature.
 
         Args:
             relation_articles: List of dicts with 'title' and 'tone' keys
-                              (from GDELTCollector.fetch_china_us_relations)
 
         Returns:
             Float from -1 (very hostile) to 1 (very cooperative).
@@ -91,17 +102,29 @@ class GeopoliticalScorer:
         if not relation_articles:
             return 0.0
 
-        tones = []
+        # If tone data is available and non-zero, use it
+        tones = [a.get("tone", 0) for a in relation_articles
+                 if isinstance(a.get("tone"), (int, float)) and a.get("tone") != 0]
+        if tones:
+            avg_tone = np.mean(tones)
+            return float(np.clip(avg_tone / 10.0, -1.0, 1.0))
+
+        # Otherwise: keyword-based analysis
+        hostile_count = 0
+        friendly_count = 0
         for article in relation_articles:
-            tone = article.get("tone", 0)
-            if isinstance(tone, (int, float)):
-                tones.append(tone)
+            title = str(article.get("title", "")).lower()
+            desc = str(article.get("description", "")).lower()
+            text = title + " " + desc
+            if any(kw in text for kw in self.CHINA_US_HOSTILE):
+                hostile_count += 1
+            if any(kw in text for kw in self.CHINA_US_FRIENDLY):
+                friendly_count += 1
 
-        if not tones:
+        total = hostile_count + friendly_count
+        if total == 0:
             return 0.0
-
-        avg_tone = np.mean(tones)
-        return float(np.clip(avg_tone / 10.0, -1.0, 1.0))
+        return float(np.clip((friendly_count - hostile_count) / total, -1.0, 1.0))
 
     def compute_policy_signal(self, macro_news: list) -> float:
         """Compute central bank policy direction signal.

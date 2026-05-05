@@ -5,10 +5,9 @@ from data.collectors.market import MarketCollector
 from data.collectors.crypto import CryptoCollector
 from data.collectors.gold import GoldCollector
 from data.collectors.sentiment import SentimentCollector
-from data.collectors.gdelt import GDELTCollector
 from data.collectors.macro import MacroCollector
-from factors.sentiment import SentimentScorer
 from factors.geopolitical import GeopoliticalScorer
+from factors.sentiment import SentimentScorer
 from signals.scorer import SignalScorer
 from signals.risk_monitor import RiskMonitor
 from push.wechat import WeChatPusher
@@ -30,7 +29,6 @@ class DailyPipeline:
         self.crypto_collector = CryptoCollector()
         self.gold_collector = GoldCollector()
         self.sentiment_collector = SentimentCollector()
-        self.gdelt_collector = GDELTCollector()
         self.macro_collector = MacroCollector()
         self.sentiment_scorer = SentimentScorer()
         self.geo_scorer = GeopoliticalScorer()
@@ -72,25 +70,46 @@ class DailyPipeline:
         }.get(market, "")
 
     def _fetch_geo_factors(self):
-        """Fetch and compute geopolitical factors (once per run)."""
+        """Fetch geopolitical factors from RSS news analysis (once per run)."""
         if self._geo_factors is not None:
             return self._geo_factors
 
-        logger.info("Fetching geopolitical data...")
-        conflict_articles = self.gdelt_collector.fetch_geopolitical_conflicts(days=3)
-        relation_articles = self.gdelt_collector.fetch_china_us_relations(days=3)
-        macro_news = self.macro_collector.fetch_all(max_per_source=10)
+        logger.info("Fetching geopolitical factors from RSS news...")
 
-        # Convert DataFrames to list of dicts for scorer
-        conflicts = conflict_articles.to_dict("records") if hasattr(conflict_articles, "to_dict") and not conflict_articles.empty else []
-        relations = relation_articles.to_dict("records") if hasattr(relation_articles, "to_dict") and not relation_articles.empty else []
+        # Collect news from all RSS sources
+        all_news = self.macro_collector.fetch_all(max_per_source=15)
+        logger.info(f"Fetched {len(all_news)} news items from RSS")
+
+        # Use GeopoliticalScorer to analyze the news headlines
+        # Treat RSS news as both "conflict articles" and "macro news"
+        # since they contain mixed geopolitical + economic content
+        news_as_articles = [
+            {"title": item.get("title", ""), "tone": 0, "description": item.get("description", "")}
+            for item in all_news
+        ]
+
+        # Filter for conflict-related and china-us-related
+        conflict_keywords = {"war", "conflict", "attack", "missile", "iran", "russia", "ukraine",
+                            "military", "strike", "bomb", "nuclear", "hormuz", "blockade", "invasion"}
+        china_us_keywords = {"china", "chinese", "trump", "beijing", "tariff", "trade war",
+                            "xi jinping", "us-china", "sino"}
+
+        conflict_articles = [
+            a for a in news_as_articles
+            if any(kw in a["title"].lower() for kw in conflict_keywords)
+        ]
+        china_us_articles = [
+            a for a in news_as_articles
+            if any(kw in a["title"].lower() for kw in china_us_keywords)
+        ]
 
         self._geo_factors = self.geo_scorer.compute_all_factors(
-            conflict_articles=conflicts,
-            relation_articles=relations,
-            macro_news=macro_news,
+            conflict_articles=conflict_articles,
+            relation_articles=china_us_articles,
+            macro_news=all_news,
         )
         logger.info(f"Geo factors: {self._geo_factors}")
+        logger.info(f"  Conflict news: {len(conflict_articles)}, China-US news: {len(china_us_articles)}")
         return self._geo_factors
 
     def run_daily_recommendation(self):

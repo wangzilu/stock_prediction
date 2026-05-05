@@ -5,12 +5,19 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-# RSS feed sources for macro/policy news
+# RSS feed sources — global mainstream media + policy
 RSS_FEEDS = {
+    # Central banks
     "fed": "https://www.federalreserve.gov/feeds/press_all.xml",
-    "pboc": "http://www.pbc.gov.cn/rss/zhengcehuobisi.xml",
-    "reuters_markets": "https://news.google.com/rss/search?q=federal+reserve+OR+central+bank+OR+interest+rate&hl=en",
-    "reuters_china": "https://news.google.com/rss/search?q=china+economy+OR+PBOC+OR+yuan&hl=en",
+    # Google News aggregations (reliable, fast, multi-source)
+    "geopolitics": "https://news.google.com/rss/search?q=war+OR+conflict+OR+military+OR+sanctions+OR+missile&hl=en",
+    "china_us": "https://news.google.com/rss/search?q=china+US+OR+trump+china+OR+trade+war+OR+tariff&hl=en",
+    "markets": "https://news.google.com/rss/search?q=federal+reserve+OR+central+bank+OR+interest+rate+OR+inflation&hl=en",
+    "china_economy": "https://news.google.com/rss/search?q=china+economy+OR+PBOC+OR+yuan+OR+A-shares&hl=en",
+    "middle_east": "https://news.google.com/rss/search?q=iran+OR+israel+OR+hormuz+OR+middle+east+conflict&hl=en",
+    "russia_ukraine": "https://news.google.com/rss/search?q=russia+ukraine+war+OR+zelensky+OR+putin&hl=en",
+    "gold_oil": "https://news.google.com/rss/search?q=gold+price+OR+oil+price+OR+crude+OR+safe+haven&hl=en",
+    "crypto_macro": "https://news.google.com/rss/search?q=bitcoin+OR+crypto+regulation+OR+SEC+crypto&hl=en",
 }
 
 
