@@ -8,7 +8,11 @@ Usage:
     python main.py --setup      # Download Qlib data (first-time setup)
 """
 import sys
+import os
 import logging
+
+# Ensure working directory is project root (for crontab execution)
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 logging.basicConfig(
     level=logging.INFO,
