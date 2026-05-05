@@ -98,6 +98,7 @@ class DailyPipeline:
         logger.info("Starting daily recommendation pipeline...")
         today = datetime.now().strftime("%Y-%m-%d")
         self._geo_factors = None  # Reset cache
+        self.market_collector.invalidate_cache()  # Fresh spot data
         recommendations = []
 
         # Fetch geo factors once for all stocks

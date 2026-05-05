@@ -1,10 +1,16 @@
 import pandas as pd
 import akshare as ak
+import logging
 from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
 
 
 class MarketCollector:
     """Collects A-share market data via AKShare."""
+
+    def __init__(self):
+        self._spot_cache = None  # Cache for realtime spot data
 
     def fetch_daily(self, code: str, days: int = 60) -> pd.DataFrame:
         """Fetch daily OHLCV data for a stock.
@@ -46,8 +52,20 @@ class MarketCollector:
             df = df[["open", "high", "low", "close", "volume"]]
             return df.tail(days)
 
-        except Exception:
+        except Exception as e:
+            logger.warning(f"fetch_daily failed for {code}: {e}")
             return pd.DataFrame()
+
+    def _load_spot_cache(self):
+        """Load full A-share spot data (once per session)."""
+        if self._spot_cache is None:
+            logger.info("Loading A-share spot data (one-time)...")
+            self._spot_cache = ak.stock_zh_a_spot_em()
+            logger.info(f"Loaded {len(self._spot_cache)} stocks")
+
+    def invalidate_cache(self):
+        """Clear spot cache to force refresh next call."""
+        self._spot_cache = None
 
     def fetch_realtime(self, code: str) -> dict:
         """Fetch realtime quote for a stock.
@@ -61,8 +79,8 @@ class MarketCollector:
         """
         try:
             symbol = code[2:]
-            df = ak.stock_zh_a_spot_em()
-            row = df[df["代码"] == symbol]
+            self._load_spot_cache()
+            row = self._spot_cache[self._spot_cache["代码"] == symbol]
 
             if row.empty:
                 return {}
@@ -76,10 +94,11 @@ class MarketCollector:
                 "low": float(row["最低"]),
             }
 
-        except Exception:
+        except Exception as e:
+            logger.warning(f"fetch_realtime failed for {code}: {e}")
             return {}
 
-    def fetch_batch_daily(self, codes: list[str], days: int = 60) -> dict[str, pd.DataFrame]:
+    def fetch_batch_daily(self, codes: list, days: int = 60) -> dict:
         """Fetch daily data for multiple stocks.
 
         Returns:
