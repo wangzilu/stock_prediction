@@ -1,4 +1,5 @@
 import pytest
+import pandas as pd
 from unittest.mock import MagicMock
 from scheduler.jobs import DailyPipeline
 
@@ -10,10 +11,14 @@ def _make_pipeline():
     pipeline.crypto_collector = MagicMock()
     pipeline.gold_collector = MagicMock()
     pipeline.sentiment_collector = MagicMock()
+    pipeline.gdelt_collector = MagicMock()
+    pipeline.macro_collector = MagicMock()
     pipeline.sentiment_scorer = MagicMock()
+    pipeline.geo_scorer = MagicMock()
     pipeline.signal_scorer = MagicMock()
     pipeline.pusher = MagicMock()
     pipeline.verifier = MagicMock()
+    pipeline._geo_factors = None
     return pipeline
 
 
@@ -29,6 +34,17 @@ def test_pipeline_runs_without_error():
     ]
     pipeline.sentiment_scorer.score_batch.return_value = {
         "sentiment_score": 0.5, "heat": 0.6, "post_count": 1
+    }
+
+    # Mock GDELT and macro collectors
+    pipeline.gdelt_collector.fetch_geopolitical_conflicts.return_value = pd.DataFrame()
+    pipeline.gdelt_collector.fetch_china_us_relations.return_value = pd.DataFrame()
+    pipeline.macro_collector.fetch_all.return_value = []
+    pipeline.geo_scorer.compute_all_factors.return_value = {
+        "geo_risk_index": -0.2,
+        "china_us_temperature": 0.1,
+        "policy_signal": 0.0,
+        "safe_haven_signal": 0.3,
     }
 
     mock_rec = MagicMock()

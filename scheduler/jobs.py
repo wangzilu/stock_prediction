@@ -5,7 +5,10 @@ from data.collectors.market import MarketCollector
 from data.collectors.crypto import CryptoCollector
 from data.collectors.gold import GoldCollector
 from data.collectors.sentiment import SentimentCollector
+from data.collectors.gdelt import GDELTCollector
+from data.collectors.macro import MacroCollector
 from factors.sentiment import SentimentScorer
+from factors.geopolitical import GeopoliticalScorer
 from signals.scorer import SignalScorer
 from push.wechat import WeChatPusher
 from tracker.verifier import Verifier
@@ -26,10 +29,16 @@ class DailyPipeline:
         self.crypto_collector = CryptoCollector()
         self.gold_collector = GoldCollector()
         self.sentiment_collector = SentimentCollector()
+        self.gdelt_collector = GDELTCollector()
+        self.macro_collector = MacroCollector()
         self.sentiment_scorer = SentimentScorer()
+        self.geo_scorer = GeopoliticalScorer()
         self.signal_scorer = SignalScorer()
         self.pusher = WeChatPusher()
         self.verifier = Verifier()
+
+        # Cached geo factors (computed once per run, shared across stocks)
+        self._geo_factors = None
 
     def _get_quote(self, code, market):
         """Get realtime quote based on market type."""
@@ -49,7 +58,8 @@ class DailyPipeline:
             return self.crypto_collector.fetch_daily(code, days)
         elif market == MARKET_GOLD:
             return self.gold_collector.fetch_daily(days)
-        return __import__("pandas").DataFrame()
+        import pandas as pd
+        return pd.DataFrame()
 
     def _market_label(self, market):
         """Get display label for market type."""
@@ -59,11 +69,37 @@ class DailyPipeline:
             MARKET_GOLD: "黄金",
         }.get(market, "")
 
+    def _fetch_geo_factors(self):
+        """Fetch and compute geopolitical factors (once per run)."""
+        if self._geo_factors is not None:
+            return self._geo_factors
+
+        logger.info("Fetching geopolitical data...")
+        conflict_articles = self.gdelt_collector.fetch_geopolitical_conflicts(days=3)
+        relation_articles = self.gdelt_collector.fetch_china_us_relations(days=3)
+        macro_news = self.macro_collector.fetch_all(max_per_source=10)
+
+        # Convert DataFrames to list of dicts for scorer
+        conflicts = conflict_articles.to_dict("records") if hasattr(conflict_articles, "to_dict") and not conflict_articles.empty else []
+        relations = relation_articles.to_dict("records") if hasattr(relation_articles, "to_dict") and not relation_articles.empty else []
+
+        self._geo_factors = self.geo_scorer.compute_all_factors(
+            conflict_articles=conflicts,
+            relation_articles=relations,
+            macro_news=macro_news,
+        )
+        logger.info(f"Geo factors: {self._geo_factors}")
+        return self._geo_factors
+
     def run_daily_recommendation(self):
         """Run the full daily recommendation pipeline."""
         logger.info("Starting daily recommendation pipeline...")
         today = datetime.now().strftime("%Y-%m-%d")
+        self._geo_factors = None  # Reset cache
         recommendations = []
+
+        # Fetch geo factors once for all stocks
+        geo = self._fetch_geo_factors()
 
         for code, name, market in WATCHLIST:
             try:
@@ -79,8 +115,20 @@ class DailyPipeline:
                 else:
                     sentiment = {"sentiment_score": 0.0, "heat": 0.0, "post_count": 0}
 
-                # MVP: use price change as model score proxy
+                # Model score: price change as base, adjusted by geo factors
                 model_score = quote.get("change_pct", 0) / 10
+
+                # Adjust model score with geopolitical context
+                if market == MARKET_GOLD:
+                    # Gold benefits from safe haven demand
+                    model_score += geo["safe_haven_signal"] * 0.3
+                elif market == MARKET_STOCK:
+                    # A-shares affected by China-US relations and policy
+                    model_score += geo["china_us_temperature"] * 0.1
+                    model_score += geo["policy_signal"] * 0.1
+                elif market == MARKET_CRYPTO:
+                    # Crypto affected by overall risk appetite
+                    model_score += geo["geo_risk_index"] * 0.1
 
                 display_name = f"[{self._market_label(market)}] {name}"
                 rec = self.signal_scorer.score_stock(
@@ -104,13 +152,15 @@ class DailyPipeline:
             self.pusher.send("📊 今日无明确推荐信号，建议观望")
             return
 
+        # Append geo context to report
         report = self.signal_scorer.generate_report(top_recs)
+        report += f"\n宏观环境：地缘风险{geo['geo_risk_index']:+.2f} | 中美关系{geo['china_us_temperature']:+.2f} | 政策{geo['policy_signal']:+.2f}"
+
         success = self.pusher.send_recommendation(report)
         logger.info(f"Push {'success' if success else 'failed'}: {len(top_recs)} recommendations")
 
         # Record for verification
         for rec in top_recs:
-            # Find market type for this code
             market = next((m for c, n, m in WATCHLIST if c == rec.code), MARKET_STOCK)
             quote = self._get_quote(rec.code, market)
             price = quote.get("price") if quote else None
