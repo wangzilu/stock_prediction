@@ -11,7 +11,8 @@ QLIB_PROVIDER_URI = str(QLIB_DATA_DIR / "cn_data")
 HIGH_THRESHOLD = 0.7
 MID_THRESHOLD = 0.3
 
-WECHAT_WEBHOOK_URL = os.environ.get("WECHAT_WEBHOOK_URL", "")
+# Push notification (pushplus.plus)
+PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "543dffd7b291435bbba636f2b7e3499b")
 
 RECOMMENDATION_TIME = "14:00"
 MARKET_CLOSE_TIME = "15:00"
