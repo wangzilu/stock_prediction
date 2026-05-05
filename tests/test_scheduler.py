@@ -15,6 +15,7 @@ def _make_pipeline():
     pipeline.macro_collector = MagicMock()
     pipeline.sentiment_scorer = MagicMock()
     pipeline.geo_scorer = MagicMock()
+    pipeline.news_analyzer = MagicMock()
     pipeline.signal_scorer = MagicMock()
     pipeline.risk_monitor = MagicMock()
     pipeline.pusher = MagicMock()
@@ -37,15 +38,17 @@ def test_pipeline_runs_without_error():
         "sentiment_score": 0.5, "heat": 0.6, "post_count": 1
     }
 
-    # Mock GDELT and macro collectors
-    pipeline.gdelt_collector.fetch_geopolitical_conflicts.return_value = pd.DataFrame()
-    pipeline.gdelt_collector.fetch_china_us_relations.return_value = pd.DataFrame()
+    # Mock macro + FinBERT analysis
     pipeline.macro_collector.fetch_all.return_value = []
-    pipeline.geo_scorer.compute_all_factors.return_value = {
-        "geo_risk_index": -0.2,
-        "china_us_temperature": 0.1,
-        "policy_signal": 0.0,
-        "safe_haven_signal": 0.3,
+    pipeline.news_analyzer.analyze_geopolitical_news.return_value = {
+        "overall_sentiment": -0.1,
+        "conflict_sentiment": -0.2,
+        "china_us_sentiment": 0.1,
+        "policy_sentiment": -0.1,
+        "market_sentiment": 0.0,
+        "num_analyzed": 50,
+        "num_conflict": 10,
+        "num_china_us": 8,
     }
 
     mock_rec = MagicMock()

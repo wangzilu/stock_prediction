@@ -8,6 +8,7 @@ from data.collectors.sentiment import SentimentCollector
 from data.collectors.macro import MacroCollector
 from factors.geopolitical import GeopoliticalScorer
 from factors.sentiment import SentimentScorer
+from factors.news_sentiment import NewsSentimentAnalyzer
 from signals.scorer import SignalScorer
 from signals.risk_monitor import RiskMonitor
 from push.wechat import WeChatPusher
@@ -32,6 +33,7 @@ class DailyPipeline:
         self.macro_collector = MacroCollector()
         self.sentiment_scorer = SentimentScorer()
         self.geo_scorer = GeopoliticalScorer()
+        self.news_analyzer = NewsSentimentAnalyzer()
         self.signal_scorer = SignalScorer()
         self.risk_monitor = RiskMonitor()
         self.pusher = WeChatPusher()
@@ -70,7 +72,7 @@ class DailyPipeline:
         }.get(market, "")
 
     def _fetch_geo_factors(self):
-        """Fetch geopolitical factors from RSS news analysis (once per run)."""
+        """Fetch geopolitical factors from RSS news + FinBERT analysis (once per run)."""
         if self._geo_factors is not None:
             return self._geo_factors
 
@@ -80,38 +82,29 @@ class DailyPipeline:
         all_news = self.macro_collector.fetch_all(max_per_source=15)
         logger.info(f"Fetched {len(all_news)} news items from RSS")
 
-        # Use GeopoliticalScorer to analyze the news headlines
-        # Treat RSS news as both "conflict articles" and "macro news"
-        # since they contain mixed geopolitical + economic content
-        news_as_articles = [
-            {"title": item.get("title", ""), "tone": 0, "description": item.get("description", "")}
-            for item in all_news
-        ]
+        # FinBERT semantic analysis - understands context
+        logger.info("Running FinBERT sentiment analysis on headlines...")
+        nlp_result = self.news_analyzer.analyze_geopolitical_news(all_news)
+        logger.info(f"FinBERT analysis: {nlp_result}")
 
-        # Filter for conflict-related and china-us-related
-        conflict_keywords = {"war", "conflict", "attack", "missile", "iran", "russia", "ukraine",
-                            "military", "strike", "bomb", "nuclear", "hormuz", "blockade", "invasion",
-                            "israel", "gaza", "hezbollah", "taiwan", "strait", "escalat", "crisis"}
-        china_us_keywords = {"china", "chinese", "trump", "beijing", "tariff", "trade war",
-                            "xi jinping", "us-china", "sino", "decoupl", "eu tariff",
-                            "sanction", "export ban", "trade deal"}
+        # Compute geo factors using FinBERT scores
+        # conflict_sentiment: negative = high risk
+        # china_us_sentiment: positive = friendly, negative = hostile
+        # policy_sentiment: positive = dovish, negative = hawkish
+        geo_risk = nlp_result["conflict_sentiment"]  # Already [-1, 1]
+        china_us = nlp_result["china_us_sentiment"]
+        policy = nlp_result["policy_sentiment"]
 
-        conflict_articles = [
-            a for a in news_as_articles
-            if any(kw in a["title"].lower() for kw in conflict_keywords)
-        ]
-        china_us_articles = [
-            a for a in news_as_articles
-            if any(kw in a["title"].lower() for kw in china_us_keywords)
-        ]
+        # Safe haven: inverse of conflict sentiment + overall negativity
+        safe_haven = max(0, -geo_risk) * 0.6 + max(0, -nlp_result["overall_sentiment"]) * 0.4
 
-        self._geo_factors = self.geo_scorer.compute_all_factors(
-            conflict_articles=conflict_articles,
-            relation_articles=china_us_articles,
-            macro_news=all_news,
-        )
-        logger.info(f"Geo factors: {self._geo_factors}")
-        logger.info(f"  Conflict news: {len(conflict_articles)}, China-US news: {len(china_us_articles)}")
+        self._geo_factors = {
+            "geo_risk_index": round(geo_risk, 4),
+            "china_us_temperature": round(china_us, 4),
+            "policy_signal": round(policy, 4),
+            "safe_haven_signal": round(min(1.0, safe_haven), 4),
+        }
+        logger.info(f"Geo factors (FinBERT): {self._geo_factors}")
         return self._geo_factors
 
     def run_daily_recommendation(self):
