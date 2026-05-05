@@ -10,6 +10,7 @@ from data.collectors.macro import MacroCollector
 from factors.sentiment import SentimentScorer
 from factors.geopolitical import GeopoliticalScorer
 from signals.scorer import SignalScorer
+from signals.risk_monitor import RiskMonitor
 from push.wechat import WeChatPusher
 from tracker.verifier import Verifier
 from config.watchlist import (
@@ -34,6 +35,7 @@ class DailyPipeline:
         self.sentiment_scorer = SentimentScorer()
         self.geo_scorer = GeopoliticalScorer()
         self.signal_scorer = SignalScorer()
+        self.risk_monitor = RiskMonitor()
         self.pusher = WeChatPusher()
         self.verifier = Verifier()
 
@@ -217,3 +219,43 @@ class DailyPipeline:
             if report:
                 self.pusher.send_verification(report)
                 logger.info(f"Verification report sent for {rec_date}")
+
+    def run_risk_check(self):
+        """Hourly risk check: detect abnormal events and push alerts."""
+        logger.info("Running risk check...")
+
+        # Fetch fresh geo factors
+        self._geo_factors = None
+        geo = self._fetch_geo_factors()
+
+        # Check sentiment for watchlist stocks
+        sentiment_by_stock = {}
+        for code, name, market in WATCHLIST:
+            if market != MARKET_STOCK:
+                continue
+            try:
+                posts = self.sentiment_collector.fetch_all(code, limit_per_source=10)
+                sentiment = self.sentiment_scorer.score_batch(posts)
+                sentiment_by_stock[code] = {
+                    "name": name,
+                    "sentiment_score": sentiment["sentiment_score"],
+                    "heat": sentiment["heat"],
+                }
+            except Exception as e:
+                logger.warning(f"Sentiment fetch failed for {code}: {e}")
+
+        # Run all risk checks
+        alerts = self.risk_monitor.check_all(geo, sentiment_by_stock)
+
+        if not alerts:
+            logger.info("No risk alerts")
+            return
+
+        # Push each alert
+        for alert in alerts:
+            msg = self.signal_scorer.generate_alert_message(alert)
+            success = self.pusher.send_alert(msg)
+            logger.info(
+                f"Risk alert {'sent' if success else 'failed'}: "
+                f"{alert.severity} - {alert.trigger[:50]}"
+            )

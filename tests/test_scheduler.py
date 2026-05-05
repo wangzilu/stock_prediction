@@ -16,6 +16,7 @@ def _make_pipeline():
     pipeline.sentiment_scorer = MagicMock()
     pipeline.geo_scorer = MagicMock()
     pipeline.signal_scorer = MagicMock()
+    pipeline.risk_monitor = MagicMock()
     pipeline.pusher = MagicMock()
     pipeline.verifier = MagicMock()
     pipeline._geo_factors = None

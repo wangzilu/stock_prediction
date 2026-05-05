@@ -1,15 +1,17 @@
 """Stock Prediction System - Main Entry Point.
 
 Usage:
-    python main.py              # Start scheduler (runs daily at 14:00)
+    python main.py              # Start scheduler (daily 14:00 + hourly risk check)
     python main.py --run-now    # Run recommendation pipeline immediately
     python main.py --verify     # Run verification check immediately
+    python main.py --risk-check # Run risk check immediately
     python main.py --setup      # Download Qlib data (first-time setup)
 """
 import sys
 import logging
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,9 +41,15 @@ def main():
         pipeline.run_verification()
         return
 
+    if "--risk-check" in args:
+        logger.info("Running risk check now...")
+        pipeline.run_risk_check()
+        return
+
     # Default: start scheduler
     scheduler = BlockingScheduler()
 
+    # Daily recommendation at 14:00 on weekdays
     scheduler.add_job(
         pipeline.run_daily_recommendation,
         CronTrigger(day_of_week="mon-fri", hour=14, minute=0),
@@ -49,6 +57,7 @@ def main():
         name="Daily Stock Recommendation",
     )
 
+    # Verification check at 14:05 on weekdays
     scheduler.add_job(
         pipeline.run_verification,
         CronTrigger(day_of_week="mon-fri", hour=14, minute=5),
@@ -56,9 +65,18 @@ def main():
         name="5-Day Verification Check",
     )
 
+    # Hourly risk check (every hour during trading hours 9-15, weekdays)
+    scheduler.add_job(
+        pipeline.run_risk_check,
+        CronTrigger(day_of_week="mon-fri", hour="9-15", minute=30),
+        id="risk_check",
+        name="Hourly Risk Check",
+    )
+
     logger.info("Scheduler started. Jobs:")
     logger.info("  - Daily recommendation: Mon-Fri 14:00")
     logger.info("  - Verification check: Mon-Fri 14:05")
+    logger.info("  - Risk check: Mon-Fri 9:30-15:30 (hourly)")
     logger.info("Press Ctrl+C to exit.")
 
     try:
