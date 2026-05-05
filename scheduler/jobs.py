@@ -11,6 +11,7 @@ from factors.sentiment import SentimentScorer
 from factors.news_sentiment import NewsSentimentAnalyzer
 from signals.scorer import SignalScorer
 from signals.risk_monitor import RiskMonitor
+from signals.market_judge import MarketJudge
 from push.wechat import WeChatPusher
 from tracker.verifier import Verifier
 from config.watchlist import (
@@ -38,9 +39,11 @@ class DailyPipeline:
         self.risk_monitor = RiskMonitor()
         self.pusher = WeChatPusher()
         self.verifier = Verifier()
+        self.market_judge = MarketJudge()
 
         # Cached geo factors (computed once per run, shared across stocks)
         self._geo_factors = None
+        self._nlp_result = None
 
     def _get_quote(self, code, market):
         """Get realtime quote based on market type."""
@@ -104,6 +107,7 @@ class DailyPipeline:
             "policy_signal": round(policy, 4),
             "safe_haven_signal": round(min(1.0, safe_haven), 4),
         }
+        self._nlp_result = nlp_result
         logger.info(f"Geo factors (FinBERT): {self._geo_factors}")
         return self._geo_factors
 
@@ -117,10 +121,18 @@ class DailyPipeline:
         logger.info("Starting daily recommendation pipeline...")
         today = datetime.now().strftime("%Y-%m-%d")
         self._geo_factors = None  # Reset cache
+        self._nlp_result = None  # Reset cache
         self.market_collector.invalidate_cache()  # Fresh spot data
 
         # Fetch geo factors once
         geo = self._fetch_geo_factors()
+
+        # Market index judgment
+        market_judgment = self.market_judge.judge(
+            geo_factors=geo,
+            news_sentiment=self._nlp_result,
+        )
+        logger.info(f"Market judgment: {market_judgment['direction']} ({market_judgment['reason']})")
 
         # === Stage 1: Fast screening (price-based, all stocks) ===
         logger.info(f"Stage 1: Screening {len(WATCHLIST)} instruments...")
@@ -208,9 +220,10 @@ class DailyPipeline:
             self.pusher.send("📊 今日无明确推荐信号，建议观望")
             return
 
-        # Append geo context to report
+        # Build report with market judgment header
         report = self.signal_scorer.generate_report(top_recs)
         report += f"\n宏观环境：地缘风险{geo['geo_risk_index']:+.2f} | 中美关系{geo['china_us_temperature']:+.2f} | 政策{geo['policy_signal']:+.2f}"
+        report = self.market_judge.format_for_report(market_judgment) + "\n" + report
 
         success = self.pusher.send_recommendation(report)
         logger.info(f"Push {'success' if success else 'failed'}: {len(top_recs)} recommendations")

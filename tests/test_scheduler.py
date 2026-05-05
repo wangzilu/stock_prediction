@@ -20,7 +20,9 @@ def _make_pipeline():
     pipeline.risk_monitor = MagicMock()
     pipeline.pusher = MagicMock()
     pipeline.verifier = MagicMock()
+    pipeline.market_judge = MagicMock()
     pipeline._geo_factors = None
+    pipeline._nlp_result = None
     return pipeline
 
 
@@ -62,6 +64,16 @@ def test_pipeline_runs_without_error():
     pipeline.signal_scorer.generate_report.return_value = "test report"
     pipeline.pusher.send_recommendation.return_value = True
     pipeline.pusher.send.return_value = True
+
+    mock_judgment = {
+        "direction": "中性",
+        "score": 0.0,
+        "reason": "市场平稳",
+        "suggested_position": "5成",
+        "index_change": 0.0,
+    }
+    pipeline.market_judge.judge.return_value = mock_judgment
+    pipeline.market_judge.format_for_report.return_value = "大盘研判：中性（市场平稳）\n建议整体仓位：5成"
 
     pipeline.run_daily_recommendation()
 
