@@ -15,7 +15,7 @@ from push.wechat import WeChatPusher
 from tracker.verifier import Verifier
 from config.watchlist import (
     WATCHLIST, MARKET_STOCK, MARKET_CRYPTO, MARKET_GOLD,
-    to_akshare_code,
+    SENTIMENT_TOP_N, to_akshare_code,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -94,69 +94,97 @@ class DailyPipeline:
         return self._geo_factors
 
     def run_daily_recommendation(self):
-        """Run the full daily recommendation pipeline."""
+        """Run the full daily recommendation pipeline.
+
+        Two-stage approach for 300+ stocks:
+        1. Fast screen: use price change only to rank all stocks
+        2. Deep analysis: sentiment + mid-term model for top-N candidates
+        """
         logger.info("Starting daily recommendation pipeline...")
         today = datetime.now().strftime("%Y-%m-%d")
         self._geo_factors = None  # Reset cache
         self.market_collector.invalidate_cache()  # Fresh spot data
-        recommendations = []
 
-        # Fetch geo factors once for all stocks
+        # Fetch geo factors once
         geo = self._fetch_geo_factors()
+
+        # === Stage 1: Fast screening (price-based, all stocks) ===
+        logger.info(f"Stage 1: Screening {len(WATCHLIST)} instruments...")
+        candidates = []
 
         for code, name, market in WATCHLIST:
             try:
                 quote = self._get_quote(code, market)
                 if not quote:
-                    logger.warning(f"No market data for {code} ({market}), skipping")
                     continue
 
-                # Sentiment (only for stocks; crypto/gold use price-only signal)
-                if market == MARKET_STOCK:
-                    posts = self.sentiment_collector.fetch_all(code, limit_per_source=20)
-                    sentiment = self.sentiment_scorer.score_batch(posts)
-                else:
-                    sentiment = {"sentiment_score": 0.0, "heat": 0.0, "post_count": 0}
-
-                # Short-term score: price change as proxy
                 short_score = quote.get("change_pct", 0) / 10
 
-                # Mid-term score: try LSTM model if price history available
-                mid_score = 0.0
-                try:
-                    df = self._get_daily(code, market, days=30)
-                    if not df.empty and len(df) >= 20:
-                        from models.mid_term import MidTermModel
-                        mid_model = MidTermModel(lookback_days=20)
-                        pred = mid_model.predict(df)
-                        mid_score = pred.get("trend_score", 0.0)
-                except Exception:
-                    pass
-
-                # Macro score: composite from geo factors
+                # Quick macro adjustment
                 macro_score = 0.0
                 if market == MARKET_GOLD:
-                    macro_score = geo["safe_haven_signal"] * 2 - 1  # [0,1] -> [-1,1]
+                    macro_score = geo["safe_haven_signal"] * 2 - 1
                 elif market == MARKET_STOCK:
                     macro_score = (geo["china_us_temperature"] + geo["policy_signal"]) / 2
                 elif market == MARKET_CRYPTO:
                     macro_score = geo["geo_risk_index"]
 
+                candidates.append({
+                    "code": code,
+                    "name": name,
+                    "market": market,
+                    "short_score": short_score,
+                    "macro_score": macro_score,
+                    "price": quote.get("price", 0),
+                })
+            except Exception as e:
+                logger.warning(f"Screen failed for {code}: {e}")
+
+        # Sort by absolute short_score (strongest movers first)
+        candidates.sort(key=lambda c: abs(c["short_score"]), reverse=True)
+        top_candidates = candidates[:SENTIMENT_TOP_N]
+        logger.info(f"Stage 1 done: {len(candidates)} screened, top {len(top_candidates)} selected")
+
+        # === Stage 2: Deep analysis (sentiment + mid-term model) ===
+        logger.info("Stage 2: Deep analysis with sentiment + mid-term model...")
+        from models.mid_term import MidTermModel
+        mid_model = MidTermModel(lookback_days=20)
+
+        recommendations = []
+        for cand in top_candidates:
+            code, name, market = cand["code"], cand["name"], cand["market"]
+            try:
+                # Sentiment
+                if market == MARKET_STOCK:
+                    posts = self.sentiment_collector.fetch_all(code, limit_per_source=10)
+                    sentiment = self.sentiment_scorer.score_batch(posts)
+                else:
+                    sentiment = {"sentiment_score": 0.0, "heat": 0.0, "post_count": 0}
+
+                # Mid-term model
+                mid_score = 0.0
+                try:
+                    df = self._get_daily(code, market, days=30)
+                    if not df.empty and len(df) >= 20:
+                        pred = mid_model.predict(df)
+                        mid_score = pred.get("trend_score", 0.0)
+                except Exception:
+                    pass
+
                 display_name = f"[{self._market_label(market)}] {name}"
                 rec = self.signal_scorer.score_stock(
                     code=code,
                     name=display_name,
-                    model_score=short_score,
+                    model_score=cand["short_score"],
                     sentiment_score=sentiment["sentiment_score"],
                     sentiment_heat=sentiment["heat"],
                     mid_term_score=mid_score,
-                    macro_score=macro_score,
+                    macro_score=cand["macro_score"],
                 )
                 recommendations.append(rec)
 
             except Exception as e:
-                logger.error(f"Error processing {code}: {e}")
-                continue
+                logger.error(f"Deep analysis failed for {code}: {e}")
 
         recommendations.sort(key=lambda r: r.final_score, reverse=True)
         top_recs = [r for r in recommendations if r.signal in ("强烈看多", "看多")][:5]
