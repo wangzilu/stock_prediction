@@ -21,45 +21,34 @@ class MarketJudge:
     def __init__(self):
         self.collector = MarketCollector()
 
-    def judge(self, geo_factors: dict = None, news_sentiment: dict = None) -> dict:
+    def judge(self, geo_factors: dict = None) -> dict:
         """Judge overall market direction.
 
         Args:
-            geo_factors: Dict with geo_risk_index, policy_signal, etc.
-            news_sentiment: Dict from NewsSentimentAnalyzer with market_sentiment, etc.
+            geo_factors: Dict with geo_risk_index, policy_signal, china_us_temperature,
+                        and optionally market_direction from LLM analysis.
 
         Returns:
-            Dict with:
-                - direction: str ("偏强", "中性", "偏弱", "强势", "弱势")
-                - score: float [-1, 1]
-                - reason: str
-                - suggested_position: str (e.g., "7成", "5成", "3成")
-                - index_change: float (CSI300 change %)
+            Dict with direction, score, reason, suggested_position, index_change.
         """
-        # Get CSI300 index realtime data
         index_change = self._get_index_change()
-
-        # Score components
         index_score = max(-1, min(1, index_change / 3))  # ±3% = ±1
 
-        # News/geo factors
-        market_sent = 0.0
-        if news_sentiment:
-            market_sent = news_sentiment.get("market_sentiment", 0)
-
         geo_score = 0.0
+        llm_direction = 0.0
         if geo_factors:
             geo_score = (
                 geo_factors.get("geo_risk_index", 0) * 0.3
                 + geo_factors.get("policy_signal", 0) * 0.3
                 + geo_factors.get("china_us_temperature", 0) * 0.4
             )
+            llm_direction = geo_factors.get("market_direction", 0)
 
-        # Weighted combination
+        # Weighted: index 40%, geo 30%, LLM market direction 30%
         final_score = (
-            index_score * 0.5
-            + market_sent * 0.25
-            + geo_score * 0.25
+            index_score * 0.4
+            + geo_score * 0.3
+            + llm_direction * 0.3
         )
         final_score = max(-1, min(1, final_score))
 

@@ -58,38 +58,47 @@ class LLMAnalyst:
         self.api_url = "https://api.minimax.io/v1/chat/completions"
 
     def _call_llm(self, system: str, user: str, max_tokens: int = 2048) -> str:
-        """Call MiniMax API and return cleaned response text."""
-        try:
-            resp = requests.post(
-                self.api_url,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "max_tokens": max_tokens,
-                },
-                timeout=60,
-            )
+        """Call MiniMax API with retry and return cleaned response text."""
+        import time
 
-            if resp.status_code != 200:
-                logger.warning(f"MiniMax API returned {resp.status_code}: {resp.text[:200]}")
-                return ""
+        for attempt in range(2):
+            try:
+                resp = requests.post(
+                    self.api_url,
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user},
+                        ],
+                        "max_tokens": max_tokens,
+                    },
+                    timeout=60,
+                )
 
-            data = resp.json()
-            text = data["choices"][0]["message"]["content"]
-            # Strip think tags
-            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-            return text
+                if resp.status_code != 200:
+                    logger.warning(f"MiniMax API attempt {attempt+1} returned {resp.status_code}: {resp.text[:200]}")
+                    if attempt == 0:
+                        time.sleep(3)
+                        continue
+                    return ""
 
-        except Exception as e:
-            logger.warning(f"MiniMax API call failed: {e}")
-            return ""
+                data = resp.json()
+                text = data["choices"][0]["message"]["content"]
+                # Strip think tags
+                text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+                return text
+
+            except Exception as e:
+                logger.warning(f"MiniMax API attempt {attempt+1} failed: {e}")
+                if attempt == 0:
+                    time.sleep(3)
+
+        return ""
 
     def analyze_geopolitics(self, headlines: list) -> dict:
         """Use LLM to analyze geopolitical risk from news headlines.

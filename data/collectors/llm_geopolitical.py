@@ -6,7 +6,7 @@ Claude has up-to-date knowledge and can reason about complex geopolitical dynami
 import json
 import logging
 import requests
-from config.settings import ANTHROPIC_API_KEY
+ANTHROPIC_API_KEY = ""  # Deprecated: use signals/llm_analyst.py with MiniMax instead
 
 logger = logging.getLogger(__name__)
 

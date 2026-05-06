@@ -147,29 +147,13 @@ class MacroCollector:
         """
         return self.fetch_rss(RSS_FEEDS["fed"], max_items)
 
-    def fetch_pboc_news(self, max_items: int = 10) -> list:
-        """Fetch PBOC (People's Bank of China) policy news.
-
-        Returns:
-            List of dicts with title, link, published, description
-        """
-        return self.fetch_rss(RSS_FEEDS["pboc"], max_items)
-
     def fetch_market_news(self, max_items: int = 20) -> list:
-        """Fetch global market/central bank news via Google News RSS.
-
-        Returns:
-            List of dicts with title, link, published, description
-        """
-        return self.fetch_rss(RSS_FEEDS["reuters_markets"], max_items)
+        """Fetch global market/central bank news."""
+        return self.fetch_rss(RSS_FEEDS["central_banks"], max_items)
 
     def fetch_china_macro_news(self, max_items: int = 20) -> list:
-        """Fetch China macro economy news.
-
-        Returns:
-            List of dicts with title, link, published, description
-        """
-        return self.fetch_rss(RSS_FEEDS["reuters_china"], max_items)
+        """Fetch China macro economy news."""
+        return self.fetch_rss(RSS_FEEDS["china_economy"], max_items)
 
     def fetch_all(self, max_per_source: int = 10) -> list:
         """Fetch news from all sources.
@@ -179,10 +163,14 @@ class MacroCollector:
         """
         all_news = []
 
+        seen_titles = set()
         for source_name, url in RSS_FEEDS.items():
             items = self.fetch_rss(url, max_per_source)
             for item in items:
-                item["source"] = source_name
-            all_news.extend(items)
+                title = item.get("title", "").strip()
+                if title and title not in seen_titles:
+                    item["source"] = source_name
+                    all_news.append(item)
+                    seen_titles.add(title)
 
         return all_news
