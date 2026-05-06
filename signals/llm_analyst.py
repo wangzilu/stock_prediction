@@ -125,31 +125,51 @@ class LLMAnalyst:
         if not headlines:
             return self._default_geo_result()
 
-        headline_text = "\n".join(f"- {h}" for h in headlines[:150])
+        # Limit headlines to fit within model context (estimate ~4 chars per token)
+        selected = []
+        char_count = 0
+        for h in headlines:
+            if char_count + len(h) > 12000:  # ~3000 tokens for headlines
+                break
+            selected.append(h)
+            char_count += len(h)
+        headline_text = "\n".join(f"- {h}" for h in selected)
+        logger.info(f"Geo analysis input: {len(selected)} headlines, ~{char_count} chars")
         prompt = GEO_ANALYSIS_PROMPT.format(headlines=headline_text)
 
-        text = self._call_llm("你是一个地缘政治和宏观经济分析专家。只输出JSON，不要其他内容。", prompt, max_tokens=1024)
+        text = self._call_llm("你是一个地缘政治和宏观经济分析专家。只输出JSON，不要其他内容。", prompt, max_tokens=2048)
 
         if not text:
+            logger.warning("LLM geo analysis returned empty response")
             return self._default_geo_result()
 
         try:
-            # Find JSON in response
-            start = text.find("{")
-            end = text.rfind("}") + 1
+            # Find JSON in response (may be wrapped in markdown code block)
+            clean = text.strip()
+            if clean.startswith("```"):
+                # Strip markdown code fences
+                lines = clean.split("\n")
+                clean = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+            start = clean.find("{")
+            end = clean.rfind("}") + 1
             if start >= 0 and end > start:
-                parsed = json.loads(text[start:end])
+                json_str = clean[start:end]
+                parsed = json.loads(json_str)
                 result = {
                     "geo_risk_index": max(-1, min(1, float(parsed.get("geo_risk_index", 0)))),
                     "china_us_temperature": max(-1, min(1, float(parsed.get("china_us_temperature", 0)))),
                     "policy_signal": max(-1, min(1, float(parsed.get("policy_signal", 0)))),
                     "safe_haven_signal": max(0, min(1, float(parsed.get("safe_haven_signal", 0)))),
                     "market_direction": max(-1, min(1, float(parsed.get("market_direction", 0)))),
+                    "key_events": parsed.get("key_events", []),
                     "reasoning": parsed.get("reasoning", {}),
                 }
                 return result
+            else:
+                logger.warning(f"No JSON found in LLM geo response: {text[:200]}")
         except (json.JSONDecodeError, ValueError, KeyError) as e:
-            logger.warning(f"Failed to parse LLM geo response: {e}")
+            logger.warning(f"Failed to parse LLM geo response: {e}\nRaw: {text[:300]}")
 
         return self._default_geo_result()
 

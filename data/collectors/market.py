@@ -23,6 +23,7 @@ class MarketCollector:
         self._spot_cache = None
         self._spot_loaded = False  # Prevent retry loop
         self._akshare_down = False  # Skip AKShare entirely if it's down
+        self._bs_logged_in = False  # baostock session state
 
     # ========== Daily OHLCV ==========
 
@@ -76,15 +77,22 @@ class MarketCollector:
         logger.info("AKShare marked as down — subsequent calls will skip to baostock")
         return pd.DataFrame()
 
+    def _ensure_baostock_login(self):
+        """Login to baostock once per session."""
+        if not self._bs_logged_in:
+            import baostock as bs
+            bs.login()
+            self._bs_logged_in = True
+
     def _fetch_daily_baostock(self, code: str, days: int) -> pd.DataFrame:
         """Fallback: fetch daily K-line from baostock (free, no registration)."""
         try:
             import baostock as bs
-            bs.login()
+            self._ensure_baostock_login()
 
             symbol = code[2:]
             prefix = code[:2].lower()
-            bs_code = f"{prefix}.{symbol}"  # "sh.600519"
+            bs_code = f"{prefix}.{symbol}"
 
             end_date = datetime.now().strftime("%Y-%m-%d")
             start_date = (datetime.now() - timedelta(days=days * 2)).strftime("%Y-%m-%d")
@@ -95,14 +103,12 @@ class MarketCollector:
                 start_date=start_date,
                 end_date=end_date,
                 frequency="d",
-                adjustflag="2",  # 前复权
+                adjustflag="2",
             )
 
             rows = []
             while rs.error_code == "0" and rs.next():
                 rows.append(rs.get_row_data())
-
-            bs.logout()
 
             if not rows:
                 return pd.DataFrame()
