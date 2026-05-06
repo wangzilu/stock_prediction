@@ -7,6 +7,16 @@ logger = logging.getLogger(__name__)
 
 # RSS feed sources — global mainstream media + policy + geopolitics
 RSS_FEEDS = {
+    # === Global mainstream media (direct RSS) ===
+    "bbc_world": "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "bbc_business": "https://feeds.bbci.co.uk/news/business/rss.xml",
+    "reuters_world": "https://news.google.com/rss/search?q=site:reuters.com+world&hl=en",
+    "aljazeera": "https://www.aljazeera.com/xml/rss/all.xml",
+    "france24": "https://www.france24.com/en/rss",
+    "dw_news": "https://rss.dw.com/rdf/rss-en-world",
+    "nyt_world": "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+    "wsj_world": "https://news.google.com/rss/search?q=site:wsj.com+world+OR+economy&hl=en",
+
     # Central banks
     "fed": "https://www.federalreserve.gov/feeds/press_all.xml",
 

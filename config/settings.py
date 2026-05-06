@@ -23,8 +23,8 @@ MID_THRESHOLD = 0.3
 # Push notification (pushplus.plus)
 PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "")
 
-# LLM API (Anthropic Claude)
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+# LLM API (MiniMax)
+MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
 
 RECOMMENDATION_TIME = "14:00"
 MARKET_CLOSE_TIME = "15:00"

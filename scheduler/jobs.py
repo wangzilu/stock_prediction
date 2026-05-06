@@ -6,12 +6,11 @@ from data.collectors.crypto import CryptoCollector
 from data.collectors.gold import GoldCollector
 from data.collectors.sentiment import SentimentCollector
 from data.collectors.macro import MacroCollector
-from factors.geopolitical import GeopoliticalScorer
 from factors.sentiment import SentimentScorer
-from factors.news_sentiment import NewsSentimentAnalyzer
 from signals.scorer import SignalScorer
 from signals.risk_monitor import RiskMonitor
 from signals.market_judge import MarketJudge
+from signals.llm_analyst import LLMAnalyst
 from push.wechat import WeChatPusher
 from tracker.verifier import Verifier
 from config.watchlist import (
@@ -33,17 +32,16 @@ class DailyPipeline:
         self.sentiment_collector = SentimentCollector()
         self.macro_collector = MacroCollector()
         self.sentiment_scorer = SentimentScorer()
-        self.geo_scorer = GeopoliticalScorer()
-        self.news_analyzer = NewsSentimentAnalyzer()
         self.signal_scorer = SignalScorer()
         self.risk_monitor = RiskMonitor()
         self.pusher = WeChatPusher()
         self.verifier = Verifier()
         self.market_judge = MarketJudge()
+        self.llm_analyst = LLMAnalyst()
 
-        # Cached geo factors (computed once per run, shared across stocks)
+        # Cached data (computed once per run)
         self._geo_factors = None
-        self._nlp_result = None
+        self._headlines = None
 
     def _get_quote(self, code, market):
         """Get realtime quote based on market type."""
@@ -75,40 +73,24 @@ class DailyPipeline:
         }.get(market, "")
 
     def _fetch_geo_factors(self):
-        """Fetch geopolitical factors from RSS news + FinBERT analysis (once per run)."""
+        """Fetch geopolitical factors via LLM analysis of global news (once per run)."""
         if self._geo_factors is not None:
             return self._geo_factors
 
-        logger.info("Fetching geopolitical factors from RSS news...")
+        logger.info("Fetching global news from RSS...")
+        all_news = self.macro_collector.fetch_all(max_per_source=10)
+        headlines = [item.get("title", "") for item in all_news if item.get("title")]
+        self._headlines = headlines
+        logger.info(f"Fetched {len(headlines)} headlines from {len(all_news)} news items")
 
-        # Collect news from all RSS sources
-        all_news = self.macro_collector.fetch_all(max_per_source=15)
-        logger.info(f"Fetched {len(all_news)} news items from RSS")
-
-        # FinBERT semantic analysis - understands context
-        logger.info("Running FinBERT sentiment analysis on headlines...")
-        nlp_result = self.news_analyzer.analyze_geopolitical_news(all_news)
-        logger.info(f"FinBERT analysis: {nlp_result}")
-
-        # Compute geo factors using FinBERT scores
-        # conflict_sentiment: negative = high risk
-        # china_us_sentiment: positive = friendly, negative = hostile
-        # policy_sentiment: positive = dovish, negative = hawkish
-        geo_risk = nlp_result["conflict_sentiment"]  # Already [-1, 1]
-        china_us = nlp_result["china_us_sentiment"]
-        policy = nlp_result["policy_sentiment"]
-
-        # Safe haven: inverse of conflict sentiment + overall negativity
-        safe_haven = max(0, -geo_risk) * 0.6 + max(0, -nlp_result["overall_sentiment"]) * 0.4
-
-        self._geo_factors = {
-            "geo_risk_index": round(geo_risk, 4),
-            "china_us_temperature": round(china_us, 4),
-            "policy_signal": round(policy, 4),
-            "safe_haven_signal": round(min(1.0, safe_haven), 4),
-        }
-        self._nlp_result = nlp_result
-        logger.info(f"Geo factors (FinBERT): {self._geo_factors}")
+        # Use MiniMax LLM for deep geopolitical analysis
+        logger.info("Running LLM geopolitical analysis...")
+        self._geo_factors = self.llm_analyst.analyze_geopolitics(headlines)
+        reasoning = self._geo_factors.get("reasoning", {})
+        logger.info(f"Geo factors (LLM): {self._geo_factors}")
+        if reasoning:
+            for key, reason in reasoning.items():
+                logger.info(f"  {key}: {reason}")
         return self._geo_factors
 
     def run_daily_recommendation(self):
@@ -121,7 +103,7 @@ class DailyPipeline:
         logger.info("Starting daily recommendation pipeline...")
         today = datetime.now().strftime("%Y-%m-%d")
         self._geo_factors = None  # Reset cache
-        self._nlp_result = None  # Reset cache
+        self._headlines = None  # Reset cache
         self.market_collector.invalidate_cache()  # Fresh spot data
 
         # Fetch geo factors once
@@ -130,7 +112,6 @@ class DailyPipeline:
         # Market index judgment
         market_judgment = self.market_judge.judge(
             geo_factors=geo,
-            news_sentiment=self._nlp_result,
         )
         logger.info(f"Market judgment: {market_judgment['direction']} ({market_judgment['reason']})")
 
@@ -216,14 +197,16 @@ class DailyPipeline:
         top_recs = [r for r in recommendations if r.signal in ("强烈看多", "看多")][:5]
 
         if not top_recs:
-            logger.info("No strong signals today, sending neutral report")
-            self.pusher.send("📊 今日无明确推荐信号，建议观望")
-            return
+            top_recs = []  # LLM report will mention no signals
 
-        # Build report with market judgment header
-        report = self.signal_scorer.generate_report(top_recs)
-        report += f"\n宏观环境：地缘风险{geo['geo_risk_index']:+.2f} | 中美关系{geo['china_us_temperature']:+.2f} | 政策{geo['policy_signal']:+.2f}"
-        report = self.market_judge.format_for_report(market_judgment) + "\n" + report
+        # Generate LLM-powered professional report
+        logger.info("Generating LLM analyst report...")
+        report = self.llm_analyst.generate_report(
+            headlines=self._headlines or [],
+            market_judgment=market_judgment,
+            recommendations=top_recs,
+            geo_factors=geo,
+        )
 
         success = self.pusher.send_recommendation(report)
         logger.info(f"Push {'success' if success else 'failed'}: {len(top_recs)} recommendations")
