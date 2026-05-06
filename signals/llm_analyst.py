@@ -138,6 +138,8 @@ class LLMAnalyst:
         market_judgment: dict,
         recommendations: list,
         geo_factors: dict,
+        crypto_data: dict = None,
+        gold_data: dict = None,
     ) -> str:
         """Generate a professional market analysis report.
 
@@ -146,12 +148,13 @@ class LLMAnalyst:
             market_judgment: Dict with direction, score, reason, index_change
             recommendations: List of Recommendation objects
             geo_factors: Dict with geo scores and reasoning
+            crypto_data: Dict with BTC/ETH prices and change_pct
+            gold_data: Dict with gold price and change_pct
 
         Returns:
             Formatted report string for push notification
         """
-        # Build context for LLM
-        headline_text = "\n".join(f"- {h}" for h in headlines[:30])
+        headline_text = "\n".join(f"- {h}" for h in headlines[:40])
 
         rec_text = ""
         if recommendations:
@@ -164,6 +167,17 @@ class LLMAnalyst:
             for key, reason in geo_factors["reasoning"].items():
                 reasoning_text += f"- {key}: {reason}\n"
 
+        # Build crypto/gold context
+        crypto_text = ""
+        if crypto_data:
+            for symbol, data in crypto_data.items():
+                name = "比特币" if "BTC" in symbol else "以太坊" if "ETH" in symbol else symbol
+                crypto_text += f"  {name}: ${data.get('price', 0):,.0f} ({data.get('change_pct', 0):+.1f}%)\n"
+
+        gold_text = ""
+        if gold_data:
+            gold_text = f"  黄金: ¥{gold_data.get('price', 0):,.1f} ({gold_data.get('change_pct', 0):+.1f}%)"
+
         user_prompt = f"""请基于以下信息撰写今日市场研判报告：
 
 日期：{datetime.now().strftime("%Y年%m月%d日")}
@@ -171,32 +185,54 @@ class LLMAnalyst:
 【全球新闻头条】
 {headline_text}
 
-【大盘数据】
-A股大盘方向：{market_judgment.get('direction', '未知')}
+【A股大盘数据】
+大盘方向：{market_judgment.get('direction', '未知')}
 沪深300涨跌幅：{market_judgment.get('index_change', 0):+.2f}%
 研判理由：{market_judgment.get('reason', '')}
 
+【加密货币】
+{crypto_text if crypto_text else '  数据暂无'}
+
+【黄金】
+{gold_text if gold_text else '  数据暂无'}
+
 【地缘评估】
-地缘风险指数：{geo_factors.get('geo_risk_index', 0):+.2f}
-中美关系温度：{geo_factors.get('china_us_temperature', 0):+.2f}
-政策方向：{geo_factors.get('policy_signal', 0):+.2f}
-避险需求：{geo_factors.get('safe_haven_signal', 0):.2f}
+地缘风险指数：{geo_factors.get('geo_risk_index', 0):+.2f}（-1极端风险，+1安全）
+中美关系温度：{geo_factors.get('china_us_temperature', 0):+.2f}（-1对抗，+1合作）
+政策方向：{geo_factors.get('policy_signal', 0):+.2f}（-1紧缩，+1宽松）
+避险需求：{geo_factors.get('safe_haven_signal', 0):.2f}（0无需求，1极强）
 {reasoning_text}
 
 【今日推荐标的】
 {rec_text if rec_text else '暂无明确推荐信号'}
 
-请撰写研判报告，包含：
-1. 📌 全球局势速览（100-150字）
-2. 📊 A股大盘研判（100-150字，含仓位建议）
-3. 💡 今日操作建议（100-150字，如有推荐标的则点评）
+请撰写研判报告，严格包含以下5个板块：
 
-注意：如果没有推荐标的，操作建议部分给出观望理由和关注方向。"""
+1. 📌 **全球局势速览**（100-150字）
+   分析当前最重要的3个地缘/宏观事件及其对市场的影响链条
 
-        report = self._call_llm(SYSTEM_PROMPT, user_prompt, max_tokens=2048)
+2. 📊 **今日大盘复盘**（150-200字）
+   深度分析今天A股涨跌的根本原因（不只是描述数据，要分析WHY）
+   结合消息面、资金面、情绪面给出逻辑链
+
+3. 🔮 **明日预判**（100-150字）
+   基于今天的盘面和消息面，预判明天A股走势
+   给出明确的方向判断和仓位建议
+
+4. 🪙 **加密货币与黄金**（100-150字）
+   分析BTC/ETH走势及驱动因素
+   黄金走势及避险逻辑
+   给出操作建议
+
+5. 💡 **个股推荐与操作建议**（100-150字）
+   如有推荐标的则逐个点评
+   如无推荐则给出观望理由和关注方向
+
+要求：有观点有态度，分析因果逻辑链，不要泛泛而谈。"""
+
+        report = self._call_llm(SYSTEM_PROMPT, user_prompt, max_tokens=3000)
 
         if not report:
-            # Fallback to simple format
             return self._fallback_report(market_judgment, recommendations, geo_factors)
 
         return report

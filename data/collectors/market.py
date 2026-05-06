@@ -21,6 +21,7 @@ class MarketCollector:
 
     def __init__(self):
         self._spot_cache = None
+        self._spot_loaded = False  # Prevent retry loop
 
     # ========== Daily OHLCV ==========
 
@@ -139,7 +140,7 @@ class MarketCollector:
 
     def _load_spot_cache(self):
         """Load full A-share spot data with retry + fallback."""
-        if self._spot_cache is not None:
+        if self._spot_loaded:
             return
 
         # Try AKShare (eastmoney) with retries
@@ -149,6 +150,7 @@ class MarketCollector:
                 self._spot_cache = ak.stock_zh_a_spot_em()
                 if self._spot_cache is not None and not self._spot_cache.empty:
                     logger.info(f"Loaded {len(self._spot_cache)} stocks via AKShare")
+                    self._spot_loaded = True
                     return
             except Exception as e:
                 logger.warning(f"AKShare spot attempt {attempt+1}/{MAX_RETRIES}: {e}")
@@ -158,6 +160,7 @@ class MarketCollector:
         # Fallback to Tencent batch API
         logger.info("AKShare spot failed, falling back to Tencent...")
         self._spot_cache = self._load_spot_tencent()
+        self._spot_loaded = True  # Don't retry even if Tencent also failed
 
     def _load_spot_tencent(self) -> pd.DataFrame:
         """Fallback: load realtime quotes from Tencent Finance API.
@@ -228,6 +231,7 @@ class MarketCollector:
     def invalidate_cache(self):
         """Clear spot cache to force refresh next call."""
         self._spot_cache = None
+        self._spot_loaded = False
 
     def fetch_realtime(self, code: str) -> dict:
         """Fetch realtime quote with automatic fallback."""

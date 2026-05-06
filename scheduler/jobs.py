@@ -199,6 +199,14 @@ class DailyPipeline:
         if not top_recs:
             top_recs = []  # LLM report will mention no signals
 
+        # Fetch crypto and gold data for report
+        crypto_data = {}
+        for symbol in ["BTC/USDT", "ETH/USDT"]:
+            q = self.crypto_collector.fetch_realtime(symbol)
+            if q:
+                crypto_data[symbol] = q
+        gold_data = self.gold_collector.fetch_realtime()
+
         # Generate LLM-powered professional report
         logger.info("Generating LLM analyst report...")
         report = self.llm_analyst.generate_report(
@@ -206,6 +214,8 @@ class DailyPipeline:
             market_judgment=market_judgment,
             recommendations=top_recs,
             geo_factors=geo,
+            crypto_data=crypto_data,
+            gold_data=gold_data,
         )
 
         success = self.pusher.send_recommendation(report)
