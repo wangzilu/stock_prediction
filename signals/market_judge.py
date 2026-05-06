@@ -1,22 +1,19 @@
 """A-share market index judgment module.
 
-Combines index price action + FinBERT news sentiment to judge overall market direction.
+Combines index price action + LLM geopolitical analysis to judge market direction.
+Adjusts weights based on time of day:
+- Early session (before 11:00): rely more on LLM/news analysis (盘中数据不稳定)
+- Late session (after 13:00): rely more on actual price action (方向已明确)
 """
 import logging
-import pandas as pd
+from datetime import datetime
 from data.collectors.market import MarketCollector
 
 logger = logging.getLogger(__name__)
 
 
 class MarketJudge:
-    """Judges overall A-share market direction.
-
-    Considers:
-    - CSI300/Shanghai Composite intraday performance
-    - Global market sentiment (from FinBERT analysis)
-    - Geopolitical factors
-    """
+    """Judges overall A-share market direction."""
 
     def __init__(self):
         self.collector = MarketCollector()
@@ -24,15 +21,12 @@ class MarketJudge:
     def judge(self, geo_factors: dict = None) -> dict:
         """Judge overall market direction.
 
-        Args:
-            geo_factors: Dict with geo_risk_index, policy_signal, china_us_temperature,
-                        and optionally market_direction from LLM analysis.
-
-        Returns:
-            Dict with direction, score, reason, suggested_position, index_change.
+        Adjusts weight allocation based on time of day:
+        - Before 11:00: index 15%, geo 35%, LLM direction 50% (消息面驱动)
+        - After 13:00: index 50%, geo 20%, LLM direction 30% (盘面驱动)
         """
         index_change = self._get_index_change()
-        index_score = max(-1, min(1, index_change / 3))  # ±3% = ±1
+        index_score = max(-1, min(1, index_change / 3))
 
         geo_score = 0.0
         llm_direction = 0.0
@@ -44,15 +38,26 @@ class MarketJudge:
             )
             llm_direction = geo_factors.get("market_direction", 0)
 
-        # Weighted: index 40%, geo 30%, LLM market direction 30%
+        # Time-adaptive weighting
+        hour = datetime.now().hour
+        if hour < 11:
+            # Early session: price unreliable, trust news/LLM more
+            w_index, w_geo, w_llm = 0.15, 0.35, 0.50
+        elif hour < 13:
+            # Mid-day: balanced
+            w_index, w_geo, w_llm = 0.30, 0.30, 0.40
+        else:
+            # Afternoon: price action is clear
+            w_index, w_geo, w_llm = 0.50, 0.20, 0.30
+
         final_score = (
-            index_score * 0.4
-            + geo_score * 0.3
-            + llm_direction * 0.3
+            index_score * w_index
+            + geo_score * w_geo
+            + llm_direction * w_llm
         )
         final_score = max(-1, min(1, final_score))
 
-        # Determine direction
+        # Direction
         if final_score > 0.5:
             direction = "强势"
         elif final_score > 0.15:
@@ -64,7 +69,7 @@ class MarketJudge:
         else:
             direction = "弱势"
 
-        # Suggested position
+        # Position
         if final_score > 0.5:
             position = "8成"
         elif final_score > 0.2:
@@ -76,8 +81,7 @@ class MarketJudge:
         else:
             position = "2成以下"
 
-        # Reason
-        reason = self._generate_reason(index_change, market_sent, geo_score, geo_factors)
+        reason = self._generate_reason(index_change, geo_score, geo_factors, hour)
 
         return {
             "direction": direction,
@@ -88,54 +92,55 @@ class MarketJudge:
         }
 
     def _get_index_change(self) -> float:
-        """Get CSI300 index change percentage."""
+        """Get CSI300 index change percentage.
+
+        Uses Tencent single-stock API directly (instant, no full market load).
+        """
         try:
-            import akshare as ak
-            # Try to get CSI300 ETF (510300) as proxy
-            quote = self.collector.fetch_realtime("sh510300")
-            if quote:
-                return quote.get("change_pct", 0)
+            # Direct Tencent call for index - bypasses slow AKShare full market load
+            quote = self.collector._fetch_realtime_tencent_single("sh000300")  # CSI300 index
+            if quote and quote.get("change_pct"):
+                return quote["change_pct"]
 
-            # Fallback: try shanghai composite
-            quote = self.collector.fetch_realtime("sh000001")
-            if quote:
-                return quote.get("change_pct", 0)
-
+            quote = self.collector._fetch_realtime_tencent_single("sh000001")  # Shanghai Composite
+            if quote and quote.get("change_pct"):
+                return quote["change_pct"]
         except Exception as e:
             logger.warning(f"Index fetch failed: {e}")
         return 0.0
 
-    def _generate_reason(self, index_change, market_sent, geo_score, geo_factors) -> str:
-        """Generate human-readable reason for market judgment."""
+    def _generate_reason(self, index_change, geo_score, geo_factors, hour) -> str:
+        """Generate human-readable reason."""
         parts = []
 
-        if abs(index_change) > 0.5:
-            if index_change > 0:
-                parts.append(f"大盘上涨{index_change:+.1f}%")
-            else:
-                parts.append(f"大盘下跌{index_change:+.1f}%")
-
-        if market_sent > 0.2:
-            parts.append("全球市场情绪偏暖")
-        elif market_sent < -0.2:
-            parts.append("全球市场情绪偏冷")
+        if abs(index_change) > 0.3:
+            parts.append(f"盘面{'上涨' if index_change > 0 else '下跌'}{index_change:+.1f}%")
 
         if geo_factors:
+            md = geo_factors.get("market_direction", 0)
+            if md > 0.3:
+                parts.append("消息面偏多")
+            elif md < -0.3:
+                parts.append("消息面偏空")
+
             if geo_factors.get("geo_risk_index", 0) < -0.3:
                 parts.append("地缘风险偏高")
+            if geo_factors.get("china_us_temperature", 0) > 0.3:
+                parts.append("中美关系缓和")
+            elif geo_factors.get("china_us_temperature", 0) < -0.3:
+                parts.append("中美关系紧张")
             if geo_factors.get("policy_signal", 0) < -0.3:
                 parts.append("政策偏紧")
             elif geo_factors.get("policy_signal", 0) > 0.3:
                 parts.append("政策偏松")
-            if geo_factors.get("china_us_temperature", 0) < -0.3:
-                parts.append("中美关系紧张")
-            elif geo_factors.get("china_us_temperature", 0) > 0.3:
-                parts.append("中美关系缓和")
+
+        if hour < 11:
+            parts.append("早盘研判以消息面为主")
 
         return "，".join(parts) if parts else "市场平稳"
 
     def format_for_report(self, judgment: dict) -> str:
-        """Format judgment for inclusion in push report header."""
+        """Format judgment for push report header."""
         return (
             f"大盘研判：{judgment['direction']}"
             f"（{judgment['reason']}）\n"
