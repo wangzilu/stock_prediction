@@ -6,6 +6,7 @@ from data.collectors.crypto import CryptoCollector
 from data.collectors.gold import GoldCollector
 from data.collectors.sentiment import SentimentCollector
 from data.collectors.macro import MacroCollector
+from data.collectors.global_indices import GlobalIndicesCollector
 from factors.sentiment import SentimentScorer
 from signals.scorer import SignalScorer
 from signals.risk_monitor import RiskMonitor
@@ -32,6 +33,7 @@ class DailyPipeline:
         self.sentiment_collector = SentimentCollector()
         self.macro_collector = MacroCollector()
         self.sentiment_scorer = SentimentScorer()
+        self.global_indices = GlobalIndicesCollector()
         self.signal_scorer = SignalScorer()
         self.risk_monitor = RiskMonitor()
         self.pusher = WeChatPusher()
@@ -199,13 +201,14 @@ class DailyPipeline:
         if not top_recs:
             top_recs = []  # LLM report will mention no signals
 
-        # Fetch crypto and gold data for report
+        # Fetch global market data for report
         crypto_data = {}
         for symbol in ["BTC/USDT", "ETH/USDT"]:
             q = self.crypto_collector.fetch_realtime(symbol)
             if q:
                 crypto_data[symbol] = q
         gold_data = self.gold_collector.fetch_realtime()
+        global_indices = self.global_indices.format_for_report()
 
         # Generate LLM-powered professional report
         logger.info("Generating LLM analyst report...")
@@ -216,6 +219,7 @@ class DailyPipeline:
             geo_factors=geo,
             crypto_data=crypto_data,
             gold_data=gold_data,
+            global_indices_text=global_indices,
         )
 
         success = self.pusher.send_recommendation(report)

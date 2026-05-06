@@ -161,6 +161,7 @@ class LLMAnalyst:
         geo_factors: dict,
         crypto_data: dict = None,
         gold_data: dict = None,
+        global_indices_text: str = "",
     ) -> str:
         """Generate a professional market analysis report.
 
@@ -206,6 +207,9 @@ class LLMAnalyst:
 【今日全球新闻头条（请全面分析所有重要事件，不要遗漏）】
 {headline_text}
 
+【全球股市行情（实时数据）】
+{global_indices_text if global_indices_text else '  数据暂无'}
+
 【A股大盘数据】
 大盘方向：{market_judgment.get('direction', '未知')}
 沪深300涨跌幅：{market_judgment.get('index_change', 0):+.2f}%
@@ -238,7 +242,9 @@ class LLMAnalyst:
    同时告诉读者：华尔街和全球投资者今天最关注什么？为什么？
    最后落脚到：这对全球金融市场和A股意味着什么？
 
-2. 📊 **A股大盘复盘与明日预判**（200-250字）
+2. 📊 **全球市场与A股大盘**（250-300字）
+   先快速点评美股、港股等主要市场的表现和驱动因素（基于实时数据）。
+   然后重点分析：
    今天A股为什么涨/跌？不要只描述数据，要给出因果链：
    "因为...（消息面/资金面/情绪面），所以...（哪些板块涨/跌），导致...（大盘方向）"
    基于今天的逻辑链，推导明天的走势方向。

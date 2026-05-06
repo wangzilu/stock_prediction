@@ -22,25 +22,32 @@ class MarketCollector:
     def __init__(self):
         self._spot_cache = None
         self._spot_loaded = False  # Prevent retry loop
+        self._akshare_down = False  # Skip AKShare entirely if it's down
 
     # ========== Daily OHLCV ==========
 
     def fetch_daily(self, code: str, days: int = 60) -> pd.DataFrame:
-        """Fetch daily OHLCV with retry + multi-source fallback.
+        """Fetch daily OHLCV with smart fallback.
 
         Priority: AKShare → baostock → Tencent (realtime only)
+        If AKShare is marked down, skip directly to baostock.
         """
-        df = self._fetch_daily_akshare(code, days)
-        if df.empty:
-            logger.info(f"AKShare daily failed for {code}, trying baostock...")
-            df = self._fetch_daily_baostock(code, days)
-        if df.empty:
-            logger.info(f"baostock daily failed for {code}, trying Tencent...")
-            df = self._fetch_daily_tencent(code, days)
-        return df
+        if not self._akshare_down:
+            df = self._fetch_daily_akshare(code, days)
+            if not df.empty:
+                return df
+
+        df = self._fetch_daily_baostock(code, days)
+        if not df.empty:
+            return df
+
+        return self._fetch_daily_tencent(code, days)
 
     def _fetch_daily_akshare(self, code: str, days: int) -> pd.DataFrame:
-        """Fetch daily via AKShare with retries."""
+        """Fetch daily via AKShare with retries. Skips if AKShare is known to be down."""
+        if self._akshare_down:
+            return pd.DataFrame()
+
         symbol = code[2:]
         end_date = datetime.now().strftime("%Y%m%d")
         start_date = (datetime.now() - timedelta(days=days * 2)).strftime("%Y%m%d")
@@ -63,6 +70,10 @@ class MarketCollector:
                 logger.warning(f"AKShare daily attempt {attempt+1}/{MAX_RETRIES} for {code}: {e}")
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(RETRY_DELAY)
+
+        # All retries failed — mark AKShare as down for this session
+        self._akshare_down = True
+        logger.info("AKShare marked as down — subsequent calls will skip to baostock")
         return pd.DataFrame()
 
     def _fetch_daily_baostock(self, code: str, days: int) -> pd.DataFrame:
@@ -229,9 +240,10 @@ class MarketCollector:
         return pd.DataFrame()
 
     def invalidate_cache(self):
-        """Clear spot cache to force refresh next call."""
+        """Clear all caches to force fresh data on next run."""
         self._spot_cache = None
         self._spot_loaded = False
+        self._akshare_down = False
 
     def fetch_realtime(self, code: str) -> dict:
         """Fetch realtime quote with automatic fallback."""
