@@ -78,7 +78,7 @@ class DailyPipeline:
             return self._geo_factors
 
         logger.info("Fetching global news from RSS...")
-        all_news = self.macro_collector.fetch_all(max_per_source=10)
+        all_news = self.macro_collector.fetch_all(max_per_source=15)
         headlines = [item.get("title", "") for item in all_news if item.get("title")]
         self._headlines = headlines
         logger.info(f"Fetched {len(headlines)} headlines from {len(all_news)} news items")
