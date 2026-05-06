@@ -7,8 +7,8 @@ from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 3
-RETRY_DELAY = 5  # seconds
+MAX_RETRIES = 1  # Only try AKShare once, then fallback immediately
+RETRY_DELAY = 3  # seconds
 
 
 class MarketCollector:

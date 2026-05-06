@@ -8,12 +8,16 @@ def _make_pipeline():
     """Create a fully mocked DailyPipeline."""
     pipeline = DailyPipeline.__new__(DailyPipeline)
     pipeline.market_collector = MagicMock()
+    pipeline.market_collector._spot_cache = None
+    pipeline.market_collector._spot_loaded = False
+    pipeline.market_collector._akshare_down = False
     pipeline.crypto_collector = MagicMock()
     pipeline.gold_collector = MagicMock()
     pipeline.sentiment_collector = MagicMock()
     pipeline.macro_collector = MagicMock()
     pipeline.sentiment_scorer = MagicMock()
     pipeline.signal_scorer = MagicMock()
+    pipeline.global_indices = MagicMock()
     pipeline.risk_monitor = MagicMock()
     pipeline.pusher = MagicMock()
     pipeline.verifier = MagicMock()
@@ -28,6 +32,12 @@ def test_pipeline_runs_without_error():
     """Pipeline should handle mocked components without crashing."""
     pipeline = _make_pipeline()
 
+    import pandas as pd
+    # Mock spot cache with sample data
+    pipeline.market_collector._spot_cache = pd.DataFrame([
+        {"代码": "600519", "名称": "贵州茅台", "最新价": 1800.0, "涨跌幅": 1.5, "成交量": 50000, "最高": 1820, "最低": 1780},
+    ])
+    pipeline.market_collector._spot_loaded = True
     pipeline.market_collector.fetch_realtime.return_value = {"price": 1800.0, "change_pct": 1.5}
     pipeline.crypto_collector.fetch_realtime.return_value = {"price": 100000.0, "change_pct": 2.0}
     pipeline.gold_collector.fetch_realtime.return_value = {"price": 550.0, "change_pct": 0.5}
@@ -49,6 +59,7 @@ def test_pipeline_runs_without_error():
         "reasoning": {"geo_risk": "test"},
     }
     pipeline.llm_analyst.generate_report.return_value = "LLM generated report"
+    pipeline.global_indices.format_for_report.return_value = "道琼斯: 49000 (+0.5%)"
 
     pipeline.market_judge.judge.return_value = {
         "direction": "中性", "score": 0.0, "reason": "市场平稳",

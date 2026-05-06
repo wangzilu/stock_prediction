@@ -117,42 +117,74 @@ class DailyPipeline:
         )
         logger.info(f"Market judgment: {market_judgment['direction']} ({market_judgment['reason']})")
 
-        # === Stage 1: Fast screening (price-based, all stocks) ===
-        logger.info(f"Stage 1: Screening {len(WATCHLIST)} instruments...")
+        # === Stage 1: Fast screening ALL A-shares + crypto + gold ===
+        logger.info("Stage 1: Screening all A-shares from spot cache...")
         candidates = []
 
-        for code, name, market in WATCHLIST:
-            try:
-                quote = self._get_quote(code, market)
-                if not quote:
+        # Load full market spot data once (5800+ stocks)
+        self.market_collector._load_spot_cache()
+        spot = self.market_collector._spot_cache
+        stock_macro = (geo["china_us_temperature"] + geo["policy_signal"]) / 2
+
+        if spot is not None and not spot.empty:
+            for _, row in spot.iterrows():
+                try:
+                    code_num = str(row["代码"])
+                    price = float(row["最新价"]) if row["最新价"] else 0
+                    change_pct = float(row["涨跌幅"]) if row["涨跌幅"] else 0
+                    if price <= 0:
+                        continue
+
+                    prefix = "SH" if code_num.startswith("6") else "SZ"
+                    qlib_code = f"{prefix}{code_num}"
+                    name = str(row.get("名称", code_num))
+
+                    candidates.append({
+                        "code": qlib_code,
+                        "name": name,
+                        "market": MARKET_STOCK,
+                        "short_score": change_pct / 10,
+                        "macro_score": stock_macro,
+                        "price": price,
+                    })
+                except Exception:
                     continue
+            logger.info(f"Screened {len(candidates)} A-shares from spot cache")
+        else:
+            logger.warning("Spot cache empty, falling back to watchlist")
+            for code, name, market in WATCHLIST:
+                if market != MARKET_STOCK:
+                    continue
+                quote = self._get_quote(code, market)
+                if quote:
+                    candidates.append({
+                        "code": code, "name": name, "market": market,
+                        "short_score": quote.get("change_pct", 0) / 10,
+                        "macro_score": stock_macro, "price": quote.get("price", 0),
+                    })
 
-                short_score = quote.get("change_pct", 0) / 10
-
-                # Quick macro adjustment
-                macro_score = 0.0
-                if market == MARKET_GOLD:
-                    macro_score = geo["safe_haven_signal"] * 2 - 1
-                elif market == MARKET_STOCK:
-                    macro_score = (geo["china_us_temperature"] + geo["policy_signal"]) / 2
-                elif market == MARKET_CRYPTO:
-                    macro_score = geo["geo_risk_index"]
-
+        # Add crypto + gold
+        for symbol in ["BTC/USDT", "ETH/USDT"]:
+            q = self.crypto_collector.fetch_realtime(symbol)
+            if q:
+                name = "比特币" if "BTC" in symbol else "以太坊"
                 candidates.append({
-                    "code": code,
-                    "name": name,
-                    "market": market,
-                    "short_score": short_score,
-                    "macro_score": macro_score,
-                    "price": quote.get("price", 0),
+                    "code": symbol, "name": name, "market": MARKET_CRYPTO,
+                    "short_score": q.get("change_pct", 0) / 10,
+                    "macro_score": geo["geo_risk_index"], "price": q.get("price", 0),
                 })
-            except Exception as e:
-                logger.warning(f"Screen failed for {code}: {e}")
+        gold_q = self.gold_collector.fetch_realtime()
+        if gold_q:
+            candidates.append({
+                "code": "AU", "name": "黄金", "market": MARKET_GOLD,
+                "short_score": gold_q.get("change_pct", 0) / 10,
+                "macro_score": geo["safe_haven_signal"] * 2 - 1, "price": gold_q.get("price", 0),
+            })
 
         # Sort by absolute short_score (strongest movers first)
         candidates.sort(key=lambda c: abs(c["short_score"]), reverse=True)
         top_candidates = candidates[:SENTIMENT_TOP_N]
-        logger.info(f"Stage 1 done: {len(candidates)} screened, top {len(top_candidates)} selected")
+        logger.info(f"Stage 1 done: {len(candidates)} total, top {len(top_candidates)} selected for deep analysis")
 
         # === Stage 2: Deep analysis (sentiment + mid-term model) ===
         logger.info("Stage 2: Deep analysis with sentiment + mid-term model...")
