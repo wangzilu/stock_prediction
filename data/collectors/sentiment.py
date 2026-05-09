@@ -104,8 +104,59 @@ class SentimentCollector:
         except Exception:
             return []
 
+    def fetch_akshare_comments(self, stock_code: str, limit: int = 20) -> list:
+        """Fetch stock comments via AKShare structured API (more reliable than HTML scraping).
+
+        Args:
+            stock_code: Pure numeric code, e.g. "600519"
+            limit: Max posts to return
+
+        Returns:
+            List of dicts with keys: text, timestamp, source
+        """
+        try:
+            import akshare as ak
+            # AKShare 个股评论情绪接口
+            df = ak.stock_comment_detail_zlkp_jgcyd_em(symbol=stock_code)
+            if df is None or df.empty:
+                return []
+
+            posts = []
+            for _, row in df.head(limit).iterrows():
+                text = str(row.get("用户评论", row.get("评论内容", "")))
+                if not text or len(text) < 4:
+                    continue
+                posts.append({
+                    "text": text[:500],
+                    "timestamp": datetime.now().isoformat(),
+                    "source": "akshare_comment",
+                })
+            return posts
+        except Exception as e:
+            # Fallback: try general comment sentiment
+            try:
+                import akshare as ak
+                df = ak.stock_comment_em()
+                if df is None or df.empty:
+                    return []
+                row = df[df["代码"] == stock_code]
+                if row.empty:
+                    return []
+                # Extract sentiment summary as a single "post"
+                r = row.iloc[0]
+                summary = f"关注度:{r.get('关注指数', 'N/A')} 参与度:{r.get('参与指数', 'N/A')}"
+                return [{
+                    "text": summary,
+                    "timestamp": datetime.now().isoformat(),
+                    "source": "akshare_sentiment",
+                }]
+            except Exception:
+                return []
+
     def fetch_all(self, qlib_code: str, limit_per_source: int = 20) -> list:
         """Fetch sentiment from all sources for a stock.
+
+        Priority: AKShare API > Eastmoney HTML > Xueqiu (often blocked)
 
         Args:
             qlib_code: Qlib format code, e.g. "SH600519"
@@ -115,9 +166,21 @@ class SentimentCollector:
             Combined list of posts from all sources
         """
         stock_code = qlib_code[2:]
+        all_posts = []
 
-        xueqiu_posts = self.fetch_xueqiu(qlib_code, limit_per_source)
-        time.sleep(0.5)
-        eastmoney_posts = self.fetch_eastmoney(stock_code, limit_per_source)
+        # Source 1: AKShare structured API (most reliable)
+        ak_posts = self.fetch_akshare_comments(stock_code, limit_per_source)
+        all_posts.extend(ak_posts)
 
-        return xueqiu_posts + eastmoney_posts
+        # Source 2: Eastmoney HTML (fragile but sometimes has more data)
+        if len(all_posts) < limit_per_source:
+            em_posts = self.fetch_eastmoney(stock_code, limit_per_source)
+            all_posts.extend(em_posts)
+
+        # Source 3: Xueqiu (often blocked, try as last resort)
+        if len(all_posts) < 5:
+            time.sleep(0.5)
+            xq_posts = self.fetch_xueqiu(qlib_code, limit_per_source)
+            all_posts.extend(xq_posts)
+
+        return all_posts
