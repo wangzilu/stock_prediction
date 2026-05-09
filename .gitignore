@@ -11,3 +11,6 @@ data/storage/
 *.db
 .venv/
 venv/
+logs/
+mlruns/
+.claude/

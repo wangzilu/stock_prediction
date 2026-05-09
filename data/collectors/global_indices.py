@@ -17,7 +17,10 @@ INDICES = {
     "恒生科技": "hkHSTECH",
     "沪深300": "sh000300",
     "上证指数": "sh000001",
+    "深证成指": "sz399001",
     "创业板指": "sz399006",
+    "科创50": "sh000688",
+    "北证50": "bj899050",
 }
 
 
@@ -61,9 +64,9 @@ class GlobalIndicesCollector:
             logger.warning(f"Index fetch failed for {code}: {e}")
             return {}
 
-    def format_for_report(self) -> str:
+    def format_for_report(self, data: dict = None) -> str:
         """Fetch all indices and format as text for LLM context."""
-        data = self.fetch_all()
+        data = data if data is not None else self.fetch_all()
         if not data:
             return "全球指数数据暂无"
 

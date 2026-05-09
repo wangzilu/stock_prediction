@@ -1,12 +1,19 @@
 import pandas as pd
+import numpy as np
 from datetime import datetime
 
 import qlib
+from qlib.constant import REG_CN
 from qlib.data.dataset import DatasetH
 from qlib.contrib.model.gbdt import LGBModel
 from qlib.utils import init_instance_by_config
 
-from config.settings import QLIB_PROVIDER_URI, PREDICTION_HORIZON_DAYS, TOP_K_STOCKS
+from config.settings import (
+    QLIB_PROVIDER_URI,
+    PREDICTION_HORIZON_DAYS,
+    TOP_K_STOCKS,
+    LGB_INFERENCE_UNIVERSE,
+)
 from config.watchlist import WATCHLIST_STOCK
 
 
@@ -20,12 +27,137 @@ class ShortTermModel:
         self._model = None
         self._dataset = None
         self._initialized = False
+        self.latest_prediction_date = ""
+
+    @staticmethod
+    def _normalize_code(code) -> str:
+        text = str(code).upper()
+        if "." in text:
+            left, right = text.split(".", 1)
+            if right in ("SH", "SS"):
+                return f"SH{left.zfill(6)}"
+            if right == "SZ":
+                return f"SZ{left.zfill(6)}"
+        return text
+
+    @staticmethod
+    def _score_column(predictions: pd.DataFrame):
+        if "score" in predictions.columns:
+            return "score"
+        if len(predictions.columns) == 1:
+            return predictions.columns[0]
+        numeric_cols = [
+            col for col in predictions.columns
+            if pd.api.types.is_numeric_dtype(predictions[col])
+        ]
+        if len(numeric_cols) == 1:
+            return numeric_cols[0]
+        raise RuntimeError("Qlib prediction output does not contain a score column")
+
+    @staticmethod
+    def _datetime_level(index: pd.MultiIndex) -> int:
+        for i, name in enumerate(index.names):
+            if name and str(name).lower() in ("datetime", "date"):
+                return i
+        for i in range(index.nlevels):
+            values = index.get_level_values(i)
+            if pd.api.types.is_datetime64_any_dtype(values):
+                return i
+        return 0
+
+    @staticmethod
+    def _instrument_level(index: pd.MultiIndex, date_level: int) -> int:
+        for i, name in enumerate(index.names):
+            if name and str(name).lower() in ("instrument", "code", "symbol"):
+                return i
+        return 1 if date_level == 0 and index.nlevels > 1 else 0
+
+    @classmethod
+    def _prediction_frame(cls, predictions) -> pd.DataFrame:
+        if isinstance(predictions, pd.Series):
+            predictions = predictions.to_frame("score")
+        if not isinstance(predictions, pd.DataFrame):
+            raise RuntimeError(
+                f"Qlib prediction output must be a DataFrame or Series, got {type(predictions).__name__}"
+            )
+        if predictions.empty:
+            raise RuntimeError("Qlib model produced empty predictions")
+
+        score_col = cls._score_column(predictions)
+        scores = pd.to_numeric(predictions[score_col], errors="coerce").astype("float64")
+        normalized = predictions.copy()
+        normalized["score"] = scores
+        return normalized[["score"]]
+
+    @classmethod
+    def _normalize_prediction_frame(cls, predictions) -> pd.DataFrame:
+        normalized = cls._prediction_frame(predictions)
+        scores = normalized["score"]
+        finite_mask = np.isfinite(scores.to_numpy())
+
+        normalized = normalized.loc[finite_mask].copy()
+        if normalized.empty:
+            raise RuntimeError("Qlib model produced no finite predictions")
+        return normalized[["score"]]
+
+    @classmethod
+    def _latest_finite_predictions(cls, predictions) -> pd.DataFrame:
+        normalized = cls._prediction_frame(predictions)
+        if not isinstance(normalized.index, pd.MultiIndex):
+            finite_mask = np.isfinite(normalized["score"].to_numpy())
+            latest = normalized.loc[finite_mask].copy()
+            if latest.empty:
+                raise RuntimeError("Qlib model produced no finite predictions")
+            latest.index = [cls._normalize_code(code) for code in latest.index]
+            return latest
+
+        index = normalized.index
+        date_level = cls._datetime_level(index)
+        instrument_level = cls._instrument_level(index, date_level)
+        latest_date = index.get_level_values(date_level).max()
+
+        finite_mask = np.isfinite(normalized["score"].to_numpy())
+        finite = normalized.loc[finite_mask].copy()
+        if finite.empty:
+            raise RuntimeError("Qlib model produced no finite predictions")
+
+        finite["_datetime"] = pd.to_datetime(
+            finite.index.get_level_values(date_level),
+            errors="coerce",
+        )
+        finite["_instrument"] = [
+            cls._normalize_code(code)
+            for code in finite.index.get_level_values(instrument_level)
+        ]
+        finite = finite.dropna(subset=["_datetime"])
+        if finite.empty:
+            raise RuntimeError("Qlib model produced no finite dated predictions")
+
+        finite = finite.sort_values(["_instrument", "_datetime"])
+        latest = finite.groupby("_instrument", sort=False).tail(1).copy()
+        latest.index = latest["_instrument"]
+        latest = latest[~latest.index.duplicated(keep="last")]
+        selected_dates = latest["_datetime"].copy()
+        latest = latest[["score"]]
+        if latest.empty:
+            raise RuntimeError("Qlib model produced no finite latest-date predictions")
+        try:
+            latest.attrs["latest_date"] = pd.Timestamp(latest_date).strftime("%Y-%m-%d")
+        except Exception:
+            latest.attrs["latest_date"] = str(latest_date)
+        try:
+            latest.attrs["stale_prediction_count"] = int(
+                (selected_dates < pd.Timestamp(latest_date)).sum()
+            )
+        except Exception:
+            latest.attrs["stale_prediction_count"] = 0
+        return latest
 
     def initialize(self):
         """Initialize Qlib and prepare model."""
         if self._initialized:
             return
-        qlib.init(provider_uri=QLIB_PROVIDER_URI, region_type="cn")
+        qlib.init(provider_uri=QLIB_PROVIDER_URI, region=REG_CN)
         self._initialized = True
 
     def train(
@@ -44,7 +176,7 @@ class ShortTermModel:
             "kwargs": {
                 "start_time": train_start,
                 "end_time": valid_end,
-                "instruments": "csi300",
+                "instruments": LGB_INFERENCE_UNIVERSE,
                 "label": [
                     f"Ref($close, -{PREDICTION_HORIZON_DAYS}) / Ref($close, -1) - 1"
                 ],
@@ -102,24 +234,21 @@ class ShortTermModel:
         if date is None:
             date = datetime.now().strftime("%Y-%m-%d")
 
-        predictions = self._model.predict(dataset=self._dataset)
+        latest_preds = self._latest_finite_predictions(
+            self._model.predict(dataset=self._dataset)
+        )
 
-        if isinstance(predictions, pd.Series):
-            predictions = predictions.to_frame("score")
-
-        latest_date = predictions.index.get_level_values(0).max()
-        latest_preds = predictions.loc[latest_date]
-
-        watchlist_codes = {code for code, _ in WATCHLIST_STOCK}
+        watchlist_codes = {self._normalize_code(code) for code, _ in WATCHLIST_STOCK}
         watchlist_map = {code: name for code, name in WATCHLIST_STOCK}
 
         results = []
-        for code in latest_preds.index:
+        for raw_code in latest_preds.index:
+            code = self._normalize_code(raw_code)
             if code in watchlist_codes:
                 results.append({
                     "code": code,
                     "name": watchlist_map.get(code, ""),
-                    "score": float(latest_preds.loc[code, "score"]),
+                    "score": float(latest_preds.loc[raw_code, "score"]),
                 })
 
         df = pd.DataFrame(results)
@@ -129,3 +258,70 @@ class ShortTermModel:
         df = df.sort_values("score", ascending=False).reset_index(drop=True)
         df["rank"] = range(1, len(df) + 1)
         return df.head(TOP_K_STOCKS)
+
+    @classmethod
+    def load_from_pickle(cls, model_path: str = None, dataset_path: str = None):
+        """Load pre-trained model and rebuild dataset for inference.
+
+        The dataset is rebuilt fresh from Qlib to avoid pickle
+        incompatibility with Alpha158 handler across Qlib versions.
+        """
+        import pickle
+        from datetime import datetime, timedelta
+        from config.settings import DATA_DIR
+
+        model_path = model_path or str(DATA_DIR / "lgb_model.pkl")
+
+        instance = cls()
+        instance.initialize()
+
+        with open(model_path, "rb") as f:
+            instance._model = pickle.load(f)
+
+        # Rebuild dataset fresh — avoids Alpha158 pickle issues
+        today = datetime.now()
+        test_start = (today - timedelta(days=29)).strftime("%Y-%m-%d")
+        test_end = today.strftime("%Y-%m-%d")
+
+        handler_config = {
+            "class": "Alpha158",
+            "module_path": "qlib.contrib.data.handler",
+            "kwargs": {
+                "start_time": test_start,
+                "end_time": test_end,
+                "instruments": LGB_INFERENCE_UNIVERSE,
+            },
+        }
+        dataset_config = {
+            "class": "DatasetH",
+            "module_path": "qlib.data.dataset",
+            "kwargs": {
+                "handler": handler_config,
+                "segments": {
+                    "test": (test_start, test_end),
+                },
+            },
+        }
+        instance._dataset = init_instance_by_config(dataset_config)
+        return instance
+
+    def predict_batch(self) -> dict:
+        """Generate predictions for ALL stocks in the dataset.
+
+        Returns:
+            Dict mapping qlib_code (e.g. 'SH600519') to predicted score (float).
+        """
+        if self._model is None:
+            raise RuntimeError("Model not loaded. Call load_from_pickle() first.")
+
+        latest_preds = self._latest_finite_predictions(
+            self._model.predict(dataset=self._dataset)
+        )
+        self.latest_prediction_date = str(latest_preds.attrs.get("latest_date", ""))
+        result = {
+            self._normalize_code(code): float(row["score"])
+            for code, row in latest_preds.iterrows()
+        }
+        if not result:
+            raise RuntimeError("Qlib model produced no finite latest-date predictions")
+        return result

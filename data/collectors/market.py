@@ -3,12 +3,21 @@ import akshare as ak
 import requests
 import logging
 import time
+import json
+import os
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional, Union
+
+from config.settings import SPOT_CACHE_META_PATH, SPOT_CACHE_PATH, SPOT_CACHE_TTL_SECONDS
 
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 1  # Only try AKShare once, then fallback immediately
 RETRY_DELAY = 3  # seconds
+MARKET_OPEN_MINUTE = 9 * 60 + 25
+MARKET_CLOSE_MINUTE = 15 * 60
+AFTER_CLOSE_CACHE_MINUTE = 15 * 60 + 10
 
 
 class MarketCollector:
@@ -19,11 +28,19 @@ class MarketCollector:
     2. Tencent Finance API - fallback, fast and stable from overseas
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        spot_cache_path: Union[Path, str] = SPOT_CACHE_PATH,
+        spot_cache_meta_path: Union[Path, str] = SPOT_CACHE_META_PATH,
+        spot_cache_ttl_seconds: int = SPOT_CACHE_TTL_SECONDS,
+    ):
         self._spot_cache = None
         self._spot_loaded = False  # Prevent retry loop
         self._akshare_down = False  # Skip AKShare entirely if it's down
         self._bs_logged_in = False  # baostock session state
+        self._spot_cache_path = Path(spot_cache_path)
+        self._spot_cache_meta_path = Path(spot_cache_meta_path)
+        self._spot_cache_ttl_seconds = spot_cache_ttl_seconds
 
     # ========== Daily OHLCV ==========
 
@@ -155,9 +172,91 @@ class MarketCollector:
 
     # ========== Realtime ==========
 
+    @staticmethod
+    def _minute_of_day(value: datetime) -> int:
+        return value.hour * 60 + value.minute
+
+    @classmethod
+    def _is_trading_session(cls, value: datetime) -> bool:
+        minute = cls._minute_of_day(value)
+        return (
+            value.weekday() < 5
+            and MARKET_OPEN_MINUTE <= minute <= MARKET_CLOSE_MINUTE
+        )
+
+    @classmethod
+    def _is_after_close(cls, value: datetime) -> bool:
+        return value.weekday() < 5 and cls._minute_of_day(value) >= AFTER_CLOSE_CACHE_MINUTE
+
+    @classmethod
+    def _is_after_close_snapshot(cls, value: datetime) -> bool:
+        return cls._minute_of_day(value) >= AFTER_CLOSE_CACHE_MINUTE
+
+    def _read_spot_disk_cache(self) -> Optional[pd.DataFrame]:
+        """Read a fresh-enough A-share spot snapshot from disk."""
+        if not self._spot_cache_path.exists() or not self._spot_cache_meta_path.exists():
+            return None
+
+        try:
+            meta = json.loads(self._spot_cache_meta_path.read_text(encoding="utf-8"))
+            created_at = datetime.fromisoformat(meta.get("created_at", ""))
+            now = datetime.now()
+            age_seconds = (now - created_at).total_seconds()
+
+            if self._is_trading_session(now):
+                if created_at.date() != now.date() or age_seconds > self._spot_cache_ttl_seconds:
+                    return None
+            elif self._is_after_close(now):
+                if created_at.date() != now.date() or not self._is_after_close_snapshot(created_at):
+                    return None
+            else:
+                # Pre-open/off-hours: previous after-close cache is the latest confirmed snapshot.
+                if age_seconds > 18 * 3600 or not self._is_after_close_snapshot(created_at):
+                    return None
+
+            df = pd.read_csv(self._spot_cache_path, dtype={"代码": str})
+            if df.empty:
+                return None
+            logger.info(
+                "Loaded A-share spot data from disk cache: %s stocks, source=%s, created_at=%s",
+                len(df),
+                meta.get("source", "unknown"),
+                meta.get("created_at", ""),
+            )
+            return df
+        except Exception as e:
+            logger.warning(f"Failed to read A-share spot disk cache: {e}")
+            return None
+
+    def _write_spot_disk_cache(self, df: pd.DataFrame, source: str) -> None:
+        """Persist a full A-share spot snapshot for later one-shot runs."""
+        if df is None or df.empty:
+            return
+        try:
+            self._spot_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_csv = self._spot_cache_path.with_name(f"{self._spot_cache_path.name}.tmp")
+            tmp_meta = self._spot_cache_meta_path.with_name(f"{self._spot_cache_meta_path.name}.tmp")
+            df.to_csv(tmp_csv, index=False, encoding="utf-8")
+            meta = {
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "source": source,
+                "row_count": int(len(df)),
+            }
+            tmp_meta.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp_csv, self._spot_cache_path)
+            os.replace(tmp_meta, self._spot_cache_meta_path)
+        except Exception as e:
+            logger.warning(f"Failed to write A-share spot disk cache: {e}")
+
     def _load_spot_cache(self):
         """Load full A-share spot data with retry + fallback."""
         if self._spot_loaded:
+            return
+
+        cached = self._read_spot_disk_cache()
+        if cached is not None and not cached.empty:
+            self._spot_cache = cached
+            self._spot_loaded = True
             return
 
         # Try AKShare (eastmoney) with retries
@@ -167,6 +266,7 @@ class MarketCollector:
                 self._spot_cache = ak.stock_zh_a_spot_em()
                 if self._spot_cache is not None and not self._spot_cache.empty:
                     logger.info(f"Loaded {len(self._spot_cache)} stocks via AKShare")
+                    self._write_spot_disk_cache(self._spot_cache, "akshare")
                     self._spot_loaded = True
                     return
             except Exception as e:
@@ -177,7 +277,28 @@ class MarketCollector:
         # Fallback to Tencent batch API
         logger.info("AKShare spot failed, falling back to Tencent...")
         self._spot_cache = self._load_spot_tencent()
+        self._write_spot_disk_cache(self._spot_cache, "tencent")
         self._spot_loaded = True  # Don't retry even if Tencent also failed
+
+    def warm_spot_cache(self) -> dict:
+        """Force-refresh the full-market spot cache and return cache metadata."""
+        self._spot_cache = None
+        self._spot_loaded = False
+        self._akshare_down = False
+        self._load_spot_cache()
+
+        meta = {}
+        if self._spot_cache_meta_path.exists():
+            try:
+                meta = json.loads(self._spot_cache_meta_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.warning(f"Failed to read warmed spot cache metadata: {e}")
+        return {
+            "row_count": int(len(self._spot_cache)) if self._spot_cache is not None else 0,
+            "source": meta.get("source", "memory"),
+            "created_at": meta.get("created_at", ""),
+            "cache_path": str(self._spot_cache_path),
+        }
 
     def _load_spot_tencent(self) -> pd.DataFrame:
         """Fallback: load realtime quotes from Tencent Finance API.

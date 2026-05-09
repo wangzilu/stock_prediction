@@ -13,7 +13,7 @@ from config.settings import MINIMAX_API_KEY
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """你是一位顶级金融分析师和地缘政治分析专家，风格参考"振海听风"。你的任务是基于提供的全球新闻头条、市场数据和地缘政治信息，撰写专业的每日市场研判报告。
+SYSTEM_PROMPT = """你是一位顶级金融分析师和地缘政治分析专家，结构参考"震海听风"式的清晰时政财经短评，但不要模仿具体措辞。你的任务是基于提供的全球新闻头条、市场数据和地缘政治信息，撰写专业的每日市场研判报告。
 
 核心写作原则：
 1. 因果逻辑链条是灵魂：不是罗列事件，而是分析"A导致B，B导致C，所以影响D"
@@ -182,6 +182,7 @@ class LLMAnalyst:
         crypto_data: dict = None,
         gold_data: dict = None,
         global_indices_text: str = "",
+        horizon_recommendations_text: str = "",
     ) -> str:
         """Generate a professional market analysis report.
 
@@ -201,8 +202,15 @@ class LLMAnalyst:
         rec_text = ""
         if recommendations:
             for i, rec in enumerate(recommendations, 1):
-                display_code = rec.code[2:] if rec.code[:2] in ("SH", "SZ") else rec.code
-                rec_text += f"{i}. {rec.name}({display_code}) | 评分{(rec.final_score+1)*5:.1f} | {rec.reason}\n"
+                display_code = rec.code[2:] if rec.code[:2] in ("SH", "SZ", "BJ") else rec.code
+                next_day = ""
+                if getattr(rec, "horizon", "") == "短线" and getattr(rec, "next_day_change_pct", None) is not None:
+                    next_day = f" | 明日预测{rec.next_day_change_pct:+.2f}%"
+                horizon = f" | {rec.horizon}" if getattr(rec, "horizon", "") else ""
+                rec_text += (
+                    f"{i}. {rec.name}({display_code}){horizon}{next_day} | "
+                    f"评分{(rec.final_score+1)*5:.1f} | {rec.reason}\n"
+                )
 
         reasoning_text = ""
         if geo_factors.get("reasoning"):
@@ -251,6 +259,9 @@ class LLMAnalyst:
 【今日推荐标的】
 {rec_text if rec_text else '暂无明确推荐信号'}
 
+【长中短线分类推荐】
+{horizon_recommendations_text if horizon_recommendations_text else '暂无分组推荐'}
+
 请撰写研判报告，严格包含以下5个板块：
 
 1. 📌 **全球局势**（200-300字）
@@ -279,7 +290,8 @@ class LLMAnalyst:
    当前该买入还是观望？
 
 5. 💡 **个股推荐与操作建议**（100-150字）
-   如有推荐标的则逐个说明推荐逻辑（不是罗列指标）。
+   必须按短线、中线、长线分别说明推荐逻辑（不是罗列指标）。
+   短线标的必须引用明日预测涨跌幅。
    如无推荐则说明观望理由和应该关注的方向/板块。
 
 关键要求：
@@ -306,13 +318,94 @@ class LLMAnalyst:
         ]
         if recommendations:
             for i, rec in enumerate(recommendations, 1):
-                display_code = rec.code[2:] if rec.code[:2] in ("SH", "SZ") else rec.code
+                display_code = rec.code[2:] if rec.code[:2] in ("SH", "SZ", "BJ") else rec.code
                 score = round((rec.final_score + 1) * 5, 1)
                 lines.append(f"{i}. {rec.name}({display_code}) | {rec.signal} | {score}")
                 lines.append(f"   {rec.reason}")
         else:
             lines.append("暂无明确推荐信号，建议观望")
         return "\n".join(lines)
+
+    def generate_summary(self, data: dict) -> str:
+        """Generate daily market close summary."""
+        user_prompt = f"""请基于以下数据撰写今日收盘市场总结（300-500字）：
+
+全球指数：
+{data.get('global_indices', '无数据')}
+
+加密货币：{json.dumps(data.get('crypto_data', {}), ensure_ascii=False)}
+黄金：{json.dumps(data.get('gold_data', {}), ensure_ascii=False)}
+
+地缘政治因素：{json.dumps(data.get('geo_factors', {}), ensure_ascii=False)}
+
+今日重要新闻：
+{chr(10).join(data.get('headlines', [])[:20])}
+
+要求：
+1. 总结今日A股、港股、美股期货走势
+2. 分析主要驱动因素
+3. 点评板块轮动
+4. 给出明日开盘预判"""
+
+        return self._call_llm(SYSTEM_PROMPT, user_prompt, max_tokens=2048)
+
+    def generate_outlook(self, data: dict) -> str:
+        """Generate evening outlook for next trading day."""
+        top_bull = data.get("top_bullish", [])
+        top_bear = data.get("top_bearish", [])
+
+        bull_text = "\n".join([f"  {b['code']}: {b['score']:.4f}" for b in top_bull])
+        bear_text = "\n".join([f"  {b['code']}: {b['score']:.4f}" for b in top_bear])
+
+        user_prompt = f"""请撰写明日市场展望的前三段宏观主线（350-650字）。
+
+重要：你只输出以下三段，不要输出大盘预测表、个股列表、黄金、加密货币，因为这些会由程序在后面统一拼接。不要写标题之外的开场白。
+
+固定结构：
+一、世界大事
+二、对世界格局的影响
+三、对投资的影响
+
+写法要求：
+- 每段只抓1-2个真正重要的主线，不要罗列新闻
+- 用"事件 → 格局变化 → 资金/风险偏好 → 投资动作"的因果链
+- 观点明确，语言克制，不要重复数字表
+
+结构化大盘预测：
+{data.get('market_prediction_text', '未生成')}
+
+上证/深证/北证/科创预测：
+{data.get('a_share_forecast_text', '未生成')}
+
+个股预测：
+{data.get('short_candidates_text', '暂无')}
+
+黄金预测：
+{data.get('gold_forecast_text', '暂无')}
+
+加密货币预测：
+{data.get('crypto_forecast_text', '暂无')}
+
+模型看多前10:
+{bull_text}
+
+模型看空后5:
+{bear_text}
+
+全球指数：
+{data.get('global_indices', '无数据')}
+
+加密货币：{json.dumps(data.get('crypto_data', {}), ensure_ascii=False)}
+黄金：{json.dumps(data.get('gold_data', {}), ensure_ascii=False)}
+
+地缘因素：{json.dumps(data.get('geo_factors', {}), ensure_ascii=False)}
+
+夜间新闻：
+{chr(10).join(data.get('headlines', [])[:20])}
+
+再次强调：最终输出只包含"一、世界大事""二、对世界格局的影响""三、对投资的影响"三段。"""
+
+        return self._call_llm(SYSTEM_PROMPT, user_prompt, max_tokens=2048)
 
     def _default_geo_result(self):
         return {

@@ -14,8 +14,13 @@ if _env_file.exists():
 DATA_DIR = PROJECT_ROOT / "data" / "storage"
 QLIB_DATA_DIR = DATA_DIR / "qlib_data"
 DB_PATH = DATA_DIR / "tracker.db"
+SPOT_CACHE_PATH = DATA_DIR / "a_share_spot_cache.csv"
+SPOT_CACHE_META_PATH = DATA_DIR / "a_share_spot_cache.meta.json"
+SPOT_CACHE_TTL_SECONDS = int(os.environ.get("SPOT_CACHE_TTL_SECONDS", "300"))
 
-QLIB_PROVIDER_URI = str(QLIB_DATA_DIR / "cn_data")
+QLIB_PROVIDER_URI = os.environ.get("QLIB_PROVIDER_URI", str(QLIB_DATA_DIR / "cn_data"))
+QLIB_DATA_PROVIDER = os.environ.get("QLIB_DATA_PROVIDER", "auto")
+QLIB_UNIVERSE_SOURCE = os.environ.get("QLIB_UNIVERSE_SOURCE", "baostock")
 
 HIGH_THRESHOLD = 0.7
 MID_THRESHOLD = 0.3
@@ -35,3 +40,19 @@ MAX_PUSH_PER_STOCK_PER_DAY = 2
 
 PREDICTION_HORIZON_DAYS = 5
 TOP_K_STOCKS = 5
+LGB_MIN_PREDICTIONS = int(os.environ.get("LGB_MIN_PREDICTIONS", "4500"))
+LGB_INFERENCE_UNIVERSE = os.environ.get("LGB_INFERENCE_UNIVERSE", "all")
+LGB_MIN_DATA_INSTRUMENTS = int(os.environ.get("LGB_MIN_DATA_INSTRUMENTS", "4500"))
+LGB_CACHE_MAX_AGE_DAYS = int(os.environ.get("LGB_CACHE_MAX_AGE_DAYS", "7"))
+
+# Model paths
+RL_MODEL_PATH = DATA_DIR / "rl_model.pt"
+LGB_MODEL_PATH = DATA_DIR / "lgb_model.pkl"
+LGB_PREDICTION_CACHE_PATH = DATA_DIR / "lgb_latest_predictions.json"
+MID_MODEL_PATH = DATA_DIR / "mid_model.pt"
+OVERNIGHT_STOCK_SNAPSHOT_PATH = DATA_DIR / "overnight_stock_forecasts.json"
+
+# Sell check thresholds
+TAKE_PROFIT_PCT = 8.0   # sell if gain >= 8%
+STOP_LOSS_PCT = 5.0      # sell if loss >= 5%
+LGB_FLIP_THRESHOLD = -0.02  # sell if LGB score drops below this

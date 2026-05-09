@@ -1,7 +1,22 @@
 from dataclasses import dataclass, field
 from datetime import datetime
+import math
+from typing import Optional
 
 from config.settings import HIGH_THRESHOLD, MID_THRESHOLD
+
+
+def _finite_float(value, default=0.0):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _clamp(value, low=-1.0, high=1.0, default=0.0):
+    number = _finite_float(value, default)
+    return max(low, min(high, number))
 
 
 @dataclass
@@ -20,6 +35,11 @@ class Recommendation:
     mid_term_score: float = 0.0
     macro_score: float = 0.0
     has_divergence: bool = False  # Short and mid disagree
+    rl_action: str = "hold"  # buy / hold / sell
+    rl_confidence: float = 0.0
+    horizon: str = ""
+    horizon_score: float = 0.0
+    next_day_change_pct: Optional[float] = None
 
 
 @dataclass
@@ -72,10 +92,11 @@ class SignalScorer:
         Returns:
             Recommendation with fused signal
         """
-        short = max(-1.0, min(1.0, model_score))
-        mid = max(-1.0, min(1.0, mid_term_score))
-        sent = max(-1.0, min(1.0, sentiment_score))
-        macro = max(-1.0, min(1.0, macro_score))
+        short = _clamp(model_score)
+        mid = _clamp(mid_term_score)
+        sent = _clamp(sentiment_score)
+        heat = _clamp(sentiment_heat, low=0.0, high=1.0)
+        macro = _clamp(macro_score)
 
         # Detect divergence: short and mid disagree on direction
         has_divergence = (short > 0.2 and mid < -0.2) or (short < -0.2 and mid > 0.2)
@@ -104,7 +125,7 @@ class SignalScorer:
         if has_divergence and signal != "观望":
             signal += "(分歧)"
 
-        reason = self._generate_reason(short, mid, sent, sentiment_heat, macro)
+        reason = self._generate_reason(short, mid, sent, heat, macro)
 
         return Recommendation(
             code=code,
@@ -113,7 +134,7 @@ class SignalScorer:
             signal=signal,
             model_score=round(short, 2),
             sentiment_score=round(sent, 2),
-            sentiment_heat=round(sentiment_heat, 2),
+            sentiment_heat=round(heat, 2),
             reason=reason,
             short_term_score=round(short, 2),
             mid_term_score=round(mid, 2),
@@ -182,8 +203,12 @@ class SignalScorer:
         for i, rec in enumerate(recommendations, 1):
             score_display = round((rec.final_score + 1) * 5, 1)
             display_code = rec.code[2:] if rec.code[:2] in ("SH", "SZ") else rec.code
+            horizon = f" | {rec.horizon}" if rec.horizon else ""
+            next_day = ""
+            if rec.next_day_change_pct is not None:
+                next_day = f" | 明日{rec.next_day_change_pct:+.2f}%"
             lines.append(
-                f"{i}. {rec.name}({display_code}) | {rec.signal} | 评分 {score_display}"
+                f"{i}. {rec.name}({display_code}) | {rec.signal}{horizon}{next_day} | 评分 {score_display}"
             )
             lines.append(f"   理由：{rec.reason}")
 
@@ -199,6 +224,29 @@ class SignalScorer:
                 position = "3成以下"
             lines.append(f"建议仓位：{position}")
 
+        return "\n".join(lines)
+
+    def generate_sell_report(self, sell_items: list) -> str:
+        """Generate formatted sell-check report.
+
+        Args:
+            sell_items: list of dicts with keys:
+                code, name, reason, gain_pct, rec_date
+        """
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        lines = [f"📉 盘中卖出建议 ({now})", "─────────────"]
+
+        for item in sell_items:
+            gain = item["gain_pct"]
+            sign = "+" if gain >= 0 else ""
+            lines.append(f"• {item['name']}({item['code'][-6:]})")
+            lines.append(f"  推荐日: {item['rec_date']} | 收益: {sign}{gain:.1f}%")
+            lines.append(f"  触发: {item['reason']}")
+
+        if not sell_items:
+            lines.append("暂无卖出建议，持仓继续观察。")
+
+        lines.append("─────────────")
         return "\n".join(lines)
 
     def generate_alert_message(self, alert: RiskAlert) -> str:

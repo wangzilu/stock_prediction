@@ -61,3 +61,19 @@ class WeChatPusher:
     def send_verification(self, verification_report: str) -> bool:
         """Send 5-day verification report."""
         return self.send(verification_report, title="📋 荐股印证")
+
+    def send_sell_check(self, report: str) -> bool:
+        """Send sell-check report."""
+        return self.send(report, title="📉 盘中卖出建议")
+
+    def send_intraday_decision(self, report: str) -> bool:
+        """Send 14:30 intraday decision report."""
+        return self.send(report, title="📌 14:30盘中决策")
+
+    def send_daily_summary(self, report: str) -> bool:
+        """Send daily market summary."""
+        return self.send(report, title="📊 收盘总结")
+
+    def send_evening_outlook(self, report: str) -> bool:
+        """Send evening outlook report."""
+        return self.send(report, title="🌙 明日展望")

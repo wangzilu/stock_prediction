@@ -1,3 +1,5 @@
+import math
+
 import pytest
 from signals.scorer import SignalScorer, Recommendation
 
@@ -45,6 +47,28 @@ def test_low_score_gives_bearish_signal():
     assert rec.signal in ("强烈看空", "看空")
 
 
+def test_score_stock_coerces_nan_inputs_to_neutral():
+    """Non-finite upstream scores should not leak into recommendations."""
+    scorer = SignalScorer()
+    rec = scorer.score_stock(
+        code="SH600519",
+        name="贵州茅台",
+        model_score=float("nan"),
+        sentiment_score=float("inf"),
+        sentiment_heat=float("nan"),
+        mid_term_score=float("-inf"),
+        macro_score=float("nan"),
+    )
+
+    assert rec.final_score == 0.0
+    assert rec.model_score == 0.0
+    assert rec.sentiment_score == 0.0
+    assert rec.sentiment_heat == 0.0
+    assert rec.mid_term_score == 0.0
+    assert rec.macro_score == 0.0
+    assert math.isfinite(rec.final_score)
+
+
 def test_generate_daily_report():
     """Generate daily report should return formatted recommendations."""
     scorer = SignalScorer()
@@ -52,7 +76,11 @@ def test_generate_daily_report():
         scorer.score_stock("SH600519", "贵州茅台", 0.8, 0.5, 0.6),
         scorer.score_stock("SZ300750", "宁德时代", 0.6, 0.3, 0.4),
     ]
+    recs[0].horizon = "短线"
+    recs[0].next_day_change_pct = 1.25
     report = scorer.generate_report(recs)
     assert "今日推荐" in report
     assert "贵州茅台" in report
     assert "评分" in report
+    assert "短线" in report
+    assert "明日+1.25%" in report
