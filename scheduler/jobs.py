@@ -1096,6 +1096,62 @@ class DailyPipeline:
             f"{market_reason}。A股方向因子{market:+.2f}，明日先看指数确认，再决定个股进攻力度。"
         )
 
+    def _build_monster_radar(self, top_n: int = 5) -> str:
+        """Build monster stock (妖股) radar section for push reports."""
+        try:
+            from data.collectors.limit_up import LimitUpCollector
+            from factors.monster_stock import MonsterStockScorer
+
+            collector = LimitUpCollector()
+            scorer = MonsterStockScorer(limit_up_collector=collector)
+
+            pool = collector.fetch_today_pool()
+            if pool.empty:
+                return ""
+
+            # Score each limit-up stock
+            scores = []
+            for _, row in pool.iterrows():
+                code = row.get("qlib_code", "")
+                name = row.get("name", "")
+                if not code:
+                    continue
+                ms = scorer.score(
+                    code=code,
+                    name=name,
+                    sector_limit_up_count=0,  # TODO: compute from pool
+                )
+                scores.append(ms)
+
+            if not scores:
+                return ""
+
+            # Sort by score, take top N
+            scores.sort(key=lambda s: s.monster_score, reverse=True)
+            top = [s for s in scores[:top_n] if s.risk_filter_passed]
+
+            if not top:
+                return ""
+
+            lines = ["【妖股雷达】"]
+            for i, s in enumerate(top, 1):
+                boards = s.details.get("consecutive_boards", 0)
+                board_str = f"{boards}连板" if boards > 0 else "首板"
+                lines.append(
+                    f"{i}. {s.name}({s.code[-6:]}) "
+                    f"| {s.category} | {board_str} "
+                    f"| 评分{s.monster_score:.2f}"
+                )
+
+            premium = scorer._board_premium or 0
+            lines.append(f"涨停次日溢价率: {premium:+.1f}%")
+            lines.append("风险提示: 妖股高风险，单只仓位≤5%")
+
+            return "\n".join(lines)
+        except Exception as e:
+            logger.warning(f"Monster radar failed: {e}")
+            return ""
+
     def _load_model_quality_line(self) -> str:
         """Load model quality from lgb_eval_latest.json for push reports."""
         try:
@@ -1132,14 +1188,20 @@ class DailyPipeline:
 
         model_quality = self._load_model_quality_line()
 
+        monster_radar = self._build_monster_radar()
+
         sections = [
             f"【明日策略】{datetime.now().strftime('%Y-%m-%d')}",
             world_text,
             a_share_forecast_text,
             stock_forecast_text,
+        ]
+        if monster_radar:
+            sections.append(monster_radar)
+        sections.extend([
             gold_forecast_text,
             crypto_forecast_text,
-        ]
+        ])
         if model_quality:
             sections.append(model_quality)
 

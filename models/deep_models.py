@@ -114,8 +114,11 @@ class DeepModel:
             X_valid: optional validation features
             y_valid: optional validation labels
         """
-        # Clean NaN/Inf
-        train_mask = np.isfinite(X_train).all(axis=1) & np.isfinite(y_train)
+        # Fill NaN features with 0 (Alpha158 has many NaN for short-history stocks)
+        X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
+        y_train = np.nan_to_num(y_train, nan=0.0)
+        # Remove rows where label is still 0 (likely genuinely missing)
+        train_mask = y_train != 0.0
         X_train = X_train[train_mask]
         y_train = y_train[train_mask]
 
@@ -131,7 +134,9 @@ class DeepModel:
 
         # Validation
         if X_valid is not None and y_valid is not None:
-            valid_mask = np.isfinite(X_valid).all(axis=1) & np.isfinite(y_valid)
+            X_valid = np.nan_to_num(X_valid, nan=0.0, posinf=0.0, neginf=0.0)
+            y_valid = np.nan_to_num(y_valid, nan=0.0)
+            valid_mask = y_valid != 0.0
             X_valid = X_valid[valid_mask]
             y_valid = y_valid[valid_mask]
 
@@ -208,21 +213,18 @@ class DeepModel:
             np.ndarray (n_samples,) of predictions
         """
         self.model.eval()
-        mask = np.isfinite(X).all(axis=1)
-        result = np.full(len(X), np.nan)
-
-        if mask.sum() == 0:
-            return result
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        result = np.zeros(len(X))
 
         with torch.no_grad():
-            x_t = torch.FloatTensor(X[mask]).to(self.device)
+            x_t = torch.FloatTensor(X).to(self.device)
             # Process in batches
             preds = []
             for i in range(0, len(x_t), self.batch_size):
                 batch = x_t[i:i + self.batch_size]
                 p = self.model(batch).cpu().numpy()
                 preds.append(p)
-            result[mask] = np.concatenate(preds)
+            result = np.concatenate(preds)
 
         if self.device.type == "mps":
             torch.mps.synchronize()

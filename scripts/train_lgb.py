@@ -203,23 +203,42 @@ def main():
     dataset = init_instance_by_config(dataset_config)
     print("Dataset ready.")
 
-    model_config = {
-        "class": "LGBModel",
-        "module_path": "qlib.contrib.model.gbdt",
-        "kwargs": {
-            "loss": "mse",
-            "colsample_bytree": 0.8879,
-            "learning_rate": 0.05,
-            "subsample": 0.8789,
-            "lambda_l1": 205.6999,
-            "lambda_l2": 580.9768,
-            "max_depth": 8,
-            "num_leaves": 210,
-            "num_threads": 4,
-        },
-    }
+    # Model selection: XGB (better IC) or LGB (fallback)
+    model_type = os.environ.get("TRAIN_MODEL_TYPE", "xgb").lower()
 
-    print("Training LightGBM...")
+    if model_type == "xgb":
+        model_config = {
+            "class": "XGBModel",
+            "module_path": "qlib.contrib.model.xgboost",
+            "kwargs": {
+                "n_estimators": 500,
+                "max_depth": 8,
+                "learning_rate": 0.05,
+                "subsample": 0.8789,
+                "colsample_bytree": 0.8879,
+                "reg_alpha": 205.6999,
+                "reg_lambda": 580.9768,
+                "n_jobs": 4,
+            },
+        }
+        print(f"Training XGBoost (IC=0.024 > LGB IC=0.008)...")
+    else:
+        model_config = {
+            "class": "LGBModel",
+            "module_path": "qlib.contrib.model.gbdt",
+            "kwargs": {
+                "loss": "mse",
+                "colsample_bytree": 0.8879,
+                "learning_rate": 0.05,
+                "subsample": 0.8789,
+                "lambda_l1": 205.6999,
+                "lambda_l2": 580.9768,
+                "max_depth": 8,
+                "num_leaves": 210,
+                "num_threads": 4,
+            },
+        }
+        print("Training LightGBM (fallback)...")
     model = init_instance_by_config(model_config)
     model.fit(dataset)
     print("Training complete!")
