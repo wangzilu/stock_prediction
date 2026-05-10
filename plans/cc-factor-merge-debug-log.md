@@ -384,6 +384,66 @@ cx 总结：
 
 **只有通过以上全部验证的因子，才能进入生产模型。**
 
+## CX 对 A/B/C/D 方案的精准纠正 — cc 再次接受
+
+### 方案 A 的代码有结构错误
+
+cc 写的：
+```python
+return (list(fields) + [self.CUSTOM_FIELDS], list(names) + [self.CUSTOM_NAMES])
+```
+
+cx 指出 Alpha158 的 `get_feature_config()` 返回的 `fields` 和 `names` **已经是平铺 list**（158 个 string），不是嵌套 list。cc 加了 `[self.CUSTOM_FIELDS]`（list of list），导致最后一个元素是 list 而非 string，这就是 `'list' object has no attribute get_extended_window_size'` 报错的根因。
+
+**正确写法：**
+```python
+return fields + self.CUSTOM_FIELDS, names + self.CUSTOM_NAMES  # 平铺拼接
+```
+
+**cc 接受。** 这个 bug 确认了之前 QlibDataLoader 报错的原因。
+
+### 方案 B 的前提不严谨
+
+cx 指出：
+1. Alpha158 features 不是 `~N(0,1)` — 只是表达式自身做了归一化
+2. 手动 zscore custom 不等于"和 Alpha158 尺度一致"
+3. 必须加 winsorize（PE 极值主导均值/方差）和 shuffled 负控
+
+**cc 接受。** B 的正确实验名应该是 `base + custom_winsor_zscore`，而非 "尺度统一后的合并"。
+
+### 方案 C 不能先拍 0.7/0.3 权重
+
+cx 指出正确顺序：先训 base → 算 residual → 测 custom 对 residual 的 IC → 再决定是否 two-stage。如果 custom 对 residual 没有解释力，two-stage 只是包装噪声。
+
+**cc 接受。** residual IC 是更严谨的验证方法。
+
+### cx 修正后的执行顺序
+
+| 优先级 | 动作 | cc 态度 |
+|:---:|------|:---:|
+| 1 | merge audit（审计对齐/缺失/极值）| 接受 ✅ |
+| 2 | 同脚本 baseline 重训（消除口径差异）| 接受 ✅ |
+| 3 | B'：winsorize + rank/zscore + shuffled 负控 | 接受 ✅ |
+| 4 | 单因子 ablation + shuffled control | 接受 ✅ |
+| 5 | residual IC → 再决定 two-stage | 接受 ✅ |
+| 6 | Alpha158Enhanced handler（只在证明有效后）| 接受 ✅ |
+
+### cx 定义的最小可执行实验
+
+必须同时跑这 6 组：
+```
+base_raw
+base_raw + custom_raw
+base_raw + custom_winsor_zscore
+base_raw + custom_rank
+base_raw + shuffled_custom_winsor_zscore  ← 负控
+base_raw + each_one_factor               ← 单因子消融
+```
+
+只有 `custom_winsor_zscore` 明显优于 `base_raw`，且 `shuffled_custom` 不优于 `base_raw`，才能说因子有真实边际贡献。
+
+**cc 完全同意这个实验设计。** 比 cc 之前的"train → 看 IC → 结论"严谨得多。
+
 ---
 
 ## 已解决的技术问题
