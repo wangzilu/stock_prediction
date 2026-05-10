@@ -130,8 +130,25 @@ def test_all_factors(test_days: int = 60, universe: str = "all") -> list:
             spread = float(np.mean(spreads)) if spreads else 0.0
             elapsed = time.time() - t1
 
-            verdict = "STRONG" if ic_mean > 0.02 else "OK" if ic_mean > 0.005 else "WEAK" if ic_mean > 0 else "NEGATIVE"
-            logger.info(f"  IC={ic_mean:+.4f} RankIC={ric_mean:+.4f} ICIR={icir:.3f} Spread={spread*100:+.3f}% → {verdict} ({elapsed:.0f}s)")
+            spread_pos = float(np.mean([s > 0 for s in spreads])) if spreads else 0.0
+            coverage = len(f) / max(len(label_df), 1)
+
+            # Joint verdict: must satisfy ALL conditions for STRONG
+            # (cx-corrected: not just Pearson IC, but RankIC + TopK spread + coverage)
+            if ric_mean > 0.01 and spread > 0 and ic_mean > 0 and ric_pos > 0.5:
+                verdict = "STRONG"
+            elif (ric_mean > 0 or spread > 0) and ic_mean > 0:
+                verdict = "OK"
+            elif ic_mean > 0:
+                verdict = "WEAK"
+            else:
+                verdict = "NEGATIVE"
+
+            elapsed = time.time() - t1
+            logger.info(
+                f"  IC={ic_mean:+.4f} RankIC={ric_mean:+.4f} Spread={spread*100:+.3f}% "
+                f"RIC>0={ric_pos:.0%} Cov={coverage:.0%} → {verdict} ({elapsed:.0f}s)"
+            )
 
             results.append({
                 "name": name,
@@ -141,13 +158,16 @@ def test_all_factors(test_days: int = 60, universe: str = "all") -> list:
                 "icir": round(icir, 4),
                 "rank_ic_pos_ratio": round(ric_pos, 4),
                 "top20_spread": round(spread, 6),
+                "spread_pos_ratio": round(spread_pos, 4),
+                "coverage": round(coverage, 4),
                 "n_samples": len(f),
                 "verdict": verdict,
             })
         except Exception as e:
             logger.error(f"  ERROR: {e}")
 
-    results.sort(key=lambda r: r["ic_mean"], reverse=True)
+    # Sort by composite score: RankIC * spread_pos_ratio (what matters for TopK trading)
+    results.sort(key=lambda r: r.get("rank_ic_mean", 0) * r.get("spread_pos_ratio", 0), reverse=True)
     return results
 
 
@@ -174,17 +194,18 @@ def main():
     if args.json:
         print(json.dumps(output, ensure_ascii=False, indent=2))
     else:
-        print(f"\n{'='*75}")
-        print(f"{'Factor':<22} {'IC':>8} {'RankIC':>8} {'ICIR':>8} {'Spread%':>9} {'Verdict':>10}")
-        print(f"{'-'*75}")
+        print(f"\n{'='*85}")
+        print(f"{'Factor':<22} {'IC':>8} {'RankIC':>8} {'Spread%':>9} {'RIC>0':>7} {'Cov':>6} {'Verdict':>10}")
+        print(f"{'-'*85}")
         for r in results:
             print(
                 f"{r['name']:<22} {r['ic_mean']:>+8.4f} {r['rank_ic_mean']:>+8.4f} "
-                f"{r['icir']:>8.3f} {r['top20_spread']*100:>+8.3f}% {r['verdict']:>10}"
+                f"{r['top20_spread']*100:>+8.3f}% {r['rank_ic_pos_ratio']:>6.0%} "
+                f"{r.get('coverage', 0):>5.0%} {r['verdict']:>10}"
             )
-        print(f"{'='*75}")
+        print(f"{'='*85}")
+        print(f"STRONG = RankIC>0.01 AND Spread>0 AND IC>0 AND RankIC_pos>50%")
 
-        # Summary
         strong = [r for r in results if r["verdict"] == "STRONG"]
         ok = [r for r in results if r["verdict"] == "OK"]
         weak = [r for r in results if r["verdict"] == "WEAK"]
@@ -192,6 +213,8 @@ def main():
         print(f"\nSTRONG: {len(strong)}  OK: {len(ok)}  WEAK: {len(weak)}  NEGATIVE: {len(neg)}")
         if strong:
             print(f"推荐加入模型: {', '.join(r['name'] for r in strong)}")
+        else:
+            print("暂无因子满足联合标准，建议用 rolling 多窗口进一步验证")
 
 
 if __name__ == "__main__":
