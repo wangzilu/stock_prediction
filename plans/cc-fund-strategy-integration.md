@@ -108,3 +108,24 @@ Phase 3（1 周）— 机构持仓
 | 涨停溢价 | — | 中 | 提升妖股命中率 |
 
 **当前 XGB IC = 0.024。如果主力资金流和北向资金两个因子各贡献 +30%，IC 可望到 0.04+，这将是质的飞跃。**
+
+---
+
+## CX 文档对比
+
+cx 在 v2 plan 第 128 行提到过基金持仓：
+
+> "Public fund heavy-position data is usable only after its public disclosure date, with a trading-day lag, so it should be treated as a quarterly 'smart money / crowding / theme confirmation' factor"
+
+**cx 的盲区：** cx 只讨论了季度频率的基金持仓因子（有滞后，alpha 有限），完全没提到日频的**主力资金流**和**北向资金**这两个高 Sharpe 因子。这两个因子：
+- 每日更新，无季度滞后
+- 来源是成交数据和港股通数据，不依赖基金季报
+- 华泰/中金券商研报有大规模回测验证
+- AKShare 免费可获取
+
+cx 把"基金持仓"和"资金流因子"混为一谈了。实际上它们是完全不同的数据维度：
+- **基金持仓**（季度，滞后 45 天）→ cx 说的对，只能做确认因子
+- **主力资金流**（日频，实时）→ cx 没提，但 Sharpe 4.43
+- **北向资金**（日频，实时）→ cx 没提，但 Sharpe 2.46
+
+**cc 的优势在于区分了这三者**，并识别出日频资金流因子是当前最大的 alpha 增量来源。
