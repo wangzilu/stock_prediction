@@ -1110,6 +1110,40 @@ class DailyPipeline:
             f"{market_reason}。A股方向因子{market:+.2f}，明日先看指数确认，再决定个股进攻力度。"
         )
 
+    def _build_portfolio_risk_line(self) -> str:
+        """Build portfolio risk status line for push reports."""
+        try:
+            import json as _json
+            # Read backtest results for risk metrics
+            bt_path = DATA_DIR / "lgb_backtest_latest.json"
+            if not bt_path.exists():
+                return ""
+            bt = _json.loads(bt_path.read_text())
+            m = bt.get("metrics", {})
+            sharpe = m.get("sharpe_ratio", 0)
+            maxdd = m.get("max_drawdown_pct", 0)
+            turnover = m.get("avg_daily_turnover", 0)
+            win = m.get("win_rate", 0)
+
+            parts = [f"Sharpe={sharpe:.2f}"]
+            parts.append(f"回撤={maxdd:.1f}%")
+            parts.append(f"换手={turnover:.0%}")
+            parts.append(f"胜率={win:.0%}")
+
+            # Risk warnings
+            warnings = []
+            if maxdd < -15:
+                warnings.append("回撤预警")
+            if turnover > 0.3:
+                warnings.append("换手偏高")
+
+            line = f"风控：{'｜'.join(parts)}"
+            if warnings:
+                line += f" ⚠️{'、'.join(warnings)}"
+            return line
+        except Exception:
+            return ""
+
     def _build_monster_radar(self, top_n: int = 10) -> str:
         """Build monster stock (妖股) radar section for push reports."""
         try:
@@ -1241,6 +1275,9 @@ class DailyPipeline:
         ])
         if model_quality:
             sections.append(model_quality)
+        risk_line = self._build_portfolio_risk_line()
+        if risk_line:
+            sections.append(risk_line)
 
         return _sanitize_push_text("\n\n".join(sections))
 

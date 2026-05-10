@@ -115,6 +115,10 @@ def main():
     if not run_step("Factor Decay Monitor", "monitor_factor_decay.py", timeout=60):
         logger.warning("Factor decay check returned degraded — consider model rollback")
 
+    # Step 8: Model promotion gate (auto promote/rollback)
+    if not run_step("Model Promotion Check", "promote_model.py", "--check", timeout=60):
+        logger.warning("Model promotion check failed or triggered rollback")
+
     logger.info(f"After-close pipeline completed at {datetime.now()}")
     return 0
 
