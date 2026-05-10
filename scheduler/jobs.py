@@ -463,34 +463,48 @@ class DailyPipeline:
         }
 
     def _format_evening_stock_forecasts(self, forecast_groups: dict[str, list[dict]]) -> str:
-        """Format evening stock forecasts with short/mid/long/composite top five."""
+        """Format evening stock forecasts with trading strategy for each horizon."""
         lines = ["五、个股预测"]
+
+        # Strategy specs per horizon
+        strategy = {
+            "短线": {"hold": "5个交易日", "buy": "下一开盘日", "tp": 8, "sl": 5},
+            "中线": {"hold": "20个交易日", "buy": "回调时分批", "tp": 15, "sl": 8},
+            "长线": {"hold": "60个交易日", "buy": "分3批建仓", "tp": 25, "sl": 10},
+            "综合": {"hold": "5-20个交易日", "buy": "下一开盘日", "tp": 10, "sl": 6},
+        }
+
         specs = [
             ("短线", "短线前十", "明日预测"),
             ("中线", "中线前十", "中线分"),
-            ("长线", "长线前十", "长线分"),
+            ("长线", "长线前十（观察榜）", "长线分"),
             ("综合", "综合前十", "综合分"),
         ]
         for key, title, metric_label in specs:
+            strat = strategy[key]
             lines.append(f"{title}：")
+            lines.append(f"  策略：持有{strat['hold']}｜{strat['buy']}买入｜止盈{strat['tp']}%｜止损{strat['sl']}%")
             items = forecast_groups.get(key, [])
             if not items:
-                lines.append("暂无有效候选")
+                lines.append("  暂无有效候选")
                 continue
             for i, item in enumerate(items, 1):
                 display_code = item["code"][2:] if item["code"][:2] in ("SH", "SZ", "BJ") else item["code"]
                 name = f"{item['name']} " if item.get("name") else ""
+                price = f"¥{item['price']:.2f}" if item.get("price") and item["price"] > 0 else ""
+
                 if key == "短线":
-                    metric = f"{metric_label}{item['short_expected']:+.2f}%"
+                    metric = f"预测{item['short_expected']:+.2f}%"
                 elif key == "中线":
-                    metric = f"{metric_label}{item['mid_score']:+.4f}"
+                    metric = f"中线分{item['mid_score']:+.4f}"
                 elif key == "长线":
-                    metric = f"{metric_label}{item['long_score']:+.4f}"
+                    metric = f"长线分{item['long_score']:+.4f}"
                 else:
-                    metric = f"{metric_label}{item['composite_score']:+.4f}，明日{item['short_expected']:+.2f}%"
+                    metric = f"综合{item['composite_score']:+.4f}"
+
                 lines.append(
-                    f"{i}. {name}{display_code}：{metric}，"
-                    f"模型分{item['lgb_score']:+.4f}，最近交易日{item['change_pct']:+.2f}%"
+                    f"  {i}. {name}{display_code} {price}｜{metric}｜"
+                    f"模型{item['lgb_score']:+.4f}｜涨跌{item['change_pct']:+.2f}%"
                 )
         return "\n".join(lines)
 
