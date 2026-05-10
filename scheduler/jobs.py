@@ -407,7 +407,7 @@ class DailyPipeline:
             logger.warning("Failed to load spot lookup for evening stock forecast: %s", e)
             return {}
 
-    def _build_evening_stock_forecasts(self, lgb_preds: dict, limit: int = 5) -> dict[str, list[dict]]:
+    def _build_evening_stock_forecasts(self, lgb_preds: dict, limit: int = 10) -> dict[str, list[dict]]:
         """Build short/mid/long/composite stock forecast lists for evening report."""
         spot = self._spot_lookup()
         rows = []
@@ -466,10 +466,10 @@ class DailyPipeline:
         """Format evening stock forecasts with short/mid/long/composite top five."""
         lines = ["五、个股预测"]
         specs = [
-            ("短线", "短线前五", "明日预测"),
-            ("中线", "中线前五", "中线分"),
-            ("长线", "长线前五", "长线分"),
-            ("综合", "综合前五", "综合分"),
+            ("短线", "短线前十", "明日预测"),
+            ("中线", "中线前十", "中线分"),
+            ("长线", "长线前十", "长线分"),
+            ("综合", "综合前十", "综合分"),
         ]
         for key, title, metric_label in specs:
             lines.append(f"{title}：")
@@ -490,7 +490,7 @@ class DailyPipeline:
                     metric = f"{metric_label}{item['composite_score']:+.4f}，明日{item['short_expected']:+.2f}%"
                 lines.append(
                     f"{i}. {name}{display_code}：{metric}，"
-                    f"模型分{item['lgb_score']:+.4f}，今日{item['change_pct']:+.2f}%"
+                    f"模型分{item['lgb_score']:+.4f}，最近交易日{item['change_pct']:+.2f}%"
                 )
         return "\n".join(lines)
 
@@ -847,14 +847,14 @@ class DailyPipeline:
                 ("创业板", "创业板指", 1.25),
             ],
         )
-        title = f"【9:20今日收盘预测】（{market_prediction.target_date}：上证/深证/北证/创业板）"
+        title = f"【9:20最近交易日收盘预测】（{market_prediction.target_date}：上证/深证/北证/创业板）"
         records = [
             self._segment_prediction_record(segment, market_prediction, source="morning_final")
             for segment in segments
         ]
         return self.index_predictor.format_segment_predictions(segments, title=title), records
 
-    def _build_intraday_buy_candidates(self, lgb_preds: dict, limit: int = 5) -> list[dict]:
+    def _build_intraday_buy_candidates(self, lgb_preds: dict, limit: int = 10) -> list[dict]:
         """Build 14:30 strong-buy candidates from model scores plus live tape."""
         spot = self._spot_lookup()
         rows = []
@@ -926,7 +926,7 @@ class DailyPipeline:
             price_text = f"现价{item['price']:.2f}，" if item.get("price") else ""
             lines.append(
                 f"{i}. {item['label']}：{name}{display_code}，{price_text}"
-                f"今日{item['change_pct']:+.2f}%，下一开盘日预测{item['expected_change_pct']:+.2f}%，"
+                f"最近交易日{item['change_pct']:+.2f}%，下一开盘日预测{item['expected_change_pct']:+.2f}%，"
                 f"强度{item['strength']:+.4f}"
             )
         return "\n".join(lines)
@@ -1049,7 +1049,7 @@ class DailyPipeline:
         logic = "避险需求抬升" if safe_haven >= 0.6 else "避险需求一般"
         return (
             "六、黄金预测\n"
-            f"黄金：{self._pct_direction(expected)}，{price_text}今日{change:+.2f}%，"
+            f"黄金：{self._pct_direction(expected)}，{price_text}最近交易日{change:+.2f}%，"
             f"明日参考{expected:+.2f}%附近。核心逻辑：{logic}，政策因子{policy:+.2f}。"
         )
 
@@ -1071,7 +1071,7 @@ class DailyPipeline:
             )
             price_text = f"${price:,.0f}，" if price else ""
             lines.append(
-                f"{name}：{self._pct_direction(expected)}，{price_text}今日{change:+.2f}%，"
+                f"{name}：{self._pct_direction(expected)}，{price_text}最近交易日{change:+.2f}%，"
                 f"明日参考{expected:+.2f}%附近"
             )
         if len(lines) == 1:
@@ -1096,7 +1096,7 @@ class DailyPipeline:
             f"{market_reason}。A股方向因子{market:+.2f}，明日先看指数确认，再决定个股进攻力度。"
         )
 
-    def _build_monster_radar(self, top_n: int = 5) -> str:
+    def _build_monster_radar(self, top_n: int = 10) -> str:
         """Build monster stock (妖股) radar section for push reports."""
         try:
             from data.collectors.limit_up import LimitUpCollector
@@ -1636,7 +1636,7 @@ class DailyPipeline:
         self._headlines = None
         geo = self._fetch_geo_factors()
         lgb_preds = self._load_lgb_predictions()
-        buy_items = self._build_intraday_buy_candidates(lgb_preds, limit=5)
+        buy_items = self._build_intraday_buy_candidates(lgb_preds, limit=10)
 
         crypto_data = {}
         for symbol in ["BTC/USDT", "ETH/USDT"]:
@@ -1732,7 +1732,7 @@ class DailyPipeline:
         sorted_preds = sorted(lgb_preds.items(), key=lambda x: x[1], reverse=True)
         top_bull = sorted_preds[:10]
         top_bear = sorted_preds[-5:]
-        stock_forecast_groups = self._build_evening_stock_forecasts(lgb_preds, limit=5)
+        stock_forecast_groups = self._build_evening_stock_forecasts(lgb_preds, limit=10)
         stock_forecast_block = self._format_evening_stock_forecasts(stock_forecast_groups)
 
         crypto_data = {}
