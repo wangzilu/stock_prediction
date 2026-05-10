@@ -322,6 +322,70 @@ stable = (positive_ratio > 0.6) and (ic_mean > 0.01) and (ic_std < ic_mean)
 
 ---
 
+## CX 回应的关键纠正 — cc 必须接受的
+
+### 纠正1：Alpha158 默认不对 feature 做 CSZScoreNorm
+
+cc 假设 "Alpha158 特征经过 CSZScoreNorm，范围约 [-3, 3]"。
+
+cx 查了 Qlib 0.9.7 源码，指出：
+> Alpha158 默认 `learn_processors` 只对 **label** 做 `CSZScoreNorm`，不对 feature 做。Alpha158 的 feature 看起来稳定是因为表达式本身做了归一化（如 `Mean($close, 20)/$close`），不是因为有统一的 feature zscore。
+
+**cc 接受这个修正。** 这意味着"尺度不匹配"的假设需要重新表述：不是"归一化 vs 未归一化"的冲突，而是"自归一化的技术因子 vs 原始值的基本面因子"的分布形态差异。
+
+### 纠正2：单因子筛选标准偏了
+
+cc 用 Pearson IC > 0.02 判定 STRONG。cx 指出：
+
+> 价格位置60日 IC=+0.028 但 RankIC=-0.010，EP IC=+0.021 但 RankIC=-0.015。RankIC 反向意味着"按排序选 TopK"时这个因子可能是负贡献。
+
+**cc 接受。** 生产目标是 TopK 选股，应该用 RankIC + TopK spread 联合判定，不能只看 Pearson IC。
+
+修正后的 STRONG 判定：
+```
+STRONG = RankIC > 0.01 AND TopK_spread > 0 AND IC > 0
+```
+
+按这个标准重新看 20 个因子：**没有一个同时满足所有三个条件。** 这解释了为什么加进去都变差。
+
+### 纠正3：对照实验不干净
+
+cc 把增强版结果和"旧 baseline IC=0.024"对比。cx 指出两者可能来自不同日期/标签/实现。
+
+**cc 接受。** 正确做法是在同一个脚本里即时训练 base 和 enhanced，用同一个 random seed、同一个 data split。
+
+### 纠正4：residual IC 是更正确的验证方法
+
+cx 提出的验证流程：
+1. 先用 base model 预测 → `pred_base`
+2. 计算残差 → `residual = label - pred_base`
+3. 看新因子对 residual 是否有 IC
+4. 如果没有 → 因子只是重复 Alpha158 已有信息
+
+**cc 完全同意。** 这比直接 hstack 后训练更严谨。
+
+### 纠正5：这次失败是"因子工厂第一堂工程课"
+
+cx 总结：
+> 因子宽度路线不能靠"看到几个字段就堆进去"。要建立：因子审计 → 稳定性监控 → 边际贡献实验 → rolling 验证 → 成本后回测 → 灰度回滚。
+
+**cc 完全同意。** 不急着堆因子，先把"证明一个因子真的增量有效"的流程搭起来。
+
+## 收敛后的下一步
+
+根据 cc 和 cx 共同判断，下一步应该是：
+
+1. **`scripts/audit_factor_merge.py`** — 合并审计（cx 提议 P1）
+2. **`scripts/train_factor_ablation.py`** — 增量消融实验（cx 提议 P2）
+   - base, base+factor_i, base+shuffled_factor（负控）
+   - 在同一脚本同一 split 同一 seed 下对比
+3. **改 `evaluate_factor_ic.py`** — 用 RankIC + TopK spread 联合判定（cx 提议 P3）
+4. **residual IC 测试** — 新因子对 base model 残差是否有预测力
+
+**只有通过以上全部验证的因子，才能进入生产模型。**
+
+---
+
 ## 已解决的技术问题
 
 - ✅ Qlib multiprocessing spawn 问题 → 用 cx 的 `config/qlib_runtime.py`
