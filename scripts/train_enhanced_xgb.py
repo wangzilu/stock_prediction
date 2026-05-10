@@ -39,7 +39,7 @@ CUSTOM_EXPRS = [
     "$turn / Mean($turn, 60)",
     "$amount / Mean($amount, 20)",
     "Std($turn, 20)",
-    "1.0 / $pe",
+    "1.0 / If(Abs($pe) > 0.01, $pe, 1.0)",
     "1.0 / $pb",
     "($close - Min($close, 20)) / (Max($close, 20) - Min($close, 20) + 1e-8)",
 ]
