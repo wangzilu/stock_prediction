@@ -22,6 +22,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 from config.settings import PREDICTION_HORIZON_DAYS
+from config.qlib_runtime import init_qlib
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -50,15 +51,13 @@ CUSTOM_NAMES = [
 
 
 def main():
-    import qlib
-    from qlib.constant import REG_CN
     from qlib.utils import init_instance_by_config
     from qlib.contrib.eva.alpha import calc_ic
     from qlib.data import D
 
     logger.info("Step 0: Init Qlib")
     t0 = time.time()
-    qlib.init(provider_uri=QLIB_DATA, region=REG_CN)
+    init_qlib(QLIB_DATA)
     logger.info(f"  Qlib init: {time.time()-t0:.1f}s")
 
     today = datetime.now()
