@@ -185,6 +185,96 @@ Alpha158 (日频, 158列) ──────────┐
 
 ---
 
+## 百亿私募闭环 vs 当前系统差距对照
+
+百亿私募强的不只是模型，是**完整闭环**。逐项对照：
+
+| 百亿私募能力 | 当前系统状态 | 差距 | 应对策略 | 优先级 |
+|-------------|------------|------|---------|--------|
+| **数据快且干净** | baostock 逐只串行慢，AKShare 不稳定 | 大 | provider auto + staging + health gate（cx 已实现），加速用 TuShare 批量 | ✅ 部分解决 |
+| **因子每天监控衰减** | 无因子衰减监控 | **最大差距** | `evaluate_factor_ic.py` + 每日 IC 时序追踪 + 连续 3 天 IC<0 自动预警 | P0 |
+| **模型有 rolling 验证** | 有初版 `rolling_train.py`，但非 Qlib 原生 | 中 | 用 Qlib `RollingGen` 替代，每月 rolling + OOS IC 作为模型健康指标 | P1 |
+| **组合有换手/行业暴露/回撤控制** | 只有简单止盈止损 | 大 | TopK + 换手限制（已有近似）+ 行业暴露上限（TODO）+ 最大回撤约束（TODO） | P1 |
+| **生产模型能灰度、回滚** | 覆盖写 `lgb_model.pkl`，无版本管理 | 大 | `ModelRegistry`（已建）+ Qlib `OnlineManager` 灰度/回滚 + promotion gate | P1 |
+| **每天知道收益来自行业配置还是个股选择** | 无归因 | 大 | Qlib `brinson_pa()` 已可用，接入 `after_close_pipeline` 回测后自动输出 | P0 |
+
+### 具体应对方案
+
+**1. 因子衰减监控（P0，2 天）**
+
+```python
+# 每天训练后自动跑，追踪每个因子的 IC 时序
+# 如果某因子 IC 连续 5 天为负 → 降权或剔除
+
+# 新建 scripts/monitor_factor_decay.py
+# 输入: 每日 IC 时序（从 evaluate_lgb_test.py 已有）
+# 输出: factor_health.json
+#   - 每个因子的 rolling 5d IC
+#   - 衰减预警列表
+#   - 推文标注"以下因子近期信号减弱"
+```
+
+**2. 组合风控（P1，3 天）**
+
+```python
+# 在 backtest_qlib_signal.py 和推文中加入：
+# - 单行业暴露上限 25%（避免赌一个方向）
+# - 日换手率上限 30%（避免过度交易）
+# - 组合最大回撤 -15% 自动减仓到 50%
+# - 单只个股仓位上限 8%
+
+# 这些规则直接写在 TopK 选股逻辑里
+```
+
+**3. 模型灰度和回滚（P1，2 天）**
+
+```python
+# ModelRegistry 已建好，还需要：
+# 1. 新模型训练后不立刻替换，先做"影子运行"3 天
+# 2. 影子模型的推荐和生产模型对比 IC
+# 3. 影子模型连续 3 天优于生产 → 自动 promote
+# 4. 生产模型连续 3 天 IC < 0 → 自动回滚到上一版
+```
+
+**4. Brinson 归因（P0，1 天）**
+
+```python
+# Qlib 已有 brinson_pa()
+from qlib.backtest.profit_attribution import brinson_pa
+
+# 每日收盘后自动跑
+result = brinson_pa(positions, bench='SH000905', group_field='industry')
+# 输出：
+#   - 行业配置收益（allocation effect）
+#   - 个股选择收益（selection effect）
+#   - 交互效应（interaction effect）
+# 写入推文："今日超额收益中，行业配置贡献 60%，个股选择贡献 40%"
+```
+
+**5. 完整日常闭环目标**
+
+```
+17:00 数据更新 + 健康检查
+      ↓
+17:10 模型训练（XGB 主力 + 影子模型）
+      ↓
+17:15 Smoke + 评估（IC/RankIC/Spread）
+      ↓
+17:20 因子衰减监控（哪些因子在弱化）
+      ↓
+17:25 回测（TopK + 换手 + 行业约束 + 成本）
+      ↓
+17:30 Brinson 归因（alpha 从哪来）
+      ↓
+17:35 模型版本决策（promote/hold/rollback）
+      ↓
+22:00 推文（含模型状态 + 因子健康 + 归因）
+```
+
+**这个闭环建完后，和百亿私募的差距从"什么都缺"变成"只差数据速度和执行速度"——而日频推荐系统不需要毫秒级执行。**
+
+---
+
 ## CX 对照
 
 cx 在 `cx-qlib-next-version-iteration-plan-2026-05-10.md` 中：
