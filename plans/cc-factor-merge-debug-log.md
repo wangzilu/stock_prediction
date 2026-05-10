@@ -145,6 +145,183 @@ Alpha158 已经有 `($close - Min($close, N)) / (Max($close, N) - Min($close, N)
 
 ---
 
+## CC 的详细解决方案
+
+### 方案 A：在 CSZScoreNorm 之前合并（最正统）
+
+**思路：** 问题的根因是 Alpha158 handler 内部做了 CSZScoreNorm，输出的特征是标准化的。而自定义因子在 handler 外部加入，跳过了归一化。正确做法是让自定义因子**也经过同一个归一化流程**。
+
+**实现：** 继承 Alpha158，覆盖 `get_feature_config` 追加自定义字段：
+
+```python
+from qlib.contrib.data.handler import Alpha158
+
+class Alpha158Enhanced(Alpha158):
+    """Alpha158 + PE/PB/Turn custom factors, all processed together."""
+
+    CUSTOM_FIELDS = [
+        "($close - Min($close, 60)) / (Max($close, 60) - Min($close, 60) + 1e-8)",
+        "1.0 / If(Abs($pe) > 0.01, $pe, 1.0)",
+        "($close - Min($close, 20)) / (Max($close, 20) - Min($close, 20) + 1e-8)",
+        "$pb / Ref($pb, 5) - 1",
+    ]
+    CUSTOM_NAMES = ["price_pos60", "ep", "price_pos20", "pb_mom5"]
+
+    def get_feature_config(self):
+        fields, names = super().get_feature_config()
+        # Append custom group
+        return (list(fields) + [self.CUSTOM_FIELDS],
+                list(names) + [self.CUSTOM_NAMES])
+```
+
+然后在 dataset config 中用 `Alpha158Enhanced` 替代 `Alpha158`。这样自定义因子和 Alpha158 原始因子一起经过 `CSZScoreNorm`，尺度完全一致。
+
+**优点：** 最干净，一套 handler 出所有特征，归一化统一
+**风险：** `get_feature_config` 返回的 list 结构需要兼容 QlibDataLoader 的解析逻辑，可能有嵌套格式问题（之前碰过 `'list' object has no attribute 'get_extended_window_size'`）
+**验证方法：** 先用 CSI300 小数据跑通，确认 162 列全部非 NaN 且分布在 [-3, 3]
+
+### 方案 B：手动对自定义因子做截面标准化（最稳妥）
+
+**思路：** 不改 handler，在合并后手动对新因子做 CSZScoreNorm：
+
+```python
+# Alpha158 出来的特征已经是标准化的
+X_alpha = dataset.prepare("train", col_set="feature")  # 158 列, ~N(0,1)
+
+# 自定义因子是原始值
+custom = D.features(instruments, exprs).swaplevel().reindex(X_alpha.index)
+
+# 手动做截面标准化（和 CSZScoreNorm 相同逻辑）
+for col in custom.columns:
+    grouped = custom[col].groupby(level=0)  # 按日期分组
+    mean = grouped.transform("mean")
+    std = grouped.transform("std")
+    custom[col] = (custom[col] - mean) / (std + 1e-8)
+    custom[col] = custom[col].clip(-3, 3)  # 截尾
+
+# 现在两者尺度一致，可以合并
+X_merged = pd.concat([X_alpha, custom], axis=1)
+```
+
+**优点：** 不改 Qlib 内部，最安全；归一化逻辑透明可控
+**风险：** 需要确保分组方式（按日期截面）和 CSZScoreNorm 一致
+**验证方法：** 合并后检查所有列的均值和标准差是否接近
+
+### 方案 C：Two-Stage Model（避开合并问题）
+
+**思路：** 不合并特征矩阵，而是训练两个独立模型再融合：
+
+```
+Stage 1: Alpha158 → XGB_alpha → score_alpha (当前 IC=0.024)
+Stage 2: 自定义因子 → XGB_custom → score_custom
+Final:   rank(score_alpha) * 0.7 + rank(score_custom) * 0.3 → ensemble
+```
+
+**优点：** 完全避开尺度/归一化问题；两个模型独立训练，互不干扰
+**风险：** 自定义因子只有 4 个维度，单独训练 XGB 可能过拟合
+**变种：** 用自定义因子做 `score_alpha` 的修正而非独立模型
+
+```python
+# Stage 2 变种：线性修正
+final_score = score_alpha + 0.1 * zscore(ep) + 0.1 * zscore(price_pos60)
+```
+
+### 方案 D：用 Qlib 自定义 DataLoader（最优雅但需要调试）
+
+**思路：** 用 `QlibDataLoader` 直接定义包含 Alpha158 + 自定义字段的完整特征集，让 Qlib 内部统一处理：
+
+```python
+handler_config = {
+    "class": "DataHandlerLP",
+    "module_path": "qlib.data.dataset.handler",
+    "kwargs": {
+        "data_loader": {
+            "class": "QlibDataLoader",
+            "kwargs": {
+                "config": {
+                    "feature": (
+                        alpha158_fields + [CUSTOM_EXPRS],  # 所有字段
+                        alpha158_names + [CUSTOM_NAMES],
+                    ),
+                    "label": ([[LABEL_EXPR]], [["LABEL0"]]),
+                },
+            },
+        },
+        "infer_processors": [{"class": "CSZScoreNorm", ...}],
+    },
+}
+```
+
+**优点：** 最 Qlib-native，所有特征同等处理
+**风险：** 之前碰过 `'list' object has no attribute 'get_extended_window_size'` 错误，是 Alpha158 的 feature config 返回格式和 QlibDataLoader 的期望格式不兼容。需要把 Alpha158 的嵌套 list 展平。
+**关键：** Alpha158 的 `get_feature_config()` 返回的是 `([group1, group2, ...], [names1, names2, ...])`，每个 group 是一个 list of expressions。QlibDataLoader 期望的是 `([[expr1, expr2, ...]], [[name1, name2, ...]])`。需要展平。
+
+### 方案推荐顺序
+
+| 优先级 | 方案 | 成功概率 | 复杂度 |
+|:---:|:---:|:---:|:---:|
+| 1 | **B（手动截面标准化）** | 高 | 低 |
+| 2 | A（继承 Alpha158） | 中 | 中 |
+| 3 | C（Two-Stage） | 高 | 低 |
+| 4 | D（QlibDataLoader） | 中 | 高 |
+
+**建议先试 B** — 只需要加 10 行代码，最快验证"尺度统一后是否能提升 IC"。如果 B 有效，说明确实是尺度问题，后续再改成 A 或 D 做长期方案。如果 B 无效，说明问题不在尺度，应该试 C（two-stage）。
+
+### 方案 B 的具体实施代码
+
+```python
+def prepare_merged_normalized(dataset, segment, custom_exprs, custom_names):
+    """Merge Alpha158 + custom factors with consistent normalization."""
+    X = dataset.prepare(segment, col_set="feature")
+    y = dataset.prepare(segment, col_set="label")
+    if isinstance(y, pd.DataFrame):
+        y = y.iloc[:, 0]
+
+    # Fetch custom features
+    instruments = list(set(str(c) for c in X.index.get_level_values(1)))
+    dates = sorted(X.index.get_level_values(0).unique())
+    custom = D.features(instruments, custom_exprs,
+                        start_time=str(min(dates))[:10],
+                        end_time=str(max(dates))[:10])
+    custom.columns = custom_names
+    custom = custom.swaplevel().sort_index().reindex(X.index)
+
+    # KEY FIX: Cross-sectional z-score normalize each custom factor
+    # This matches what CSZScoreNorm does to Alpha158 features
+    for col in custom.columns:
+        grouped = custom[col].groupby(level=0)
+        mean = grouped.transform("mean")
+        std = grouped.transform("std")
+        custom[col] = (custom[col] - mean) / (std + 1e-8)
+        custom[col] = custom[col].clip(-3, 3)
+
+    X_merged = pd.concat([X, custom], axis=1)
+    return X_merged, y
+```
+
+### 额外建议：因子稳定性 Rolling 测试
+
+不要用单个 60 天窗口判断因子好坏。应该：
+
+```python
+# 12 个滚动窗口，每个 20 天
+for split in range(12):
+    test_end = today - split * 20 days
+    test_start = test_end - 20 days
+    ic = calc_single_factor_ic(factor, label, test_start, test_end)
+    ic_history.append(ic)
+
+# 判断标准：
+# - IC > 0 的窗口占比 > 60% → 稳定有效
+# - IC 均值 > 0.01 → 足够强
+# - IC 标准差 < IC 均值 → 信号稳定
+stable = (positive_ratio > 0.6) and (ic_mean > 0.01) and (ic_std < ic_mean)
+```
+
+一个因子在 12 个窗口中有 8 个 IC > 0，比当前窗口 IC = +0.028 但下个窗口可能 -0.03 更可信。
+
+---
+
 ## 已解决的技术问题
 
 - ✅ Qlib multiprocessing spawn 问题 → 用 cx 的 `config/qlib_runtime.py`
