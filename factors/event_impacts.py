@@ -88,24 +88,25 @@ class EventImpactStore:
             as_of: YYYY-MM-DD, defaults to today
             target_id: filter by stock/sector/market code
         """
+        from datetime import timedelta
+
         if not as_of:
             as_of = datetime.now().strftime("%Y-%m-%d")
 
+        as_of_dt = datetime.strptime(as_of, "%Y-%m-%d")
         active = []
         for e in self._events:
-            # Check if within decay window
             event_date = e.get("effective_date", e.get("date", ""))
-            if not event_date:
-                continue
-            if event_date > as_of:
+            if not event_date or event_date > as_of:
                 continue
 
-            from datetime import datetime as dt, timedelta
             try:
-                ed = dt.strptime(event_date, "%Y-%m-%d")
+                ed = datetime.strptime(event_date, "%Y-%m-%d")
                 expire = ed + timedelta(days=e.get("decay_days", 5))
-                if dt.strptime(as_of, "%Y-%m-%d") > expire:
+                if as_of_dt >= expire:
                     continue
+                # Store elapsed days for decay weighting
+                e["_elapsed_days"] = (as_of_dt - ed).days
             except ValueError:
                 continue
 
@@ -123,16 +124,20 @@ class EventImpactStore:
         return [e for e in active if e.get("hard_override", "none") != "none"]
 
     def get_stock_impact(self, code: str, as_of: str = None) -> float:
-        """Get aggregate impact score for a stock."""
+        """Get aggregate impact score for a stock with time-based decay."""
         active = self.get_active(as_of, target_id=code)
         if not active:
             return 0.0
 
-        # Weighted average by confidence, with decay
         total_weight = 0
         total_impact = 0
         for e in active:
-            weight = e.get("confidence", 0.5)
+            confidence = e.get("confidence", 0.5)
+            decay_days = max(e.get("decay_days", 5), 1)
+            elapsed = e.get("_elapsed_days", 0)
+            # Linear decay: weight drops from 1.0 to 0.0 over decay_days
+            decay_factor = max(0.0, 1.0 - elapsed / decay_days)
+            weight = confidence * decay_factor
             total_impact += e.get("impact", 0) * weight
             total_weight += weight
 
