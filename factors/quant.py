@@ -2,15 +2,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-import qlib
 from qlib.contrib.data.handler import Alpha158
 
+from config.qlib_runtime import init_qlib as _init_qlib
 from config.settings import QLIB_PROVIDER_URI
 
 
 def init_qlib():
     """Initialize Qlib with local A-share data."""
-    qlib.init(provider_uri=QLIB_PROVIDER_URI, region_type="cn")
+    _init_qlib(QLIB_PROVIDER_URI)
 
 
 def get_alpha158_handler(

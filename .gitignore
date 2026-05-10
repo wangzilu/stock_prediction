@@ -14,3 +14,4 @@ venv/
 logs/
 mlruns/
 .claude/
+catboost_info/

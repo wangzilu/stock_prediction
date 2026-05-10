@@ -23,6 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.settings import PREDICTION_HORIZON_DAYS
+from config.qlib_runtime import init_qlib
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -51,12 +52,10 @@ def backtest(
 
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-    import qlib
-    from qlib.constant import REG_CN
     from qlib.utils import init_instance_by_config
     from qlib.contrib.evaluate import risk_analysis
 
-    qlib.init(provider_uri=qlib_data, region=REG_CN)
+    init_qlib(qlib_data)
 
     today = datetime.now()
     test_start = (today - timedelta(days=test_days)).strftime("%Y-%m-%d")

@@ -24,6 +24,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 from config.settings import PREDICTION_HORIZON_DAYS
+from config.qlib_runtime import init_qlib
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -41,12 +42,10 @@ def rolling_train(
     train_years: int = 3,
     universe: str = "all",
 ):
-    import qlib
-    from qlib.constant import REG_CN
     from qlib.utils import init_instance_by_config
     from qlib.contrib.eva.alpha import calc_ic
 
-    qlib.init(provider_uri=QLIB_DATA, region=REG_CN)
+    init_qlib(QLIB_DATA)
 
     today = datetime.now()
     results = []

@@ -2,12 +2,11 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
-import qlib
-from qlib.constant import REG_CN
 from qlib.data.dataset import DatasetH
 from qlib.contrib.model.gbdt import LGBModel
 from qlib.utils import init_instance_by_config
 
+from config.qlib_runtime import init_qlib
 from config.settings import (
     QLIB_PROVIDER_URI,
     PREDICTION_HORIZON_DAYS,
@@ -157,7 +156,7 @@ class ShortTermModel:
         """Initialize Qlib and prepare model."""
         if self._initialized:
             return
-        qlib.init(provider_uri=QLIB_PROVIDER_URI, region=REG_CN)
+        init_qlib(QLIB_PROVIDER_URI)
         self._initialized = True
 
     def train(

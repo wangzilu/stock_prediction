@@ -2,9 +2,9 @@
 
 Date: 2026-05-07
 Owner: Codex
-Last updated: 2026-05-09
+Last updated: 2026-05-10
 
-This is the primary execution plan for the project. Newer Qlib-specific research and cc/cx reconciliation notes are folded back into this file; detailed evidence remains in `plans/cx-qlib-advanced-implementation-plan-2026-05-09.md` and `plans/cc-qlib-advanced-features-roadmap.md`.
+This is the primary execution plan for the project. Newer Qlib-specific research and cc/cx reconciliation notes are folded back into this file; detailed evidence remains in `plans/cx-qlib-advanced-implementation-plan-2026-05-09.md`, `plans/cx-qlib-next-version-iteration-plan-2026-05-10.md`, and `plans/cc-qlib-advanced-features-roadmap.md`.
 
 2026-05-09 cc unified-plan review:
 
@@ -31,6 +31,7 @@ Evidence from local runtime:
   - data update timed out after 1 hour
   - LightGBM training raised `ValueError: Empty data from dataset`
 - A direct stdin-based probe of `ShortTermModel.load_from_pickle().predict_batch()` did not complete because Qlib multiprocessing tried to spawn from `<stdin>`, so future model smoke tests should live in a real script file.
+- 2026-05-10 fix: Qlib initialization is now centralized in `config/qlib_runtime.py`. Normal production runs keep Qlib defaults; debugging can set `QLIB_DEBUG_SAFE=1`, or pass `--joblib-backend threading --kernels 1` to `scripts/smoke_qlib_dataset.py`, to avoid macOS/joblib multiprocessing spawn from `<stdin>`.
 
 Likely root causes:
 
@@ -124,6 +125,10 @@ V2 target:
 - Short term: 1-5 trading days, timing and momentum.
 - Mid term: 20-60 trading days, trend continuation and fundamental/sector confirmation.
 - Long term: 3-24 months, business quality, growth acceleration, valuation, and multi-bagger optionality.
+
+Long-term and mid-term inputs must not be derived only from the current short-term LGB score. Add slow-moving fundamental and ownership factors such as valuation, profit growth, cash-flow quality, industry prosperity, and lagged institutional/fund holdings. Public fund heavy-position data is usable only after its public disclosure date, with a trading-day lag, so it should be treated as a quarterly "smart money / crowding / theme confirmation" factor rather than an intraday or next-day timing signal.
+
+Do not conflate quarterly fund holdings with daily capital-flow signals. Daily main-force fund flow, sector fund flow, and northbound/HK Stock Connect holdings are separate ownership/flow factors. They can update daily and are better candidates for the short/mid-horizon model than public fund quarterlies, but they still need the same IC, RankIC, turnover, capacity, and cost validation before production scoring.
 
 ### US/HK Stock Recommendation Expansion
 
@@ -1043,6 +1048,7 @@ Implemented on 2026-05-07:
   - `scripts/nightly_train.py` now refreshes the LGB inference universe every night and runs the staged LGB smoke gate before training.
   - `models/short_term.py` and `scripts/train_lgb.py` now use `LGB_INFERENCE_UNIVERSE` instead of hard-coded `csi300`.
   - Added `scripts/check_scheduler_lgb_status.py` to verify scheduler LGB status from a real script file, avoiding Qlib/joblib stdin spawn failures on macOS.
+  - Added `config/qlib_runtime.py` so all Qlib entry points share the same init path and can opt into `QLIB_DEBUG_SAFE=1` for single-kernel/threading diagnostics.
 - Current verification:
   - `scripts/check_qlib_data_health.py --qlib-dir data/storage/qlib_data/cn_data --universe csi300 --min-instruments 250 --json`
     - ok: true

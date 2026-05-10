@@ -208,14 +208,13 @@ def build_envs_from_qlib(
     lgb_score_mode: str = "latest",
 ):
     """Build gymnasium environments from Qlib data, one per stock."""
-    import qlib
-    from qlib.constant import REG_CN
     from qlib.utils import init_instance_by_config
     from qlib.data import D
     from datetime import datetime, timedelta
+    from config.qlib_runtime import init_qlib
     from models.rl_agent import StockTradingEnv
 
-    qlib.init(provider_uri=QLIB_DATA, region=REG_CN)
+    init_qlib(QLIB_DATA)
 
     today = datetime.now()
     start = (today - timedelta(days=365 * 3)).strftime("%Y-%m-%d")

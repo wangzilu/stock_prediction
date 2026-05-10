@@ -25,6 +25,7 @@ from config.settings import (
     LGB_MIN_PREDICTIONS,
     PREDICTION_HORIZON_DAYS,
 )
+from config.qlib_runtime import init_qlib
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -48,15 +49,13 @@ def evaluate(
 ) -> dict:
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-    import qlib
-    from qlib.constant import REG_CN
     from qlib.utils import init_instance_by_config
     from qlib.contrib.eva.alpha import calc_ic, calc_long_short_return
 
     if not os.path.exists(model_path):
         return {"ok": False, "error": f"Model file not found: {model_path}"}
 
-    qlib.init(provider_uri=qlib_data, region=REG_CN)
+    init_qlib(qlib_data)
 
     today = datetime.now()
     test_start = (today - timedelta(days=test_days)).strftime("%Y-%m-%d")

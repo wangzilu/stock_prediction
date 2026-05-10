@@ -698,16 +698,80 @@ cc 的“全 A 下载慢”诊断应吸收；cc 的“官方数据 + 多线程 b
 | P1 | A 股交易规则回测 | RQAlpha | 解决 T+1、涨跌停、手续费、停牌 |
 | P1 | 因子诊断 | Alphalens-reloaded | 看 LGB 分数是否有 IC/rank IC |
 | P1 | 交易日历统一 | Qlib calendar / exchange calendar | 修正节假日、调休下的明日预测和复盘日期 |
+| P1 | 日频资金流/北向因子研究 | AKShare/TuShare 主力资金流、行业资金流、北向持仓 | 与基金季报不同，日频更新；先做研究因子和本地 IC/回测 |
 | P2 | 仓位组合 | PyPortfolioOpt / Riskfolio-Lib | 从荐股升级到组合 |
 | P2 | 舆情结构化 | FinBERT + SnowNLP重训 + LTP/HanLP + LLM | 让 22:00/09:20 修正可验证 |
 | P2 | 细粒度事件冲击 | LLM JSON + LTP/HanLP/PaddleNLP + event_impacts | 把“情绪分”升级为公司/行业/宏观冲击表 |
 | P2 | 妖股模型 | 涨停板、龙虎榜、资金流、股吧热度 | 5 倍股/10 倍股必须单独模型 |
 | P2 | 真长线模型或改名观察榜 | 财报/估值/机构/行业景气 | 当前长线分数由短线模型派生，不能当长期价值判断 |
+| P2 | 基金重仓/绩优基金共识因子 | 基金季报 Top10 持仓 + 基金收益排名 + 披露日滞后 | 补机构偏好、产业趋势和拥挤度；只能做中期/长期慢因子 |
 | P3 | 多市场扩展 | OpenBB + Lean/NautilusTrader | 美股/港股/加密跨市场时再做 |
 | P3 | 研究归因助手 | FinRobot-style workflow / PyABSA research | 只作研究和解释参考，不进近期生产主链 |
 | P3 | RL baseline | FinRL/TradeMaster/TensorTrade | 用作实验对照，不先上生产 |
 
 ---
+
+### 5.1 基金重仓因子可行性
+
+结论：可行，但只能做严格滞后的中期/长期输入因子，不能把最新季末持仓当作季末当天已经知道的信息。
+
+原因：
+
+- 公募基金季报有法定披露滞后。训练样本中每一条基金持仓因子必须使用 `effective_date = report_disclosure_date + 1 trading day`，不能使用季度末日期。
+- 季报主要披露重仓股，粒度适合做机构偏好、行业主题确认、拥挤度、持仓变化和风格暴露，不适合捕捉 1-5 日交易噪声。
+- 绩优基金本身会换人、换风格、均值回归。不能简单追“上一季度冠军基金持仓”，应使用滚动 4-8 季风险调整收益、最大回撤、规模和持仓稳定性给基金加权。
+- 回测时必须避免幸存者偏差。基金池要按当时可见的基金列表和当时可见的净值排名构建，退市/清盘/改名基金不能事后剔除。
+
+第一版因子：
+
+| 因子 | 定义 | 使用场景 |
+|---|---|---|
+| `fund_star_weight` | 绩优基金持有该股的加权次数或市值权重，基金权重来自过去 4-8 季收益、回撤和规模 | 中期趋势确认 |
+| `fund_holding_delta` | 该股进入/退出/增持/减持绩优基金 Top10 的变化 | 机构偏好边际变化 |
+| `fund_consensus_count` | 不同基金公司/基金经理共同重仓该股的数量 | 机构共识与确定性 |
+| `fund_crowding_risk` | 重仓过度集中且短期涨幅过大的拥挤度 | 风险惩罚，不做加分 |
+| `fund_theme_exposure` | 绩优基金重仓股映射到行业/主题后的暴露 | 行业景气和主题轮动 |
+
+接入方式：
+
+1. 新建 `data/collectors/fund_holdings.py`，采集基金净值、阶段收益、季度报告披露日期和 Top10 重仓股。
+2. 新建 `factors/fund_holdings.py`，把基金持仓展开成股票日频慢因子；披露日前填 NaN，披露后按交易日 forward-fill 到下一次披露。
+3. 因子先进入研究训练集，不直接进生产打分；用 IC、RankIC、分层收益和 TopK 回测证明增量价值。
+4. 若只对 1-5 日 LGB 没有提升，也保留给 20-60 日中期模型和 3-24 月长线观察榜。
+
+验收门槛：
+
+- 与 Alpha158/LGB 基线相比，加入基金持仓因子后 rolling test 的 RankIC、Top20-Bot20 spread 或回测 Sharpe 至少一个稳定提升，且最大回撤不恶化。
+- 滞后处理单元测试通过：任意日期 `t` 的因子只使用 `t` 之前已经披露的数据。
+- 输出解释中能显示“该股被哪些绩优基金重仓/新增/减持”，但不得把它描述为基金当前实时持仓。
+
+### 5.2 日频资金流与北向资金因子
+
+cc 的 `plans/cc-fund-strategy-integration.md` 提了一个应吸收的修正：基金重仓、主力资金流、北向资金不是同一类数据。基金重仓是季度披露的慢因子；主力资金流和北向持仓/流入是日频资金行为因子，更适合短中期模型。
+
+可采集数据：
+
+| 因子族 | 数据接口 | 频率 | 用途 |
+|---|---|---:|---|
+| 主力资金流 | `ak.stock_individual_fund_flow(stock, market)` | 日频 | 个股买卖压力、主力净流入、卖压 z-score |
+| 行业/概念资金流 | `ak.stock_sector_fund_flow_rank(...)` | 日频 | 板块资金强弱和行业轮动 |
+| 北向个股持仓 | `ak.stock_hsgt_individual_em(symbol)`、`ak.stock_hsgt_hold_stock_em(...)` | 日频 | 外资持仓变化、2 周变化率、拥挤度 |
+| 基金季度持仓 | `ak.fund_portfolio_hold_em(...)`、`ak.fund_portfolio_change_em(...)` | 季度 | 机构共识、重仓变化、中长期确认 |
+
+本地环境校验：`akshare` 已安装；`stock_individual_fund_flow`、`stock_hsgt_individual_em`、`stock_hsgt_hold_stock_em`、`fund_portfolio_hold_em`、`fund_portfolio_change_em`、`stock_sector_fund_flow_rank` 可用；`stock_hsgt_north_net_flow_in_em` 在当前版本中不存在，代码实现时需要使用实际可用接口或做版本兼容。
+
+实施方式：
+
+1. 新建 `data/collectors/fund_flow.py`，统一采集主力资金流、行业资金流、北向个股持仓。
+2. 新建或扩展 `factors/institutional.py`，输出 `main_flow_zscore`、`sell_pressure_zscore`、`northbound_holding_delta_10d`、`sector_flow_rank`、`fund_consensus_score`。
+3. 先把这些因子写成日频 research feature parquet/csv，不直接写生产 Qlib bin；通过 `evaluate_lgb_test.py` 和 `backtest_qlib_signal.py` 比较加入前后效果。
+4. 若验证有效，再把日频资金流并入短/中期模型；季度基金持仓保留给中长期模型和解释层。
+
+验收门槛：
+
+- 至少 6-12 个月 rolling window 中，加入资金流/北向因子后的 RankIC 或 TopK 回测收益稳定优于 Alpha158/XGB 基线。
+- 明确交易成本和容量约束。主力资金流因子如果来自日内交易统计，不能假设收盘前已经完整可用；盘后模型只能用于次日或更长持有期。
+- 研报 Sharpe 只能作为优先级参考，不能作为本项目收益承诺。生产采用必须以本地数据、同一 universe、同一交易成本模型复现。
 
 ## 6. 参考来源
 
@@ -728,6 +792,10 @@ cc 的“全 A 下载慢”诊断应吸收；cc 的“官方数据 + 多线程 b
 - Backtrader: <https://www.backtrader.com/>
 - Zipline-reloaded: <https://github.com/stefan-jansen/zipline-reloaded>
 - Lean: <https://www.lean.io/>
+- 中国证监会《公开募集证券投资基金信息披露管理办法》: <https://www.csrc.gov.cn/csrc/c106256/c1653985/content.shtml>
+- 每日经济新闻，2026Q1 绩优基金与重仓方向: <https://www.nbd.com.cn/articles/2026-04-22/4351434.html>
+- 中国基金报，2026Q1 主动权益绩优基金复盘: <https://www.chnfund.com/article/AR20260426033847389>
+- cc 基金策略集成文档: `plans/cc-fund-strategy-integration.md`
 - Lean docs: <https://www.quantconnect.com/docs/v2/lean-engine/getting-started>
 - NautilusTrader: <https://nautilustrader.io/docs/latest/concepts/overview>
 - vn.py: <https://github.com/vnpy/vnpy>

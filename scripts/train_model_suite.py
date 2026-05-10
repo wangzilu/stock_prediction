@@ -26,6 +26,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 from config.settings import PREDICTION_HORIZON_DAYS, LGB_MIN_PREDICTIONS
+from config.qlib_runtime import init_qlib
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -138,11 +139,9 @@ DEEP_MODELS = ["alstm", "transformer"]
 
 def build_dataset():
     """Build shared Alpha158 dataset."""
-    import qlib
-    from qlib.constant import REG_CN
     from qlib.utils import init_instance_by_config
 
-    qlib.init(provider_uri=QLIB_DATA, region=REG_CN)
+    init_qlib(QLIB_DATA)
 
     today = datetime.now()
     train_start = (today - timedelta(days=365 * 5)).strftime("%Y-%m-%d")

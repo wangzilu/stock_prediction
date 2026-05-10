@@ -13,10 +13,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import pandas as pd
-import qlib
-from qlib.constant import REG_CN
 from qlib.utils import init_instance_by_config
 
+from config.qlib_runtime import init_qlib
 from config.settings import (
     LGB_INFERENCE_UNIVERSE,
     LGB_MIN_DATA_INSTRUMENTS,
@@ -162,7 +161,7 @@ def main():
         return 1
 
     print("Initializing Qlib...")
-    qlib.init(provider_uri=QLIB_DATA, region=REG_CN)
+    init_qlib(QLIB_DATA)
 
     # Dynamic date ranges
     today = datetime.now()
