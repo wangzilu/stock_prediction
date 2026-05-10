@@ -107,6 +107,14 @@ def main():
     if not run_step("LGB Evaluate", "evaluate_lgb_test.py", timeout=600):
         logger.warning("Evaluation failed but not blocking pipeline (model already saved)")
 
+    # Step 6: Brinson attribution
+    if not run_step("Brinson Attribution", "attribution.py", timeout=300):
+        logger.warning("Attribution failed (non-blocking)")
+
+    # Step 7: Factor decay monitoring
+    if not run_step("Factor Decay Monitor", "monitor_factor_decay.py", timeout=60):
+        logger.warning("Factor decay check returned degraded — consider model rollback")
+
     logger.info(f"After-close pipeline completed at {datetime.now()}")
     return 0
 

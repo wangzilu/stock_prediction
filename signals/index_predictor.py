@@ -48,12 +48,31 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def next_weekday(current: date) -> date:
-    """Return the next weekday. This is a first pass before exchange calendars."""
+def next_trading_day(current: date) -> date:
+    """Return the next A-share trading day using Qlib calendar.
+
+    Falls back to next weekday if Qlib calendar unavailable.
+    """
+    from pathlib import Path
+    cal_path = Path(__file__).resolve().parents[1] / "data" / "storage" / "qlib_data" / "cn_data" / "calendars" / "day.txt"
+    try:
+        if cal_path.exists():
+            cal_dates = [line.strip() for line in cal_path.read_text().splitlines() if line.strip()]
+            current_str = current.strftime("%Y-%m-%d")
+            for d in cal_dates:
+                if d > current_str:
+                    return datetime.strptime(d, "%Y-%m-%d").date()
+    except Exception:
+        pass
+    # Fallback: next weekday
     target = current + timedelta(days=1)
     while target.weekday() >= 5:
         target += timedelta(days=1)
     return target
+
+
+# Keep old name for backward compatibility
+next_weekday = next_trading_day
 
 
 class OvernightIndexPredictor:

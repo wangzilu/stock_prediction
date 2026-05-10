@@ -477,7 +477,7 @@ class DailyPipeline:
         specs = [
             ("短线", "短线前十", "明日预测"),
             ("中线", "中线前十", "中线分"),
-            ("长线", "长线前十（观察榜）", "长线分"),
+            ("长线", "长线观察榜前十（仅供参考，非长期持有建议）", "长线分"),
             ("综合", "综合前十", "综合分"),
         ]
         for key, title, metric_label in specs:
@@ -1167,22 +1167,45 @@ class DailyPipeline:
             return ""
 
     def _load_model_quality_line(self) -> str:
-        """Load model quality from lgb_eval_latest.json for push reports."""
+        """Load model quality + attribution + decay status for push reports."""
+        lines = []
         try:
-            eval_path = DATA_DIR / "lgb_eval_latest.json"
-            if not eval_path.exists():
-                return ""
             import json as _json
-            data = _json.loads(eval_path.read_text())
-            m = data.get("metrics", {})
-            quality = data.get("quality", "unknown")
-            ic = m.get("ic_mean", 0)
-            spread = m.get("top20_bot20_spread", m.get("top20_return_mean", 0))
-            n_dates = data.get("n_dates", 0)
-            label = {"normal": "正常", "marginal": "偏弱", "weak": "弱"}.get(quality, "未知")
-            return f"模型状态：IC={ic:.3f}, Top20 spread={spread*100:.2f}%, {n_dates}日测试, {label}"
+
+            # Eval metrics
+            eval_path = DATA_DIR / "lgb_eval_latest.json"
+            if eval_path.exists():
+                data = _json.loads(eval_path.read_text())
+                m = data.get("metrics", {})
+                quality = data.get("quality", "unknown")
+                ic = m.get("ic_mean", 0)
+                spread = m.get("top20_bot20_spread", m.get("top20_return_mean", 0))
+                n_dates = data.get("n_dates", 0)
+                label = {"normal": "正常", "marginal": "偏弱", "weak": "弱"}.get(quality, "未知")
+                lines.append(f"模型：IC={ic:.3f}, Spread={spread*100:.2f}%, {n_dates}日, {label}")
+
+            # Attribution
+            attr_path = DATA_DIR / "lgb_attribution_latest.json"
+            if attr_path.exists():
+                attr = _json.loads(attr_path.read_text())
+                if "error" not in attr:
+                    alloc = attr.get("allocation_share", 0)
+                    select = attr.get("selection_share", 0)
+                    lines.append(f"归因：选股贡献{select:.0f}%｜行业配置{alloc:.0f}%")
+
+            # Decay status
+            decay_path = DATA_DIR / "factor_decay_status.json"
+            if decay_path.exists():
+                decay = _json.loads(decay_path.read_text())
+                status = decay.get("status", "unknown")
+                if status == "degraded":
+                    lines.append("⚠️ 模型信号衰退，建议降低仓位")
+                elif status == "warning":
+                    lines.append("⚡ 模型信号减弱，注意风险")
         except Exception:
-            return ""
+            pass
+
+        return "\n".join(lines) if lines else ""
 
     def _format_evening_outlook_report(
         self,
