@@ -894,7 +894,86 @@ Week 5+：组合/妖股/舆情
 
 ---
 
-## 九、其他风险提示
+## 九、第二轮 Qlib 功能扫描 — 仍未用上的高价值模块
+
+基于对 Qlib 0.9.7 全部模块的逐一 import 验证，以下是当前仍未使用但有明确价值的功能：
+
+### 9.1 立刻可用（无额外依赖）
+
+| 功能 | 模块 | 当前状态 | 价值 |
+|------|------|---------|------|
+| **Brinson 收益归因** | `qlib.backtest.profit_attribution.brinson_pa()` | 未用 | 拆解"模型收益来自行业配置还是个股选择"，直接回答"alpha 从哪来" |
+| **64 个表达式算子** | `qlib.data.ops` | 只用了 Alpha158 预设 | 可自定义因子如 `ChangeInstrument`（跨资产计算）、`WMA`（加权移动平均）、`Resi`（回归残差）等 |
+| **23 个数据处理器** | `qlib.data.dataset.processor` | 只用了 CSZScoreNorm + DropnaLabel | `RobustZScoreNorm`（抗离群值）、`TanhProcess`（压缩极端值）、`MinMaxNorm` 可改善深度模型训练 |
+| **RollingGen 滚动任务生成器** | `qlib.workflow.task.gen.RollingGen` | 未用（cc 自写了 rolling_train.py） | Qlib 原生支持 step=40 expanding/sliding window，比自写更稳健 |
+| **SignalRecord + SigAnaRecord** | `qlib.workflow.record_temp` | 未用 | 自动保存 pred/label/IC/分组收益，配合 Recorder 形成完整实验记录 |
+| **PredUpdater / LabelUpdater** | `qlib.workflow.online.update` | 未用 | 增量更新预测/标签，适合日常 pipeline 不重建全量 dataset |
+| **Alpha360DL** | `qlib.contrib.data.loader.Alpha360DL` | 未用 | Alpha360 的 DataLoader 版本，支持更灵活的特征工程 |
+
+### 9.2 需要修依赖才能用（cvxpy/numpy 冲突或缺 statsmodels）
+
+| 功能 | 模块 | 阻塞原因 | 修复方式 |
+|------|------|---------|---------|
+| **TopkDropoutStrategy** | `qlib.contrib.strategy.signal_strategy` | cvxpy 需要 numpy>=2.0 | `pip install numpy==2.0 cvxpy --upgrade` 但会破坏 Qlib Alpha158 |
+| **PortfolioOptimizer** (MVO/RP/GMV) | `qlib.contrib.strategy.optimizer` | 同上 | 同上 |
+| **模型性能可视化报告** | `qlib.contrib.report.analysis_model` | 缺 `statsmodels` | `pip install statsmodels`（无冲突） |
+| **持仓分析报告** | `qlib.contrib.report.analysis_position` | 缺 `statsmodels` | 同上 |
+
+### 9.3 研究级（高价值但复杂度高）
+
+| 功能 | 模块 | 说明 |
+|------|------|------|
+| **Meta-Learning 数据选择** | `qlib.contrib.meta.data_selection` | 用 IC 相似度自动选择"哪些历史数据对当前市场最有用"，解决 concept drift |
+| **AdaRNN（域适应）** | `qlib.contrib.model.pytorch_adarnn` | 自适应 RNN，在市场风格切换时自动调整模型 |
+| **TCTS（时序对比学习）** | `qlib.contrib.model.pytorch_tcts` | 对比学习框架，学习时序特征的不变表示 |
+| **HIST（异质信息融合）** | `qlib.contrib.model.pytorch_hist` | 融合行业/概念图谱信息的 Transformer |
+| **TRA（时序路由适配器）** | `qlib.contrib.model.pytorch_tra` | 多状态交易系统，根据市场状态自动切换子模型 |
+| **SFM（股票流量动量）** | `qlib.contrib.model.pytorch_sfm` | 基于资金流的深度学习模型 |
+| **RL 订单执行** | `qlib.rl.order_execution` | TWAP 策略 + RL 优化的订单拆分，用于降低交易冲击成本 |
+| **OnlineManager** | `qlib.workflow.online.manager` | 在线模型管理，支持模型热更新和灰度发布 |
+
+### 9.4 推荐的下一步利用顺序
+
+```
+Week 1（立刻做，零依赖）：
+├─ 装 statsmodels → 启用模型性能报告
+├─ RobustZScoreNorm 替代 CSZScoreNorm → 深度模型抗离群值
+├─ 自定义表达式因子 → 用 ChangeInstrument/Resi 构造跨资产因子
+└─ Brinson 归因 → 回测后拆解 alpha 来源
+
+Week 2（修依赖）：
+├─ 解决 numpy/cvxpy 冲突 → 启用 TopkDropoutStrategy + PortfolioOptimizer
+└─ SignalRecord + Recorder → 完整实验追踪
+
+Week 3（研究级）：
+├─ Meta-Learning 数据选择 → 解决 concept drift
+├─ TRA 多状态模型 → 市场风格自动切换
+└─ HIST + 行业图谱 → 板块联动建模
+```
+
+### 9.5 自定义因子的机会 — 64 个算子组合
+
+当前只用 Alpha158 预定义的 158 个因子。但 Qlib 的表达式引擎支持 64 个算子自由组合，可以构造新因子：
+
+```python
+# 例：5日资金流动量（如果有资金流数据写入 Qlib）
+"Ref($main_net_inflow, -1) / Mean($main_net_inflow, 20)"
+
+# 例：跨资产相关性（A 股 vs 沪深300指数）
+"Corr($close, ChangeInstrument($close, 'SH000300'), 20)"
+
+# 例：回归残差（去掉大盘影响后的个股收益）
+"Resi($close/Ref($close, -1)-1, ChangeInstrument($close/Ref($close, -1)-1, 'SH000300'), 20)"
+
+# 例：异常成交量（加权移动平均）
+"$volume / WMA($volume, 20) - 1"
+```
+
+这些自定义因子可以和主力资金流/北向资金数据结合，构造出 Alpha158 没有的"资金维度因子"，直接喂给 XGB 重训。
+
+---
+
+## 十、其他风险提示
 2. **Alpha360 内存消耗大** — 360 维 × 全A 5000+ 只 × 5 年 ≈ 需要 16GB+ 内存
 3. **滚动训练耗时** — 每月重训一次，20 个月 = 20 次训练，总耗时约 1-2 小时
 4. **组合优化需要协方差矩阵** — 估计不稳定时组合权重会大幅波动，需要用 ShrinkRiskModel 收缩
