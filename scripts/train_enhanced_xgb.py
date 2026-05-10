@@ -62,7 +62,7 @@ def main():
     logger.info(f"  Qlib init: {time.time()-t0:.1f}s")
 
     today = datetime.now()
-    train_start = (today - timedelta(days=365 * 3)).strftime("%Y-%m-%d")  # 3 years for speed
+    train_start = (today - timedelta(days=365 * 5)).strftime("%Y-%m-%d")  # 5 years full history
     train_end = (today - timedelta(days=90)).strftime("%Y-%m-%d")
     valid_start = (today - timedelta(days=89)).strftime("%Y-%m-%d")
     valid_end = (today - timedelta(days=30)).strftime("%Y-%m-%d")
@@ -83,7 +83,7 @@ def main():
         "kwargs": {
             "start_time": train_start,
             "end_time": test_end,
-            "instruments": "csi300",
+            "instruments": "all",
             "label": [LABEL_EXPR],
         },
     }

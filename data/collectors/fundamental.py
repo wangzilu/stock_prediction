@@ -69,19 +69,18 @@ class FundamentalCollector:
                 logger.error(f"Cached spot also failed: {e2}")
                 return pd.DataFrame()
 
-            # Normalize code
-            result["qlib_code"] = result["code"].apply(
-                lambda c: f"SH{c}" if str(c).startswith("6") else f"SZ{c}"
-            )
+        # Derived factors (runs on BOTH happy path and fallback path)
+        result["qlib_code"] = result["code"].apply(
+            lambda c: f"SH{c}" if str(c).startswith("6") else f"SZ{c}"
+        )
 
-            # Derived factors
-            result["ep"] = 1.0 / result["pe_ttm"].replace(0, np.nan)  # Earnings yield
-            result["bp"] = 1.0 / result["pb"].replace(0, np.nan)  # Book-to-price
-            result["log_mv"] = np.log(result["total_mv"].replace(0, np.nan))
-            result["log_circ_mv"] = np.log(result["circ_mv"].replace(0, np.nan))
+        result["ep"] = 1.0 / result["pe_ttm"].replace(0, np.nan)  # Earnings yield
+        result["bp"] = 1.0 / result["pb"].replace(0, np.nan)  # Book-to-price
+        result["log_mv"] = np.log(result["total_mv"].replace(0, np.nan))
+        result["log_circ_mv"] = np.log(result["circ_mv"].replace(0, np.nan))
 
-            # Clean
-            for col in ["pe_ttm", "pb", "ep", "bp", "log_mv", "log_circ_mv"]:
+        # Clean
+        for col in ["pe_ttm", "pb", "ep", "bp", "log_mv", "log_circ_mv"]:
                 result[col] = pd.to_numeric(result[col], errors="coerce")
 
             result["date"] = datetime.now().strftime("%Y-%m-%d")
