@@ -202,6 +202,44 @@ def main():
     dataset = init_instance_by_config(dataset_config)
     print("Dataset ready.")
 
+    # Merge supplementary features (capital flow, valuation, etc.)
+    # DataHandlerLP stores learn (_learn) and infer (_infer) data separately.
+    # We must inject into both so fit() (DK_L) and predict() (DK_I) see the same columns.
+    supp_cols = 0
+    try:
+        from models.feature_merger import FeatureMerger
+        merger = FeatureMerger()
+        handler = dataset.handler
+
+        # Compute supplementary features using raw _data index
+        raw_data = getattr(handler, '_data', None)
+        if raw_data is not None:
+            supp = merger._load_supplementary(raw_data.index)
+            if supp is not None and not supp.empty:
+                # Replace inf with NaN — XGBoost handles NaN but crashes on inf
+                supp = supp.replace([np.inf, -np.inf], np.nan)
+                supp_cols = supp.shape[1]
+                common = supp.index.intersection(raw_data.index)
+
+                # Inject into all three internal DataFrames: _data, _learn, _infer
+                for attr in ('_data', '_learn', '_infer'):
+                    df = getattr(handler, attr, None)
+                    if df is None:
+                        continue
+                    attr_common = common.intersection(df.index)
+                    for col in supp.columns:
+                        df[("feature", col)] = np.nan
+                        df.loc[attr_common, ("feature", col)] = supp.loc[attr_common, col].values
+
+                # Verify injection worked for learn data
+                from qlib.data.dataset.handler import DataHandlerLP
+                verify = dataset.prepare("train", col_set="feature",
+                                         data_key=DataHandlerLP.DK_L)
+                print(f"Merged {supp_cols} supplementary features "
+                      f"(learn features: {verify.shape[1]})")
+    except Exception as e:
+        print(f"Supplementary feature merge skipped: {e}")
+
     # Model selection: XGB (better IC) or LGB (fallback)
     model_type = os.environ.get("TRAIN_MODEL_TYPE", "xgb").lower()
 
@@ -220,7 +258,8 @@ def main():
                 "n_jobs": 4,
             },
         }
-        print(f"Training XGBoost (IC=0.024 > LGB IC=0.008)...")
+        n_features = 158 + supp_cols
+        print(f"Training XGBoost ({n_features} features)...")
     else:
         model_config = {
             "class": "LGBModel",

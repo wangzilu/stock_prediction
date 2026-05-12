@@ -241,20 +241,53 @@ class DailyPipeline:
         nb_path = DATA_DIR / "northbound_history.parquet"
         if nb_path.exists():
             try:
-                nb = pd.read_parquet(nb_path, columns=["qlib_code", "trade_date"])
+                # Try to load holding quantity columns (from hk_hold API)
+                want_cols = ["qlib_code", "trade_date"]
+                # vol/ratio may come from hk_hold; 持股数量/占比 from akshare
+                detail_cols = ["vol", "ratio", "持股数量", "持股数量占A股百分比"]
+                nb_all_cols = pd.read_parquet(nb_path, columns=["qlib_code"]).columns  # dummy
+                nb = pd.read_parquet(nb_path)
                 nb = nb.dropna(subset=["trade_date"])
                 nb["trade_date"] = nb["trade_date"].astype(str)
                 latest_nb_dates = sorted(nb["trade_date"].unique())[-5:]
                 recent_nb = nb[nb["trade_date"].isin(latest_nb_dates)]
+
+                # Detect which holding-amount column is available
+                hold_col = None
+                for c in ["vol", "持股数量"]:
+                    if c in recent_nb.columns and recent_nb[c].notna().sum() > 100:
+                        hold_col = c
+                        break
+                ratio_col = None
+                for c in ["ratio", "持股数量占A股百分比"]:
+                    if c in recent_nb.columns and recent_nb[c].notna().sum() > 100:
+                        ratio_col = c
+                        break
+
+                has_detail = hold_col is not None
                 nb_stocks = set(recent_nb["qlib_code"].unique())
                 for code in nb_stocks:
                     if code not in signals:
                         signals[code] = {}
                     signals[code]["nb_present"] = True
-                    # Count how many of the latest 5 days this stock appeared
-                    stock_dates = recent_nb[recent_nb["qlib_code"] == code]["trade_date"].nunique()
-                    signals[code]["nb_days"] = stock_dates
-                logger.info(f"Loaded northbound signals for {len(nb_stocks)} stocks")
+                    grp = recent_nb[recent_nb["qlib_code"] == code]
+                    signals[code]["nb_days"] = grp["trade_date"].nunique()
+
+                    if has_detail:
+                        grp_sorted = grp.sort_values("trade_date")
+                        vals = pd.to_numeric(grp_sorted[hold_col], errors="coerce")
+                        if len(vals) >= 2 and vals.notna().sum() >= 2:
+                            # 5-day change in holding quantity
+                            signals[code]["nb_hold_change"] = float(
+                                vals.iloc[-1] - vals.iloc[0])
+                        if ratio_col:
+                            ratios = pd.to_numeric(grp_sorted[ratio_col], errors="coerce")
+                            if ratios.notna().any():
+                                signals[code]["nb_hold_ratio"] = float(
+                                    ratios.iloc[-1])
+
+                detail_info = f", with holding detail ({hold_col})" if has_detail else " (presence only)"
+                logger.info(f"Loaded northbound signals for {len(nb_stocks)} stocks{detail_info}")
             except Exception as e:
                 logger.warning(f"Failed to load northbound signals: {e}")
 
@@ -264,7 +297,7 @@ class DailyPipeline:
     def _capital_flow_score(self, qlib_code: str) -> float:
         """Compute a [-1, 1] capital flow factor for a single stock.
 
-        Positive = main force buying + northbound present.
+        Positive = main force buying + northbound increasing holdings.
         """
         signals = self._load_capital_flow_signals()
         s = signals.get(qlib_code)
@@ -272,14 +305,20 @@ class DailyPipeline:
             return 0.0
 
         # Main force: normalize net_mf_5d (万元) to [-1, 1]
-        # Typical range: -500,000 to +500,000 万元 for large caps
         net_mf_5d = _finite_float(s.get("net_mf_5d"))
         mf_score = max(-1.0, min(1.0, net_mf_5d / 200_000.0))
 
-        # Northbound bonus: +0.1 if present in recent 5 days
-        nb_bonus = 0.1 if s.get("nb_present") else 0.0
+        # Northbound: use holding change if available, else presence bonus
+        nb_hold_change = _finite_float(s.get("nb_hold_change"))
+        if nb_hold_change != 0.0:
+            # Normalize: 1M shares change → ±0.2 score
+            nb_score = max(-0.3, min(0.3, nb_hold_change / 5_000_000.0))
+        elif s.get("nb_present"):
+            nb_score = 0.1
+        else:
+            nb_score = 0.0
 
-        return round(max(-1.0, min(1.0, mf_score + nb_bonus)), 4)
+        return round(max(-1.0, min(1.0, mf_score + nb_score)), 4)
 
     def _model_status_text(self):
         """Return a compact status block for pushed reports."""

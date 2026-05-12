@@ -115,6 +115,7 @@ _JOB_DISPLAY_NAMES = {
     "spot_cache_warmup": "行情缓存",
     "qlib_data_update": "Qlib数据更新",
     "fund_flow_update": "资金流向抓取",
+    "valuation_update": "估值因子更新",
     "lgb_after_close_train": "模型训练",
     "lgb_after_close_smoke": "模型冒烟测试",
     "nightly_train": "夜间训练",

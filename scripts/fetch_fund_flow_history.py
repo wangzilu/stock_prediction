@@ -389,13 +389,28 @@ def _fetch_one_flow_st(code: str, throttle: AdaptiveThrottle):
 
 
 def _fetch_one_nb_st(code: str, throttle: AdaptiveThrottle):
-    """Fetch northbound holdings via StockToday API."""
+    """Fetch northbound holdings via StockToday API.
+
+    Tries hk_hold first (has holding quantity/value), then stock_hsgt (name only).
+    Falls back to akshare if ST_CLIENT fails.
+    """
     if code.startswith("BJ"):
         return None
 
     st = get_st_client()
     ts_code = qlib_code_to_ts_code(code)
 
+    # Try hk_hold first — should have vol/ratio/holding detail
+    try:
+        result = st.hk_hold(ts_code=ts_code)
+        df = _parse_st_result(result)
+        if df is not None and not df.empty:
+            throttle.on_success()
+            return _to_standard_flow_columns(df, code)
+    except Exception:
+        pass  # fall through to stock_hsgt
+
+    # Fallback to stock_hsgt (less detail but more reliable)
     try:
         df = _fetch_st_frame(st, ["stock_hsgt"], ts_code)
     except NoDataForStock:

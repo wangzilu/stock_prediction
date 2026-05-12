@@ -86,6 +86,16 @@ class FeatureMerger:
         if holder is not None:
             frames.append(holder)
 
+        # Valuation features (PE/PB/PS)
+        val = self._load_valuation(index)
+        if val is not None:
+            frames.append(val)
+
+        # Northbound holding features
+        nb = self._load_northbound(index)
+        if nb is not None:
+            frames.append(nb)
+
         if not frames:
             return None
 
@@ -269,6 +279,109 @@ class FeatureMerger:
             return self._align_stock_factors(df, index, factor_cols, prefix="holder")
         except Exception as e:
             logger.warning(f"Shareholder load failed: {e}")
+            return None
+
+    def _load_northbound(self, index: pd.MultiIndex) -> pd.DataFrame:
+        """Load northbound holding features from northbound_history.parquet.
+
+        Extracts per-stock aggregates when holding quantity data is available.
+        Returns None if only presence data (no vol/ratio columns).
+        """
+        path = self.data_dir / "northbound_history.parquet"
+        if not path.exists():
+            return None
+
+        try:
+            df = pd.read_parquet(path)
+            if df.empty or "qlib_code" not in df.columns:
+                return None
+
+            # Detect holding-amount column
+            hold_col = None
+            for c in ["vol", "持股数量"]:
+                if c in df.columns and df[c].notna().sum() > 1000:
+                    hold_col = c
+                    break
+            ratio_col = None
+            for c in ["ratio", "持股数量占A股百分比"]:
+                if c in df.columns and df[c].notna().sum() > 1000:
+                    ratio_col = c
+                    break
+
+            if hold_col is None and ratio_col is None:
+                # Only presence data — not useful as training feature
+                return None
+
+            # Ensure trade_date is string and sorted
+            if "trade_date" not in df.columns and "持股日期" in df.columns:
+                df["trade_date"] = pd.to_datetime(df["持股日期"], errors="coerce").dt.strftime("%Y%m%d")
+            df = df.dropna(subset=["trade_date"])
+            df["trade_date"] = df["trade_date"].astype(str)
+
+            # Compute per-stock aggregates from latest data
+            agg_frames = []
+            for code, grp in df.groupby("qlib_code"):
+                grp = grp.sort_values("trade_date")
+                row = {"qlib_code": code}
+
+                if hold_col:
+                    vals = pd.to_numeric(grp[hold_col], errors="coerce").dropna()
+                    if len(vals) >= 5:
+                        row["nb_hold_change_5d"] = float(vals.iloc[-1] - vals.iloc[-5])
+                        row["nb_hold_change_20d"] = float(
+                            vals.iloc[-1] - vals.iloc[-min(20, len(vals))])
+
+                if ratio_col:
+                    ratios = pd.to_numeric(grp[ratio_col], errors="coerce").dropna()
+                    if len(ratios) >= 1:
+                        row["nb_hold_ratio"] = float(ratios.iloc[-1])
+                    if len(ratios) >= 5:
+                        row["nb_ratio_change_5d"] = float(
+                            ratios.iloc[-1] - ratios.iloc[-5])
+
+                if len(row) > 1:  # has at least one feature besides qlib_code
+                    agg_frames.append(row)
+
+            if not agg_frames:
+                return None
+
+            agg = pd.DataFrame(agg_frames).set_index("qlib_code")
+            factor_cols = [c for c in agg.columns]
+            logger.info(f"Northbound features: {len(agg)} stocks, {len(factor_cols)} factors")
+            return self._align_stock_factors(agg, index, factor_cols, prefix="nb")
+        except Exception as e:
+            logger.warning(f"Northbound load failed: {e}")
+            return None
+
+    def _load_valuation(self, index: pd.MultiIndex) -> pd.DataFrame:
+        """Load PE/PB/PS valuation features from fundamental_valuation.parquet.
+
+        Uses latest available values per stock, aligned to Qlib MultiIndex.
+        """
+        path = self.data_dir / "fundamental_valuation.parquet"
+        if not path.exists():
+            return None
+
+        try:
+            df = pd.read_parquet(path)
+            if df.empty or "qlib_code" not in df.columns:
+                return None
+
+            factor_cols = [c for c in ["pe_ttm", "pb_mrq", "ps_ttm", "ep", "bp", "sp",
+                                        "pcf_ncf_ttm"]
+                          if c in df.columns]
+            if not factor_cols:
+                return None
+
+            # Use latest date per stock
+            df["date"] = df["date"].astype(str)
+            idx = df.groupby("qlib_code")["date"].idxmax()
+            latest = df.loc[idx, ["qlib_code"] + factor_cols].set_index("qlib_code")
+
+            logger.info(f"Valuation features: {len(latest)} stocks, {len(factor_cols)} factors")
+            return self._align_stock_factors(latest, index, factor_cols, prefix="val")
+        except Exception as e:
+            logger.warning(f"Valuation load failed: {e}")
             return None
 
     def _align_stock_factors(
