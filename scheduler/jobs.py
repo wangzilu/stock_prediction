@@ -30,6 +30,8 @@ from config.settings import (
     LGB_MODEL_PATH, RL_MODEL_PATH, MID_MODEL_PATH, PREDICTION_HORIZON_DAYS,
     LGB_MIN_PREDICTIONS, OVERNIGHT_STOCK_SNAPSHOT_PATH, DATA_DIR,
 )
+import numpy as np
+import pandas as pd
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -82,6 +84,7 @@ class DailyPipeline:
         # Cached data (computed once per run)
         self._geo_factors = None
         self._headlines = None
+        self._capital_flow_signals = None  # {qlib_code: {"net_mf": ..., "nb_days": ...}}
 
         # Pre-trained models (loaded lazily)
         self._lgb_predictions = None
@@ -197,6 +200,86 @@ class DailyPipeline:
         except Exception as e:
             return _use_cache(str(e))
         return self._lgb_predictions
+
+    def _load_capital_flow_signals(self) -> dict:
+        """Load latest capital flow signals from parquet files.
+
+        Returns dict: {qlib_code: {"net_mf": float, "net_mf_pct": float,
+                                    "net_mf_5d": float, "nb_present": bool}}
+        """
+        if self._capital_flow_signals is not None:
+            return self._capital_flow_signals
+
+        signals = {}
+
+        # --- Fund flow ---
+        flow_path = DATA_DIR / "fund_flow_history.parquet"
+        if flow_path.exists():
+            try:
+                df = pd.read_parquet(flow_path, columns=[
+                    "qlib_code", "trade_date", "net_mf_amount",
+                ])
+                df = df.dropna(subset=["net_mf_amount"])
+                df["trade_date"] = df["trade_date"].astype(str)
+                # Latest 5 trading days per stock
+                latest_dates = sorted(df["trade_date"].unique())[-5:]
+                recent = df[df["trade_date"].isin(latest_dates)]
+
+                for code, grp in recent.groupby("qlib_code"):
+                    latest_row = grp.loc[grp["trade_date"].idxmax()]
+                    net_mf = _finite_float(latest_row.get("net_mf_amount"))
+                    net_mf_5d = _finite_float(grp["net_mf_amount"].sum())
+                    signals[code] = {
+                        "net_mf": net_mf,         # latest day main force net (万元)
+                        "net_mf_5d": net_mf_5d,   # 5-day cumulative
+                    }
+                logger.info(f"Loaded capital flow signals for {len(signals)} stocks")
+            except Exception as e:
+                logger.warning(f"Failed to load fund flow signals: {e}")
+
+        # --- Northbound ---
+        nb_path = DATA_DIR / "northbound_history.parquet"
+        if nb_path.exists():
+            try:
+                nb = pd.read_parquet(nb_path, columns=["qlib_code", "trade_date"])
+                nb = nb.dropna(subset=["trade_date"])
+                nb["trade_date"] = nb["trade_date"].astype(str)
+                latest_nb_dates = sorted(nb["trade_date"].unique())[-5:]
+                recent_nb = nb[nb["trade_date"].isin(latest_nb_dates)]
+                nb_stocks = set(recent_nb["qlib_code"].unique())
+                for code in nb_stocks:
+                    if code not in signals:
+                        signals[code] = {}
+                    signals[code]["nb_present"] = True
+                    # Count how many of the latest 5 days this stock appeared
+                    stock_dates = recent_nb[recent_nb["qlib_code"] == code]["trade_date"].nunique()
+                    signals[code]["nb_days"] = stock_dates
+                logger.info(f"Loaded northbound signals for {len(nb_stocks)} stocks")
+            except Exception as e:
+                logger.warning(f"Failed to load northbound signals: {e}")
+
+        self._capital_flow_signals = signals
+        return signals
+
+    def _capital_flow_score(self, qlib_code: str) -> float:
+        """Compute a [-1, 1] capital flow factor for a single stock.
+
+        Positive = main force buying + northbound present.
+        """
+        signals = self._load_capital_flow_signals()
+        s = signals.get(qlib_code)
+        if not s:
+            return 0.0
+
+        # Main force: normalize net_mf_5d (万元) to [-1, 1]
+        # Typical range: -500,000 to +500,000 万元 for large caps
+        net_mf_5d = _finite_float(s.get("net_mf_5d"))
+        mf_score = max(-1.0, min(1.0, net_mf_5d / 200_000.0))
+
+        # Northbound bonus: +0.1 if present in recent 5 days
+        nb_bonus = 0.1 if s.get("nb_present") else 0.0
+
+        return round(max(-1.0, min(1.0, mf_score + nb_bonus)), 4)
 
     def _model_status_text(self):
         """Return a compact status block for pushed reports."""
@@ -435,9 +518,10 @@ class DailyPipeline:
                 max(-10.0, min(10.0, model_score * 100.0 / max(PREDICTION_HORIZON_DAYS, 1) * 0.80 + change_pct * 0.20)),
                 2,
             )
-            mid_score = model_score * 0.70 + (change_pct / 100.0) * 0.20 + liquidity_score * 0.10
-            long_score = model_score * 0.45 + liquidity_score * 0.35 + max(change_pct, 0.0) / 100.0 * 0.20
-            composite_score = model_score * 0.55 + mid_score * 0.25 + long_score * 0.20
+            flow_score = self._capital_flow_score(code)
+            mid_score = model_score * 0.65 + (change_pct / 100.0) * 0.15 + liquidity_score * 0.10 + flow_score * 0.10
+            long_score = model_score * 0.40 + liquidity_score * 0.30 + max(change_pct, 0.0) / 100.0 * 0.15 + flow_score * 0.15
+            composite_score = model_score * 0.50 + mid_score * 0.25 + long_score * 0.15 + flow_score * 0.10
             rows.append(
                 {
                     "code": code,
@@ -709,6 +793,7 @@ class DailyPipeline:
                 if short_score <= 0:
                     continue
 
+                flow_score = self._capital_flow_score(qlib_code)
                 candidate = {
                     "code": qlib_code,
                     "name": str(row.get("名称", code_num)),
@@ -719,6 +804,7 @@ class DailyPipeline:
                     "change_pct": change_pct,
                     "macro_score": _finite_float(stock_macro),
                     "price": price,
+                    "flow_score": flow_score,
                 }
                 candidate["next_day_change_pct"] = self._estimate_next_day_change_pct(candidate)
                 candidates.append(candidate)
@@ -1687,6 +1773,7 @@ class DailyPipeline:
         self._rl_agent = None
         self._geo_factors = None
         self._headlines = None
+        self._capital_flow_signals = None
         self.run_daily_recommendation(use_overnight_snapshot=True)
 
     def run_spot_cache_warmup(self):
@@ -1799,6 +1886,7 @@ class DailyPipeline:
 
         self._geo_factors = None
         self._lgb_predictions = None  # refresh in case model was retrained
+        self._capital_flow_signals = None  # refresh with latest data
         geo = self._fetch_geo_factors()
         lgb_preds = self._load_lgb_predictions()
 

@@ -121,7 +121,23 @@ class FeatureMerger:
             return None
 
     def _load_capital_flow(self, index: pd.MultiIndex) -> pd.DataFrame:
-        """Load capital flow features."""
+        """Load capital flow features from fund_flow_history or legacy parquet.
+
+        Supports both:
+        - fund_flow_history.parquet (ST_CLIENT format: net_mf_amount, buy_*/sell_*)
+        - capital_flow_features.parquet (legacy AKShare format: main_net_inflow, etc.)
+        """
+        # Try new fund_flow_history first (daily time-series, richer data)
+        hist_path = self.data_dir / "fund_flow_history.parquet"
+        if hist_path.exists():
+            try:
+                df = pd.read_parquet(hist_path)
+                if not df.empty and "qlib_code" in df.columns:
+                    return self._load_capital_flow_from_history(df, index)
+            except Exception as e:
+                logger.warning(f"fund_flow_history load failed, trying legacy: {e}")
+
+        # Fallback to legacy capital_flow_features.parquet
         path = self.data_dir / "capital_flow_features.parquet"
         if not path.exists():
             return None
@@ -144,6 +160,63 @@ class FeatureMerger:
         except Exception as e:
             logger.warning(f"Capital flow load failed: {e}")
             return None
+
+    def _load_capital_flow_from_history(self, df: pd.DataFrame, index: pd.MultiIndex) -> pd.DataFrame:
+        """Load daily capital flow features from fund_flow_history.parquet.
+
+        Computes per-stock rolling aggregates aligned to the Qlib training index.
+        """
+        # Normalize columns — handle both ST and AK formats
+        if "net_mf_amount" not in df.columns and "主力净流入-净额" in df.columns:
+            df["net_mf_amount"] = pd.to_numeric(df["主力净流入-净额"], errors="coerce")
+
+        if "trade_date" not in df.columns and "日期" in df.columns:
+            df["trade_date"] = pd.to_datetime(df["日期"], errors="coerce").dt.strftime("%Y%m%d")
+
+        needed = ["qlib_code", "trade_date", "net_mf_amount"]
+        if not all(c in df.columns for c in needed):
+            return None
+
+        df = df[needed].dropna()
+        df["trade_date"] = df["trade_date"].astype(str)
+
+        # Compute per-stock aggregates: latest, 5d sum, 20d mean
+        agg_frames = []
+        for code, grp in df.groupby("qlib_code"):
+            grp = grp.sort_values("trade_date")
+            latest = grp.iloc[-1]["net_mf_amount"]
+            sum_5d = grp.tail(5)["net_mf_amount"].sum()
+            mean_20d = grp.tail(20)["net_mf_amount"].mean()
+            agg_frames.append({
+                "qlib_code": code,
+                "flow_net_mf_latest": latest,
+                "flow_net_mf_5d": sum_5d,
+                "flow_net_mf_20d_avg": mean_20d,
+            })
+
+        if not agg_frames:
+            return None
+
+        agg = pd.DataFrame(agg_frames).set_index("qlib_code")
+        factor_cols = ["flow_net_mf_latest", "flow_net_mf_5d", "flow_net_mf_20d_avg"]
+
+        # Align to Qlib MultiIndex (broadcast same values across all dates per stock)
+        inst_level = 1 if index.nlevels > 1 else 0
+        instruments = index.get_level_values(inst_level)
+
+        result_data = {}
+        for col in factor_cols:
+            values = []
+            for inst in instruments:
+                inst_str = str(inst).upper()
+                if inst_str in agg.index:
+                    values.append(agg.loc[inst_str, col])
+                else:
+                    values.append(np.nan)
+            result_data[col] = values
+
+        logger.info(f"Capital flow features: {len(agg)} stocks, {len(factor_cols)} factors")
+        return pd.DataFrame(result_data, index=index)
 
     def _load_macro(self, index: pd.MultiIndex) -> pd.DataFrame:
         """Load macro features and broadcast to all stocks."""

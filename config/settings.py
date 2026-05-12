@@ -31,6 +31,9 @@ PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "")
 # LLM API (MiniMax)
 MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
 
+# StockToday API (Tushare-compatible)
+ST_TOKEN = os.environ.get("ST_TOKEN", "Np7IlxHtqsLEjyDEYD2xcaoaoiv7qS93")
+
 RECOMMENDATION_TIME = "14:00"
 MARKET_CLOSE_TIME = "15:00"
 DATA_CUTOFF_TIME = "13:00"
