@@ -1,7 +1,8 @@
-"""Persist lightweight status for scheduled jobs."""
+"""Persist lightweight status for scheduled jobs and push alerts on failure."""
 from __future__ import annotations
 
 import json
+import logging
 import time
 import traceback
 from datetime import datetime
@@ -10,6 +11,8 @@ from typing import Any, Callable
 
 from config.settings import DATA_DIR
 
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_STATUS_PATH = DATA_DIR / "job_status.json"
 
@@ -77,14 +80,17 @@ def run_with_status(
     try:
         result = func()
     except Exception as exc:
+        duration = round(time.time() - started, 2)
+        error_msg = f"{type(exc).__name__}: {exc}"
         store.update_job(
             job_id,
             status="failed",
             finished_at=_now(),
-            duration_seconds=round(time.time() - started, 2),
-            error=f"{type(exc).__name__}: {exc}",
+            duration_seconds=duration,
+            error=error_msg,
             traceback=traceback.format_exc(limit=20),
         )
+        _push_failure_alert(job_id, error_msg, duration, started_at)
         raise
 
     store.update_job(
@@ -96,3 +102,46 @@ def run_with_status(
         traceback="",
     )
     return result
+
+
+# ---------- failure alert ----------
+
+_JOB_DISPLAY_NAMES = {
+    "morning_recommendation": "晨推",
+    "sell_check": "盘中决策",
+    "daily_summary": "收盘总结",
+    "evening_outlook": "晚间展望",
+    "risk_check": "风控检查",
+    "spot_cache_warmup": "行情缓存",
+    "qlib_data_update": "Qlib数据更新",
+    "fund_flow_update": "资金流向抓取",
+    "lgb_after_close_train": "模型训练",
+    "lgb_after_close_smoke": "模型冒烟测试",
+    "nightly_train": "夜间训练",
+}
+
+
+def _push_failure_alert(job_id: str, error: str, duration: float, started_at: str):
+    """Push a WeChat alert when a scheduled job fails."""
+    try:
+        from push.wechat import WeChatPusher
+        pusher = WeChatPusher()
+    except Exception:
+        logger.warning("Cannot send failure alert: WeChatPusher init failed")
+        return
+
+    display = _JOB_DISPLAY_NAMES.get(job_id, job_id)
+    # Truncate error to avoid overly long push
+    short_error = error[:200] + "..." if len(error) > 200 else error
+    msg = (
+        f"任务【{display}】执行失败\n"
+        f"Job ID: {job_id}\n"
+        f"开始时间: {started_at}\n"
+        f"耗时: {duration:.0f}s\n"
+        f"错误: {short_error}"
+    )
+    try:
+        pusher.send(msg, title=f"🚨 任务异常: {display}")
+        logger.info(f"Failure alert pushed for job {job_id}")
+    except Exception as e:
+        logger.warning(f"Failed to push failure alert for {job_id}: {e}")
