@@ -57,11 +57,12 @@ def winsorize_zscore(df: pd.DataFrame) -> pd.DataFrame:
         # Winsorize at 1st/99th percentile per day
         p01 = grouped.transform(lambda x: x.quantile(0.01))
         p99 = grouped.transform(lambda x: x.quantile(0.99))
-        result[col] = result[col].clip(lower=p01, upper=p99)
+        clipped = result[col].clip(lower=p01, upper=p99)
         # Z-score per day
+        grouped = clipped.groupby(level=0)
         mean = grouped.transform("mean")
         std = grouped.transform("std")
-        result[col] = (result[col] - mean) / (std + 1e-8)
+        result[col] = (clipped - mean) / (std + 1e-8)
         result[col] = result[col].clip(-3, 3)
     return result
 
@@ -72,13 +73,15 @@ def rank_transform(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def shuffle_columns(df: pd.DataFrame, seed: int = SEED) -> pd.DataFrame:
-    """Shuffle each column independently (breaks true signal, keeps distribution)."""
+    """Shuffle each column within each date (breaks signal, keeps daily distribution)."""
     rng = np.random.RandomState(seed + 999)
     result = df.copy()
-    for col in result.columns:
-        vals = result[col].values.copy()
-        rng.shuffle(vals)
-        result[col] = vals
+    for _, group in result.groupby(level=0, sort=False):
+        idx = group.index
+        for col in result.columns:
+            vals = group[col].to_numpy(copy=True)
+            rng.shuffle(vals)
+            result.loc[idx, col] = vals
     return result
 
 
@@ -203,6 +206,7 @@ def main():
                            end_time=str(max(dates))[:10])
         custom.columns = CUSTOM_NAMES
         custom = custom.swaplevel().sort_index().reindex(X.index)
+        custom = custom.replace([np.inf, -np.inf], np.nan)
 
         segments[seg] = {"X_base": X, "y": y, "custom": custom, "index": X.index}
         logger.info(f"  {seg}: base={X.shape}, custom NaN={custom.isna().mean().mean():.2%}")
@@ -224,7 +228,7 @@ def main():
     groups.append(("base+custom_rank", lambda s: np.hstack([
         s["X_base"].values, rank_transform(s["custom"]).values])))
 
-    # Group 5: NEGATIVE CONTROL - base + shuffled custom
+    # Group 5: NEGATIVE CONTROL - base + shuffled custom within each date
     groups.append(("base+shuffled(NEG)", lambda s: np.hstack([
         s["X_base"].values, shuffle_columns(winsorize_zscore(s["custom"])).values])))
 

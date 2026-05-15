@@ -1,7 +1,7 @@
 """After-close serial pipeline: data update → health → train → smoke → evaluate.
 
 Replaces the 3 independent cron jobs (17:00/17:35/17:55) with one serial pipeline.
-Any step failure stops the chain — no training on stale/broken data.
+Data update failure is non-blocking if yesterday's data passes health check.
 
 Usage:
     python scripts/after_close_pipeline.py
@@ -40,7 +40,6 @@ def run_step(name, script, *args, timeout=3600):
         )
         duration = time.monotonic() - start
         if result.returncode == 0:
-            # Print last 5 lines of output
             for line in result.stdout.strip().split("\n")[-5:]:
                 logger.info(f"  {line}")
             logger.info(f"  {name} OK ({duration:.0f}s)")
@@ -58,15 +57,28 @@ def run_step(name, script, *args, timeout=3600):
         return False
 
 
+def _push_alert(title, content):
+    """Best-effort WeChat alert on pipeline failure."""
+    try:
+        sys.path.insert(0, PROJECT_ROOT)
+        from push.wechat import WeChatPusher
+        pusher = WeChatPusher()
+        pusher.send(content, title=title)
+        logger.info(f"  Alert pushed: {title}")
+    except Exception as e:
+        logger.warning(f"  Alert push failed: {e}")
+
+
 def main():
     skip_update = "--skip-update" in sys.argv
 
     logger.info(f"After-close pipeline started at {datetime.now()}")
     logger.info(f"Python: {PY}")
 
-    # Step 1: Data update (incremental)
+    # Step 1: Data update (incremental) — failure is non-blocking
+    data_updated = True
     if not skip_update:
-        if not run_step(
+        data_updated = run_step(
             "Qlib Data Update",
             "update_qlib_data.py",
             "--provider", os.environ.get("QLIB_DATA_PROVIDER", "auto"),
@@ -75,51 +87,63 @@ def main():
             "--refresh-universe",
             "--min-health-instruments", os.environ.get("LGB_MIN_DATA_INSTRUMENTS", "4500"),
             "--min-lgb-data-instruments", os.environ.get("LGB_MIN_DATA_INSTRUMENTS", "4500"),
-            timeout=7200,  # 2 hours max for data update
-        ):
-            logger.error("PIPELINE STOPPED: data update failed")
-            return 1
+            timeout=7200,
+        )
+        if not data_updated:
+            logger.warning("⚠ Data update failed — checking if existing data is still usable")
     else:
         logger.info("Skipping data update (--skip-update)")
 
-    # Step 2: Health check
-    if not run_step(
+    # Step 2: Health check — decides whether to continue
+    health_ok = run_step(
         "Qlib Data Health",
         "check_qlib_data_health.py",
         "--universe", os.environ.get("LGB_INFERENCE_UNIVERSE", "all"),
         "--min-instruments", os.environ.get("LGB_MIN_DATA_INSTRUMENTS", "4500"),
         timeout=300,
-    ):
-        logger.error("PIPELINE STOPPED: data health check failed")
+    )
+
+    if not health_ok:
+        msg = "数据更新失败" if not data_updated else "数据更新成功但健康检查失败"
+        logger.error(f"PIPELINE STOPPED: {msg}，现有数据不可用")
+        _push_alert("盘后Pipeline失败", f"{msg}，训练跳过。请手动检查数据。")
         return 1
+
+    if not data_updated and not skip_update:
+        logger.warning("✓ Existing data passed health check — continuing with yesterday's data")
+        _push_alert("盘后数据更新失败",
+                     "数据更新失败但现有数据健康检查通过，使用昨日数据继续训练。")
 
     # Step 3: Train LGB
     if not run_step("LGB Training", "train_lgb.py", timeout=1800):
         logger.error("PIPELINE STOPPED: LGB training failed")
+        _push_alert("盘后Pipeline失败", "LGB训练失败")
         return 1
 
     # Step 4: Smoke prediction
     if not run_step("LGB Smoke", "smoke_lgb_predict.py", timeout=600):
         logger.error("PIPELINE STOPPED: LGB smoke prediction failed")
+        _push_alert("盘后Pipeline失败", "LGB Smoke预测失败")
         return 1
 
-    # Step 5: Evaluate quality
+    # Step 5: Evaluate quality (non-blocking)
     if not run_step("LGB Evaluate", "evaluate_lgb_test.py", timeout=600):
-        logger.warning("Evaluation failed but not blocking pipeline (model already saved)")
+        logger.warning("Evaluation failed (non-blocking, model already saved)")
 
-    # Step 6: Brinson attribution
+    # Step 6: Brinson attribution (non-blocking)
     if not run_step("Brinson Attribution", "attribution.py", timeout=300):
         logger.warning("Attribution failed (non-blocking)")
 
-    # Step 7: Factor decay monitoring
+    # Step 7: Factor decay monitoring (non-blocking)
     if not run_step("Factor Decay Monitor", "monitor_factor_decay.py", timeout=60):
-        logger.warning("Factor decay check returned degraded — consider model rollback")
+        logger.warning("Factor decay check failed (non-blocking)")
 
-    # Step 8: Model promotion gate (auto promote/rollback)
+    # Step 8: Model promotion gate (non-blocking)
     if not run_step("Model Promotion Check", "promote_model.py", "--check", timeout=60):
-        logger.warning("Model promotion check failed or triggered rollback")
+        logger.warning("Model promotion check failed (non-blocking)")
 
-    logger.info(f"After-close pipeline completed at {datetime.now()}")
+    status = "completed" if data_updated else "completed (with stale data warning)"
+    logger.info(f"After-close pipeline {status} at {datetime.now()}")
     return 0
 
 

@@ -137,7 +137,32 @@ def main():
                 print(f"  ⚠️  {w}")
         print(f"  建议: {result['recommendation']}")
 
+    # Push WeChat alert on warning/degraded
+    if result["status"] in ("warning", "degraded"):
+        _push_decay_alert(result)
+
     sys.exit(0 if result["status"] != "degraded" else 1)
+
+
+def _push_decay_alert(result: dict):
+    """Push WeChat alert when factor health degrades."""
+    try:
+        from push.wechat import WeChatPusher
+        pusher = WeChatPusher()
+        warnings_text = "\n".join(f"- {w}" for w in result.get("warnings", []))
+        msg = (
+            f"因子健康: {result['status'].upper()}\n"
+            f"IC: {result['latest_ic']:.4f}  "
+            f"RankIC: {result['latest_rank_ic']:.4f}\n"
+            f"IC 趋势: {result['ic_trend_5d']}\n"
+            f"{warnings_text}\n"
+            f"建议: {result['recommendation']}"
+        )
+        title = "⚠️ 模型信号衰退" if result["status"] == "degraded" else "⚡ 模型信号减弱"
+        pusher.send(msg, title=title)
+        logger.info("Decay alert pushed to WeChat")
+    except Exception as e:
+        logger.warning(f"Failed to push decay alert: {e}")
 
 
 if __name__ == "__main__":

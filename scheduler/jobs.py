@@ -627,7 +627,7 @@ class DailyPipeline:
 
                 lines.append(
                     f"  {i}. {name}{display_code} {price}｜{metric}｜"
-                    f"模型{item['lgb_score']:+.4f}｜涨跌{item['change_pct']:+.2f}%"
+                    f"模型{item['lgb_score']:+.4f}｜今日涨跌{item['change_pct']:+.2f}%"
                 )
         return "\n".join(lines)
 

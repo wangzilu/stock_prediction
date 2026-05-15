@@ -44,8 +44,9 @@ class StockToday:
             tried.add(url)
 
             headers = {}
+            no_proxy = {"http": None, "https": None}
             try:
-                resp = requests.post(f"{url}{endpoint}", data=params, headers=headers, timeout=10)
+                resp = requests.post(f"{url}{endpoint}", data=params, headers=headers, timeout=10, proxies=no_proxy)
                 if resp.status_code == 200 and resp.text.strip():
                     return resp.json()
                 # 非200或空响应，切换服务器重试

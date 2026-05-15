@@ -79,6 +79,8 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         ),
         CronJob("lgb_after_close_train", "35 17 * * 1-5", [py, str(scripts / "train_lgb.py")], "lgb_after_close_train.log"),
         CronJob("lgb_after_close_smoke", "55 17 * * 1-5", [py, str(scripts / "smoke_lgb_predict.py")], "lgb_after_close_smoke.log"),
+        CronJob("factor_decay_monitor", "0 18 * * 1-5", [py, str(scripts / "monitor_factor_decay.py")], "factor_decay.log"),
+        CronJob("brinson_attribution", "5 18 * * 1-5", [py, str(scripts / "run_brinson_attribution.py")], "brinson_attribution.log"),
         CronJob("nightly_train", "0 4 * * *", [py, str(scripts / "nightly_train.py")], "train.log"),
     ]
 
@@ -147,6 +149,9 @@ def is_legacy_project_line(line: str, project_root: Path = PROJECT_ROOT) -> bool
         "scripts/update_qlib_data.py",
         "scripts/fetch_fund_flow_history.py",
         "scripts/fetch_fundamental_valuation.py",
+        "scripts/fetch_fundamental_quality.py",
+        "scripts/monitor_factor_decay.py",
+        "scripts/run_brinson_attribution.py",
         "scripts/nightly_train.py",
         "scripts/train_lgb.py",
         "scripts/smoke_lgb_predict.py",

@@ -1,20 +1,26 @@
 """Fetch fund flow + northbound history for all A-shares via StockToday API.
 
-Data source: ST_CLIENT (Tushare-compatible, multi-server load balancing).
-Fallback: akshare (eastmoney) if ST_CLIENT fails.
+Default: batch-by-date mode (按日期批量拉全市场, ~120 requests for 60 days).
+Fallback: per-stock mode (逐只拉取, 5000+ requests) or akshare.
 
 Saves to:
   data/storage/fund_flow_history.parquet
   data/storage/northbound_history.parquet
 
 Usage:
-    python scripts/fetch_fund_flow_history.py                # all A-shares
-    python scripts/fetch_fund_flow_history.py --top 500      # top 500 by market cap
+    # Batch mode (default, fast, ~120 requests for 60 days)
+    python scripts/fetch_fund_flow_history.py                # 60 trading days
+    python scripts/fetch_fund_flow_history.py --days 120     # 120 trading days
     python scripts/fetch_fund_flow_history.py --flow-only    # skip northbound
     python scripts/fetch_fund_flow_history.py --nb-only      # skip fund flow
-    python scripts/fetch_fund_flow_history.py --incremental  # skip already-fetched stocks
-    python scripts/fetch_fund_flow_history.py --workers 3    # parallel workers (default 1)
-    python scripts/fetch_fund_flow_history.py --source ak    # force akshare source
+
+    # Per-stock mode (old, slow, 5000+ requests)
+    python scripts/fetch_fund_flow_history.py --per-stock
+    python scripts/fetch_fund_flow_history.py --per-stock --top 500 --workers 3
+    python scripts/fetch_fund_flow_history.py --per-stock --incremental
+
+    # AKShare fallback (no ST_CLIENT needed)
+    python scripts/fetch_fund_flow_history.py --source ak --per-stock
 """
 import argparse
 import logging
@@ -429,6 +435,113 @@ def _fetch_one_nb_st(code: str, throttle: AdaptiveThrottle):
     return _to_standard_flow_columns(df, code)
 
 
+# ========== Batch-by-date mode (ST_CLIENT, ~100x fewer requests) ==========
+
+def _get_trade_dates(st, days: int = 60) -> list:
+    """Get recent N trading dates from trade_cal."""
+    from datetime import datetime, timedelta
+    end = datetime.now().strftime("%Y%m%d")
+    start = (datetime.now() - timedelta(days=int(days * 1.6))).strftime("%Y%m%d")
+    try:
+        resp = st.trade_cal(exchange="SSE", start_date=start, end_date=end, is_open="1")
+        df = _parse_st_result(resp)
+        if df is not None and not df.empty and "cal_date" in df.columns:
+            dates = sorted(df["cal_date"].astype(str).tolist())
+            return dates[-days:]
+    except Exception as e:
+        logger.warning(f"trade_cal failed: {e}")
+    # Fallback: weekdays
+    import pandas as _pd
+    dates = _pd.bdate_range(start, end)
+    return [d.strftime("%Y%m%d") for d in dates][-days:]
+
+
+def _ts_to_qlib(ts_code: str) -> str:
+    """600519.SH -> SH600519"""
+    if not isinstance(ts_code, str) or "." not in ts_code:
+        return str(ts_code)
+    num, ex = ts_code.split(".", 1)
+    return f"{ex}{num}"
+
+
+def fetch_fund_flow_batch(days: int = 60) -> pd.DataFrame:
+    """Fetch fund flow by trade_date (全市场一次请求).
+
+    60 days = 60 requests instead of 5413.
+    """
+    st = get_st_client()
+    trade_dates = _get_trade_dates(st, days)
+    logger.info(f"Batch mode: {len(trade_dates)} trading days")
+
+    all_dfs = []
+    for i, td in enumerate(trade_dates):
+        try:
+            resp = st.moneyflow(trade_date=td)
+            df = _parse_st_result(resp)
+            if df is not None and not df.empty:
+                df["trade_date"] = td
+                if "ts_code" in df.columns:
+                    df["qlib_code"] = df["ts_code"].apply(_ts_to_qlib)
+                    df["code"] = df["ts_code"].str.split(".").str[0]
+                all_dfs.append(df)
+                logger.info(f"  flow {td}: {len(df)} stocks")
+            else:
+                logger.warning(f"  flow {td}: empty")
+        except Exception as e:
+            logger.warning(f"  flow {td} failed: {e}")
+
+        if (i + 1) % 20 == 0:
+            time.sleep(0.3)
+
+    if not all_dfs:
+        return pd.DataFrame()
+
+    result = pd.concat(all_dfs, ignore_index=True)
+    logger.info(f"Fund flow batch: {len(result)} rows, "
+                f"{result['qlib_code'].nunique()} stocks, {len(trade_dates)} days")
+    return result
+
+
+def fetch_northbound_batch(days: int = 60) -> pd.DataFrame:
+    """Fetch northbound flow by trade_date (全市场一次请求).
+
+    Uses moneyflow_hsgt(trade_date=) for daily north/southbound totals,
+    and hk_hold for per-stock holdings.
+    """
+    st = get_st_client()
+    trade_dates = _get_trade_dates(st, days)
+    logger.info(f"Batch northbound: {len(trade_dates)} trading days")
+
+    all_dfs = []
+    for i, td in enumerate(trade_dates):
+        try:
+            # moneyflow_hsgt gives per-stock northbound flow
+            resp = st.moneyflow_hsgt(trade_date=td)
+            df = _parse_st_result(resp)
+            if df is not None and not df.empty:
+                df["trade_date"] = td
+                if "ts_code" in df.columns:
+                    df["qlib_code"] = df["ts_code"].apply(_ts_to_qlib)
+                    df["code"] = df["ts_code"].str.split(".").str[0]
+                all_dfs.append(df)
+                logger.info(f"  nb {td}: {len(df)} stocks")
+            else:
+                logger.warning(f"  nb {td}: empty")
+        except Exception as e:
+            logger.warning(f"  nb {td} failed: {e}")
+
+        if (i + 1) % 20 == 0:
+            time.sleep(0.3)
+
+    if not all_dfs:
+        return pd.DataFrame()
+
+    result = pd.concat(all_dfs, ignore_index=True)
+    logger.info(f"Northbound batch: {len(result)} rows, "
+                f"{result['qlib_code'].nunique()} stocks, {len(trade_dates)} days")
+    return result
+
+
 # ========== AKShare data sources (fallback) ==========
 
 def _fetch_one_flow_ak(code: str, throttle: AdaptiveThrottle):
@@ -524,6 +637,22 @@ def fetch_northbound(codes: list, workers: int = 1,
 
 # ---------- main ----------
 
+def _save_with_merge(new_df: pd.DataFrame, path: Path, dedup_cols: list, label: str):
+    """Save new data, merging with existing parquet if present."""
+    if new_df.empty:
+        return
+    if path.exists():
+        old_df = pd.read_parquet(path)
+        new_df = pd.concat([old_df, new_df], ignore_index=True)
+        if all(c in new_df.columns for c in dedup_cols):
+            new_df.drop_duplicates(subset=dedup_cols, keep="last", inplace=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new_df.to_parquet(path, index=False)
+    logger.info(f"Saved {label} to {path} ({len(new_df)} rows)")
+    if "trade_date" in new_df.columns:
+        logger.info(f"  Date range: {new_df['trade_date'].min()} ~ {new_df['trade_date'].max()}")
+
+
 def main():
     signal.signal(signal.SIGINT, _handle_shutdown)
     signal.signal(signal.SIGTERM, _handle_shutdown)
@@ -538,39 +667,47 @@ def main():
                         help="Parallel workers (default: 1)")
     parser.add_argument("--source", choices=["st", "ak"], default="st",
                         help="Data source: st=StockToday (default), ak=akshare")
+    parser.add_argument("--per-stock", action="store_true",
+                        help="Use old per-stock mode (slow, 5000+ requests). "
+                             "Default is batch-by-date (fast, ~120 requests)")
+    parser.add_argument("--days", type=int, default=60,
+                        help="Number of trading days for batch mode (default: 60)")
     args = parser.parse_args()
 
+    # ===== Batch-by-date mode (default, ~100x fewer requests) =====
+    if args.source == "st" and not args.per_stock:
+        logger.info(f"=== Batch mode: {args.days} trading days, ~{args.days * 2} requests ===")
+
+        if not args.nb_only:
+            flow_df = fetch_fund_flow_batch(days=args.days)
+            _save_with_merge(flow_df, FLOW_PATH,
+                             dedup_cols=["qlib_code", "trade_date"], label="fund flow")
+
+        if not args.flow_only:
+            nb_df = fetch_northbound_batch(days=args.days)
+            _save_with_merge(nb_df, NB_PATH,
+                             dedup_cols=["qlib_code", "trade_date"], label="northbound")
+
+        logger.info("Done!")
+        return
+
+    # ===== Per-stock mode (old, slow) =====
+    logger.info("=== Per-stock mode (slow) ===")
     codes = get_all_stock_codes(top_n=args.top)
 
     if not args.nb_only:
         existing = load_existing_codes(FLOW_PATH) if args.incremental else set()
         flow_df = fetch_fund_flow(codes, workers=args.workers,
                                   existing_codes=existing, source=args.source)
-        if not flow_df.empty:
-            if FLOW_PATH.exists():
-                old_df = pd.read_parquet(FLOW_PATH)
-                flow_df = pd.concat([old_df, flow_df], ignore_index=True)
-                flow_df.drop_duplicates(subset=["qlib_code", "trade_date"], keep="last", inplace=True)
-            FLOW_PATH.parent.mkdir(parents=True, exist_ok=True)
-            flow_df.to_parquet(FLOW_PATH, index=False)
-            logger.info(f"Saved fund flow to {FLOW_PATH}")
-            date_col = "trade_date" if "trade_date" in flow_df.columns else "日期"
-            logger.info(f"  Date range: {flow_df[date_col].min()} ~ {flow_df[date_col].max()}")
+        _save_with_merge(flow_df, FLOW_PATH,
+                         dedup_cols=["qlib_code", "trade_date"], label="fund flow")
 
     if not args.flow_only:
         existing = load_existing_codes(NB_PATH) if args.incremental else set()
         nb_df = fetch_northbound(codes, workers=args.workers,
                                  existing_codes=existing, source=args.source)
-        if not nb_df.empty:
-            if NB_PATH.exists():
-                old_df = pd.read_parquet(NB_PATH)
-                nb_df = pd.concat([old_df, nb_df], ignore_index=True)
-                nb_df.drop_duplicates(subset=["qlib_code", "trade_date"], keep="last", inplace=True)
-            NB_PATH.parent.mkdir(parents=True, exist_ok=True)
-            nb_df.to_parquet(NB_PATH, index=False)
-            logger.info(f"Saved northbound to {NB_PATH}")
-            date_col = "trade_date" if "trade_date" in nb_df.columns else "持股日期"
-            logger.info(f"  Date range: {nb_df[date_col].min()} ~ {nb_df[date_col].max()}")
+        _save_with_merge(nb_df, NB_PATH,
+                         dedup_cols=["qlib_code", "trade_date"], label="northbound")
 
     logger.info("Done!")
 

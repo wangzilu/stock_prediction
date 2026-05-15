@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 DATA_DIR = PROJECT_ROOT / "data" / "storage"
 QLIB_DATA = str(DATA_DIR / "qlib_data" / "cn_data")
 FACTOR_IC_PATH = DATA_DIR / "factor_ic_test.json"
+MIN_STRONG_COVERAGE = 0.8
 
 LABEL_EXPR = f"Ref($close, -{PREDICTION_HORIZON_DAYS}) / Ref($close, -1) - 1"
 
@@ -135,7 +136,13 @@ def test_all_factors(test_days: int = 60, universe: str = "all") -> list:
 
             # Joint verdict: must satisfy ALL conditions for STRONG
             # (cx-corrected: not just Pearson IC, but RankIC + TopK spread + coverage)
-            if ric_mean > 0.01 and spread > 0 and ic_mean > 0 and ric_pos > 0.5:
+            if (
+                ric_mean > 0.01
+                and spread > 0
+                and ic_mean > 0
+                and ric_pos > 0.5
+                and coverage >= MIN_STRONG_COVERAGE
+            ):
                 verdict = "STRONG"
             elif (ric_mean > 0 or spread > 0) and ic_mean > 0:
                 verdict = "OK"
@@ -204,7 +211,10 @@ def main():
                 f"{r.get('coverage', 0):>5.0%} {r['verdict']:>10}"
             )
         print(f"{'='*85}")
-        print(f"STRONG = RankIC>0.01 AND Spread>0 AND IC>0 AND RankIC_pos>50%")
+        print(
+            "STRONG = RankIC>0.01 AND Spread>0 AND IC>0 "
+            f"AND RankIC_pos>50% AND Cov>={MIN_STRONG_COVERAGE:.0%}"
+        )
 
         strong = [r for r in results if r["verdict"] == "STRONG"]
         ok = [r for r in results if r["verdict"] == "OK"]
