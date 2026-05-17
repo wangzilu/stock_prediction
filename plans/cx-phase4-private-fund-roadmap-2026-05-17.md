@@ -104,7 +104,7 @@ Phase 4 完成时，项目应新增或稳定输出以下 9 类产物：
 
 1. 固定成交假设：
    - `T 日收盘后生成信号`
-   - `T+1 日开盘` 或 `VWAP` 模拟成交
+   - 当前实现先用 `T+1 close-to-close` 作为保守代理；后续再补 `T+1 日开盘` 或 `VWAP`
 2. 从“直接吃 label 收益”升级到“持仓-调仓-成交-收益”
 3. 加真实限制：
    - `T+1`
@@ -242,7 +242,7 @@ Phase 4 完成时，项目应新增或稳定输出以下 9 类产物：
 - 自动回退到 champion
 - 候选模型降级为 `shadow` 或 `research_only`
 
-### Phase 4E：Alpha360 / Feature Set V2 对照
+### Phase 4E：Alpha360 / Feature Set V2 对照（表格模型）
 
 目标：把 `Alpha360` 放进统一评估体系，判断它是主线增量、辅助信号，还是冗余噪声。
 
@@ -250,7 +250,7 @@ Phase 4 完成时，项目应新增或稳定输出以下 9 类产物：
 
 1. `Alpha360` 不是新数据源，而是另一种价量路径表示。
 2. 它会影响模型、特征和内存开销，必须在 Track A-D 的 rolling、回测、治理口径固定后再做。
-3. 它不应该阻塞 paper trading，但如果要进入 shadow，必须通过同一套 promotion gate。
+3. 本阶段只做 **表格模型对照** 和 **rank fusion**；`ALSTM/Transformer + Alpha360` 归到 Phase 5+。
 
 要改的模块：
 
@@ -282,10 +282,9 @@ Phase 4 完成时，项目应新增或稳定输出以下 9 类产物：
 1. 新增统一 feature-set loader，不在各脚本里散落写 `Alpha158/Alpha360`。
 2. 先跑 `FS-360` 独立模型，判断 Alpha360 本身是否有 OOS 排序能力。
 3. 再跑 `FS-534/FS-535`，判断拼接是否真的优于子集。
-4. 对 Alpha360 做两类模型：
-   - 表格模型：`LGB/XGB/CatBoost`
-   - 序列模型：`ALSTM/Transformer`
+4. 对 Alpha360 做表格模型：`LGB/XGB/CatBoost`
 5. 优先做 late/rank fusion，不直接把 raw score 平均。
+6. `ALSTM/Transformer` 仅作为 Phase 5+ 的深度模型研究项，不在 Phase 4 里启动。
 
 输出物：
 
@@ -299,7 +298,7 @@ Phase 4 完成时，项目应新增或稳定输出以下 9 类产物：
 - `FS-360` 相对 `FS-174` 的 rolling RankIC 或成本后组合收益有稳定增量，才允许进入主线候选。
 - `FS-534` 必须优于 `max(FS-174, FS-360)`，否则说明拼接冗余，不保留全量拼接。
 - `FS-535` 必须优于 `max(FS-175, FS-360, FS-534)`，否则 holder + Alpha360 不升级。
-- Alpha360 深度模型必须在 `24+ split` 和成本后回测里稳定，不允许凭单次 IC 上线。
+- Alpha360 表格模型必须在 `24+ split` 和成本后回测里稳定，不允许凭单次 IC 上线。
 
 失败动作：
 
@@ -307,6 +306,7 @@ Phase 4 完成时，项目应新增或稳定输出以下 9 类产物：
 - 如果 `FS-534 <= max(FS-174, FS-360)`：不强行拼接，改做 rank ensemble 或冻结。
 - 如果 `FS-534/535` 训练集好、rolling 差：降维、筛列、增加正则，不进入 shadow。
 - 如果 Alpha360 单模型不强但 rank fusion 稳定提升：只作为辅助模型，单模型权重上限 `<= 30%`。
+- 深度模型（ALSTM/Transformer）不在本阶段排程，留到 Phase 5+。
 
 ### Phase 4F：paper trading 雏形
 
@@ -448,12 +448,12 @@ Phase 4 期间只允许一条模型增强实验进入旁路：
 
 - feature set loader
 - `FS-174 / FS-175 / FS-360 / FS-534 / FS-535` 对照
-- Alpha360 表格模型和序列模型基线
+- Alpha360 表格模型基线
 - rank fusion 报告
 
 验收：
 
-- 能回答“Alpha360 是独立有效、拼接有效、只适合深度模型，还是冗余”
+- 能回答“Alpha360 是独立有效、拼接有效、应留给 Phase 5+ 深度模型，还是冗余”
 - 任何 Alpha360 候选都能进入 registry，但默认状态是 `research_only`
 
 ### Sprint 6：paper trading

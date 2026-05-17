@@ -120,7 +120,7 @@ Phase 4 不再回答“模型分数高不高”，而是回答下面 5 个问题
 
 1. 明确唯一成交假设，建议先固定为：
    - `T 日收盘后出信号`
-   - `T+1 日开盘或 VWAP 模拟成交`
+   - 当前代码先按 `T+1 close-to-close` 记账，后续再补 `T+1 日开盘或 VWAP`
 2. 加交易限制：
    - `T+1`
    - 涨停不可买
@@ -251,15 +251,16 @@ Phase 4 不再回答“模型分数高不高”，而是回答下面 5 个问题
 - shadow 连续 `20` 个交易日无明显劣化后，才可申请 champion 替换
 - 任一关键健康项失败，则自动降级为 `research_only` 或 `shadow`
 
-### Track E：Alpha360 / Feature Set V2 对照
+### Track E：Alpha360 / Feature Set V2 对照（表格模型）
 
 目标：把 `Alpha360` 纳入统一 gate，判断它是主线增量、辅助信号，还是冗余噪声。
 
 放置位置：
 
 - 在 Track A/B/C/D 的评估、回测、治理口径固定后启动。
-- 在 RL / paper trading 之前完成首轮对照。
+- 在 RL / paper trading 之前完成首轮表格模型对照。
 - 不阻塞 champion 的正常运行。
+- `ALSTM / Transformer + Alpha360` 归到 Phase 5+，不在 Track E 启动。
 
 涉及文件：
 
@@ -286,8 +287,8 @@ Phase 4 不再回答“模型分数高不高”，而是回答下面 5 个问题
 2. 先跑 `FS-360` 独立模型。
 3. 再跑 `FS-534 / FS-535` 拼接模型。
 4. 对每档至少跑 `LGB / XGB`，有余力再跑 `CatBoost`。
-5. Alpha360 深度模型只做研究候选：`ALSTM / Transformer` 优先吃 `FS-360`。
-6. 输出 rank fusion 对照，不直接平均 raw score。
+5. 输出 rank fusion 对照，不直接平均 raw score。
+6. 深度模型路线单独进入 Phase 5+，不和本轮表格对照混在一起。
 
 交付物：
 
@@ -301,13 +302,14 @@ Phase 4 不再回答“模型分数高不高”，而是回答下面 5 个问题
 - `FS-360` 只有在 rolling 或成本后回测稳定优于 `FS-174` 时，才进入主线候选。
 - `FS-534` 必须优于 `max(FS-174, FS-360)`，否则不保留全量拼接。
 - `FS-535` 必须优于 `max(FS-175, FS-360, FS-534)`，否则不升级 holder + Alpha360。
-- Alpha360 候选进入 shadow 前，必须通过 Track A/B/C/D 的同一套 gate。
+- Alpha360 表格候选进入 shadow 前，必须通过 Track A/B/C/D 的同一套 gate。
 
 失败动作：
 
 - `FS-360 <= FS-174`：Alpha360 降级为研究特征，仅供深度模型继续探索。
 - `FS-534 <= max(FS-174, FS-360)`：判定价量冗余，不强行拼接。
 - Alpha360 单模型弱但 rank fusion 稳定提升：只作为辅助模型，权重上限 `<= 30%`。
+- Alpha360 深度模型不在 Track E 排程，后续按 Phase 5+ 另立 gate。
 
 ---
 
@@ -340,7 +342,7 @@ Phase 4 只允许两条模型增强实验进入主线旁路：
 
 - 冻结 Ranker 主线，不再继续投入主时间
 
-### `Alpha360 -> late/rank fusion`
+### `Alpha360 表格模型 -> late/rank fusion`
 
 设计：
 
@@ -411,12 +413,13 @@ Phase 4 只允许两条模型增强实验进入主线旁路：
 
 - 新模型不再靠单次实验口头升级
 
-### Week 5：Alpha360 / Feature Set V2 对照
+### Week 5：Alpha360 / Feature Set V2 表格对照
 
 目标：
 
 - `FS-174 / FS-175 / FS-360 / FS-534 / FS-535` 同口径跑通
-- Alpha360 是否进入主线候选有明确结论
+- Alpha360 表格模型是否进入主线候选有明确结论
+- Alpha360 + 深度模型不在本周启动，后移到 Phase 5+
 
 本周完成算通过：
 

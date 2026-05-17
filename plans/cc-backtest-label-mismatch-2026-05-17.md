@@ -97,7 +97,7 @@ if is_rebal_day:
 
 1. 生产里无论模型预测多少天，PnL 都是每天结算的
 2. 日频 PnL 才能算 Sharpe、最大回撤等标准指标
-3. Qlib 里 daily return 数据已经有了（`$close / Ref($close, 1) - 1`）
+3. Qlib 里可以直接取未来 1 日收益（`Ref($close, -1) / $close - 1`）；如果拿到的是历史日收益，再按信号日重新对齐
 
 需要的改动：
 1. 在 `phase4_backtest.py` 里单独加载 daily return（不用 model label）
@@ -283,6 +283,18 @@ CC 说 Track A 不受影响，基本正确，但建议补一句限定：
 - 但 Track A 的 `Spread` 不能被当作可年化的组合收益，更不能和 Track B 的日频 PnL 混用。
 
 也就是说：Track A 继续保留，Track B 必须重跑。
+
+### 额外建议：把时间语义写死在 artifact 里
+
+这类错位以后最容易复发的地方，不是模型，而是报表字段。建议后续所有 Phase 4B artifact 都明确写这几个字段：
+
+- `signal_horizon_days = 5`
+- `pnl_horizon_days = 1`
+- `execution_lag_days = 1`
+- `signal_date_index`
+- `pnl_date_index`
+
+这样以后即使换成 `T+1 open`、`T+1 VWAP` 或别的成交假设，也只是改 PnL 口径，不会把训练 label 又塞回回测。
 
 ### 修复后的验收标准
 
