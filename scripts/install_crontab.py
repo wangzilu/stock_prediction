@@ -49,7 +49,7 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("spot_cache_warmup", "5 17 * * 1-5", [py, main_py, "--warm-spot-cache"], "cron_spot_cache_warmup.log"),
         CronJob(
             "qlib_data_update",
-            "0 17 * * 1-5",
+            "45 17 * * 1-5",  # 17:45 — baostock当天数据通常17:30后可用
             [
                 py,
                 str(scripts / "update_qlib_data.py"),
@@ -62,25 +62,26 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                 "4500",
                 "--min-lgb-data-instruments",
                 "4500",
+                "--check-today",  # 健康检查：验证最新日期是今天
             ],
             "data_update.log",
         ),
         CronJob(
             "fund_flow_update",
-            "10 17 * * 1-5",
+            "55 17 * * 1-5",  # 17:55 (after data update)
             [py, str(scripts / "fetch_fund_flow_history.py"), "--incremental", "--workers", "1"],
             "fund_flow_update.log",
         ),
         CronJob(
             "valuation_update",
-            "15 17 * * 1-5",
+            "0 18 * * 1-5",  # 18:00
             [py, str(scripts / "fetch_fundamental_valuation.py"), "--days", "10", "--incremental"],
             "valuation_update.log",
         ),
-        CronJob("lgb_after_close_train", "35 17 * * 1-5", [py, str(scripts / "train_lgb.py")], "lgb_after_close_train.log"),
-        CronJob("lgb_after_close_smoke", "55 17 * * 1-5", [py, str(scripts / "smoke_lgb_predict.py")], "lgb_after_close_smoke.log"),
-        CronJob("factor_decay_monitor", "0 18 * * 1-5", [py, str(scripts / "monitor_factor_decay.py")], "factor_decay.log"),
-        CronJob("brinson_attribution", "5 18 * * 1-5", [py, str(scripts / "run_brinson_attribution.py")], "brinson_attribution.log"),
+        CronJob("lgb_after_close_train", "15 18 * * 1-5", [py, str(scripts / "train_lgb.py")], "lgb_after_close_train.log"),
+        CronJob("lgb_after_close_smoke", "35 18 * * 1-5", [py, str(scripts / "smoke_lgb_predict.py")], "lgb_after_close_smoke.log"),
+        CronJob("factor_decay_monitor", "45 18 * * 1-5", [py, str(scripts / "monitor_factor_decay.py")], "factor_decay.log"),
+        CronJob("brinson_attribution", "50 18 * * 1-5", [py, str(scripts / "run_brinson_attribution.py")], "brinson_attribution.log"),
         CronJob("nightly_train", "0 4 * * *", [py, str(scripts / "nightly_train.py")], "train.log"),
     ]
 

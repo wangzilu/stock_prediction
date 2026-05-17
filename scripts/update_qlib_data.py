@@ -1288,6 +1288,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-staging", action="store_true", help="Write directly to qlib-dir")
     parser.add_argument("--no-repair-format", action="store_true", help="Skip legacy bin format repair")
     parser.add_argument("--skip-health-check", action="store_true")
+    parser.add_argument("--check-today", action="store_true",
+                        help="After update, verify latest data date matches today (exit 1 if stale)")
     return parser.parse_args(argv)
 
 
@@ -1465,6 +1467,51 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     logger.info("Update complete: %s stocks updated, %s failed, source=%s", success, fail, source)
     logger.info("Data stored in %s", args.qlib_dir)
+
+    # --check-today: verify latest data date matches the most recent trading day
+    if getattr(args, "check_today", False):
+        today = datetime.now()
+        today_str = today.strftime("%Y-%m-%d")
+
+        # Determine expected latest trading date (skip weekends and known holidays)
+        # Use pandas bdate_range as approximation; doesn't cover CN holidays perfectly
+        # but cron only runs Mon-Fri so weekends are already excluded
+        import pandas as _pd
+        recent_bdays = _pd.bdate_range(end=today_str, periods=3)
+        # Expected: today if it's a business day, otherwise last business day
+        expected_date = str(recent_bdays[-1].date())
+
+        # Check a few representative stocks for latest date
+        qlib_dir = args.qlib_dir
+        sample_stocks = ["sh600000", "sz000001", "sh601398", "sz000002", "sh600519"]
+        stale_count = 0
+        for stock in sample_stocks:
+            day_file = qlib_dir / "instruments" / f"{stock}.txt"
+            if not day_file.exists():
+                continue
+            # Read last line of instrument file to get latest date
+            lines = day_file.read_text().strip().split("\n")
+            if lines:
+                last_line = lines[-1].strip()
+                # Format: "2026-01-01\t2026-05-17" (start\tend)
+                parts = last_line.split("\t")
+                if len(parts) >= 2:
+                    latest = parts[-1].strip()
+                    if latest < expected_date:
+                        stale_count += 1
+                        logger.warning(f"  {stock} latest date = {latest} "
+                                       f"(expected={expected_date})")
+
+        if stale_count >= 3:
+            logger.error(
+                f"DATA STALE: {stale_count}/{len(sample_stocks)} sample stocks "
+                f"do not have expected date ({expected_date}). "
+                f"Data source may not have published yet."
+            )
+            return 1
+        else:
+            logger.info(f"--check-today: data freshness OK (expected={expected_date})")
+
     return 0 if success > 0 and fail == 0 else 0
 
 
