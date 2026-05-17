@@ -2,7 +2,8 @@
 
 Takes daily model predictions → forms TopK portfolio → tracks PnL with costs.
 
-Execution assumption: T日收盘后出信号, T+1 VWAP 成交.
+Execution assumption: T日收盘后出信号, T+1 close-to-close 记账.
+T+1 open/VWAP 成交模拟可作为后续扩展，但不能和训练 label 混用。
 
 Constraints:
 - T+1 (no same-day sell)
