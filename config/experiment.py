@@ -121,7 +121,7 @@ BACKTEST_GATE = {
 
 EXPOSURE_GATE = {
     "max_stock_weight": 0.08,   # <= 8%
-    "max_industry_weight": 0.25,  # <= 25%
+    "max_industry_weight": 0.40,  # <= 40% (A股行业轮动是alpha来源，不强制中性化)
     "max_adv_participation": 0.02,  # <= 2%
 }
 
