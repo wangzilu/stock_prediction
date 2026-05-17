@@ -118,6 +118,8 @@ class PortfolioBacktest:
         max_daily_turnover: float = 0.15,  # cap daily turnover
         vol_window: int = 20,       # lookback for volatility estimation
         vol_threshold: float = 1.5, # if current vol > threshold * median, reduce trading
+        # --- Drawdown stop-loss ---
+        drawdown_stop: float = 0.0, # if > 0, force sell all when drawdown exceeds this (e.g. 0.08 = 8%)
     ):
         self.top_k = top_k
         self.cost = cost_model or CostModel()
@@ -133,6 +135,7 @@ class PortfolioBacktest:
         self.max_daily_turnover = max_daily_turnover
         self.vol_window = vol_window
         self.vol_threshold = vol_threshold
+        self.drawdown_stop = drawdown_stop
 
     def run(
         self,
@@ -239,8 +242,22 @@ class PortfolioBacktest:
                 elif isinstance(day_ld, pd.DataFrame):
                     cannot_sell = set(day_ld[day_ld.iloc[:, 0] == True].index)
 
+            # === Drawdown stop-loss check ===
+            in_drawdown_stop = False
+            if self.drawdown_stop > 0 and len(daily_pnl_net) >= 5:
+                # Compute recent peak and current drawdown
+                cum = np.cumprod([1 + r for r in daily_pnl_net])
+                peak = np.max(cum)
+                current_dd = (cum[-1] - peak) / peak
+                if current_dd < -self.drawdown_stop:
+                    in_drawdown_stop = True
+
             # === Portfolio construction ===
-            if self.mode == "buffered_partial":
+            if in_drawdown_stop:
+                # Force to cash: sell everything
+                target_portfolio = set()
+                turnover_override = 1.0 if prev_portfolio else 0.0
+            elif self.mode == "buffered_partial":
                 target_portfolio, turnover_override = self._buffered_partial_step(
                     scores, prev_portfolio, holding_days, recent_pnl, cannot_sell)
             else:

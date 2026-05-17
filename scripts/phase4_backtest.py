@@ -155,9 +155,12 @@ def main():
         {"name": "buffered_conservative", "mode": "buffered_partial",
          "rebalance_freq": 1, "dropout_k": 0, "hold_bonus": 0,
          "extra": {"buffer": 8, "trade_rate": 0.25, "max_daily_turnover": 0.10}},
-        {"name": "buffered_aggressive", "mode": "buffered_partial",
+        {"name": "buffered+stop8%", "mode": "buffered_partial",
          "rebalance_freq": 1, "dropout_k": 0, "hold_bonus": 0,
-         "extra": {"buffer": 3, "trade_rate": 0.50, "max_daily_turnover": 0.20}},
+         "extra": {"buffer": 5, "trade_rate": 0.35, "max_daily_turnover": 0.15, "drawdown_stop": 0.08}},
+        {"name": "buffered_cons+stop10%", "mode": "buffered_partial",
+         "rebalance_freq": 1, "dropout_k": 0, "hold_bonus": 0,
+         "extra": {"buffer": 8, "trade_rate": 0.25, "max_daily_turnover": 0.10, "drawdown_stop": 0.10}},
     ]
 
     all_results = {}

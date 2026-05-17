@@ -55,9 +55,12 @@ def main():
 
     # Configs to compare
     configs = [
-        {"name": "daily", "rebalance_freq": 1, "dropout_k": 0, "hold_bonus": 0},
-        {"name": "weekly+bonus", "rebalance_freq": 5, "dropout_k": 0, "hold_bonus": 0.01},
-        {"name": "biweekly+dropout", "rebalance_freq": 10, "dropout_k": 15, "hold_bonus": 0},
+        {"name": "daily", "mode": "fixed", "rebalance_freq": 1, "dropout_k": 0, "hold_bonus": 0},
+        {"name": "buffered_partial", "mode": "buffered_partial", "rebalance_freq": 1,
+         "dropout_k": 0, "hold_bonus": 0},
+        {"name": "buffered+stop8%", "mode": "buffered_partial", "rebalance_freq": 1,
+         "dropout_k": 0, "hold_bonus": 0,
+         "extra": {"buffer": 5, "trade_rate": 0.35, "max_daily_turnover": 0.15, "drawdown_stop": 0.08}},
     ]
 
     from qlib.data import D
@@ -133,11 +136,14 @@ def main():
             # Run each config
             split_result = {"split": split_idx + 1, "test": f"{test_start}~{test_end}"}
             for cfg in configs:
+                extra = cfg.get("extra", {})
                 bt = PortfolioBacktest(
                     top_k=20, cost_model=cost,
+                    mode=cfg.get("mode", "fixed"),
                     rebalance_freq=cfg["rebalance_freq"],
                     dropout_k=cfg["dropout_k"],
                     hold_bonus=cfg["hold_bonus"],
+                    **extra,
                 )
                 r = bt.run(predictions=predictions.to_frame("score"),
                            returns=daily_returns, return_horizon_days=1)
