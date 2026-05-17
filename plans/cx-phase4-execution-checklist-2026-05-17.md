@@ -37,6 +37,7 @@ Phase 4 不再回答“模型分数高不高”，而是回答下面 5 个问题
 - Champion: `XGB 174`
 - Shadow: `XGB 175 holder`
 - 受控增强实验: `XGB topN -> Ranker rerank`
+- Feature Set V2 对照: `FS-360 / FS-534 / FS-535`
 
 ### 暂缓
 
@@ -44,6 +45,7 @@ Phase 4 不再回答“模型分数高不高”，而是回答下面 5 个问题
 - `Top50 ∩ Top50` 交集策略
 - ALSTM / Transformer / RL 直接进入主线
 - 大规模扩因子但不做 rolling gate
+- Alpha360 直接全量拼接进生产模型
 
 ---
 
@@ -249,11 +251,69 @@ Phase 4 不再回答“模型分数高不高”，而是回答下面 5 个问题
 - shadow 连续 `20` 个交易日无明显劣化后，才可申请 champion 替换
 - 任一关键健康项失败，则自动降级为 `research_only` 或 `shadow`
 
+### Track E：Alpha360 / Feature Set V2 对照
+
+目标：把 `Alpha360` 纳入统一 gate，判断它是主线增量、辅助信号，还是冗余噪声。
+
+放置位置：
+
+- 在 Track A/B/C/D 的评估、回测、治理口径固定后启动。
+- 在 RL / paper trading 之前完成首轮对照。
+- 不阻塞 champion 的正常运行。
+
+涉及文件：
+
+- [models/feature_pipeline.py](/Users/wangzilu/MyProjects/stockPrediction/models/feature_pipeline.py:1)
+- [scripts/train_model_suite.py](/Users/wangzilu/MyProjects/stockPrediction/scripts/train_model_suite.py:1)
+- [models/model_registry.py](/Users/wangzilu/MyProjects/stockPrediction/models/model_registry.py:1)
+- 新增建议：`models/feature_sets.py`
+- 新增建议：`scripts/phase4_feature_set_compare.py`
+- 新增建议：`scripts/train_alpha360_baseline.py`
+
+特征集口径：
+
+| 版本 | 特征 | 说明 |
+|---|---|---|
+| `FS-174` | Alpha158 + flow + custom | 当前 champion |
+| `FS-175` | FS-174 + holder_num | 当前 shadow |
+| `FS-360` | Alpha360 | 价量路径独立基线 |
+| `FS-534` | FS-174 + Alpha360 | 验证 Alpha360 是否补充当前基线 |
+| `FS-535` | FS-175 + Alpha360 | 验证 holder + Alpha360 是否稳定有效 |
+
+任务：
+
+1. 抽象统一 feature-set loader，禁止各脚本手写分散特征拼接。
+2. 先跑 `FS-360` 独立模型。
+3. 再跑 `FS-534 / FS-535` 拼接模型。
+4. 对每档至少跑 `LGB / XGB`，有余力再跑 `CatBoost`。
+5. Alpha360 深度模型只做研究候选：`ALSTM / Transformer` 优先吃 `FS-360`。
+6. 输出 rank fusion 对照，不直接平均 raw score。
+
+交付物：
+
+- `feature_set_compare.json`
+- `feature_set_compare.csv`
+- `alpha360_model_report.json`
+- `alpha360_rank_fusion_report.json`
+
+验收门槛：
+
+- `FS-360` 只有在 rolling 或成本后回测稳定优于 `FS-174` 时，才进入主线候选。
+- `FS-534` 必须优于 `max(FS-174, FS-360)`，否则不保留全量拼接。
+- `FS-535` 必须优于 `max(FS-175, FS-360, FS-534)`，否则不升级 holder + Alpha360。
+- Alpha360 候选进入 shadow 前，必须通过 Track A/B/C/D 的同一套 gate。
+
+失败动作：
+
+- `FS-360 <= FS-174`：Alpha360 降级为研究特征，仅供深度模型继续探索。
+- `FS-534 <= max(FS-174, FS-360)`：判定价量冗余，不强行拼接。
+- Alpha360 单模型弱但 rank fusion 稳定提升：只作为辅助模型，权重上限 `<= 30%`。
+
 ---
 
 ## 五、唯一保留的模型增强实验
 
-Phase 4 只允许一条模型增强实验进入主线旁路：
+Phase 4 只允许两条模型增强实验进入主线旁路：
 
 ### `XGB 选池 -> Ranker rerank`
 
@@ -279,6 +339,22 @@ Phase 4 只允许一条模型增强实验进入主线旁路：
 如果不通过：
 
 - 冻结 Ranker 主线，不再继续投入主时间
+
+### `Alpha360 -> late/rank fusion`
+
+设计：
+
+1. `FS-360` 先独立训练。
+2. `FS-174` 和 `FS-360` 分别产生日频 rank。
+3. 只做 rank-level fusion，不做 raw score 平均。
+4. 权重由 rolling 表现决定，Alpha360 初始权重上限 `30%`。
+
+进入下一轮的门槛：
+
+- 成本后组合收益相对 champion 提升 `>= 5%-10%`
+- 换手不显著恶化
+- 暴露不恶化
+- `24+ split` 下不是靠少数窗口撑出来
 
 ---
 
@@ -335,6 +411,19 @@ Phase 4 只允许一条模型增强实验进入主线旁路：
 
 - 新模型不再靠单次实验口头升级
 
+### Week 5：Alpha360 / Feature Set V2 对照
+
+目标：
+
+- `FS-174 / FS-175 / FS-360 / FS-534 / FS-535` 同口径跑通
+- Alpha360 是否进入主线候选有明确结论
+
+本周完成算通过：
+
+- 有 `feature_set_compare` artifact
+- registry 中所有 Alpha360 run 默认是 `research_only`
+- 只有通过 Track A/B/C/D 的候选才允许申请 shadow
+
 ---
 
 ## 七、Phase 4 完成定义
@@ -345,7 +434,8 @@ Phase 4 只允许一条模型增强实验进入主线旁路：
 2. 成本后回测报告稳定输出，包含收益、回撤、换手、成本。
 3. 风险暴露和容量报告稳定输出。
 4. champion / shadow / reject 治理生效。
-5. 每个模型升级都能追溯到 artifact，而不是只剩终端日志。
+5. Alpha360 / Feature Set V2 有首轮同口径结论。
+6. 每个模型升级都能追溯到 artifact，而不是只剩终端日志。
 
 ---
 
@@ -356,6 +446,7 @@ Phase 4 只允许一条模型增强实验进入主线旁路：
 3. 不把 `175 holder` 的单次好结果当成已取代 `174` 的证据。
 4. 不在 Phase 4 中途转去追 Transformer / RL 大工程。
 5. 不让生产脚本和研究结论继续口径打架。
+6. 不把 Alpha360 当作“维度更多所以一定更好”。
 
 ---
 
@@ -368,6 +459,7 @@ Phase 4 只允许一条模型增强实验进入主线旁路：
 | 主模型 | `XGB 174` |
 | Shadow 模型 | `XGB 175 holder` |
 | Ranker 定位 | 仅做 rerank 实验 |
+| Alpha360 定位 | Phase 4E 特征集对照，优先独立模型与 rank fusion |
 | Phase 4 主目标 | rolling + 成本后 + 暴露后可交易验证 |
 | promote 依据 | artifact + gate，不是单次分数 |
 
