@@ -27,7 +27,7 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 from config.settings import PREDICTION_HORIZON_DAYS
 from config.qlib_runtime import init_qlib
 from models.feature_merger import FeatureMerger
-from models.feature_pipeline import prepare_features_174, train_xgb
+from models.feature_pipeline import prepare_features_174, train_xgb, load_daily_returns
 from backtest.cost_model import CostModel
 from backtest.portfolio_backtest import PortfolioBacktest, PortfolioResult
 
@@ -124,32 +124,73 @@ def main():
 
     # Predict on full test (keep NaN rows — backtest handles them)
     X_test_np = X_test_df.values.astype(np.float32)
-    y_test_np = y_test_s.values.astype(np.float32)
     pred_raw = model.predict(xgb.DMatrix(X_test_np))
 
     # Build predictions DataFrame for backtest
     predictions = pd.Series(pred_raw, index=X_test_df.index, name="score")
     predictions = predictions[np.isfinite(predictions)]
 
-    # Build returns DataFrame: this is the actual next-day return (label)
-    # Note: label = Ref($close, -N) / Ref($close, -1) - 1, which is forward return
-    returns = pd.Series(y_test_np, index=X_test_df.index, name="return")
-    returns = returns[np.isfinite(returns)]
+    # Load DAILY realized returns (NOT model label!)
+    # Model label is 5-day forward return — cannot be used as daily PnL.
+    logger.info("Loading daily realized returns (1-day close-to-close)...")
+    daily_returns = load_daily_returns(X_test_df.index)
+    # Rename column to match PortfolioBacktest expectation
+    if isinstance(daily_returns, pd.DataFrame):
+        daily_returns = daily_returns.rename(columns={"pnl_return_1d": "return"})
+    elif isinstance(daily_returns, pd.Series):
+        daily_returns = daily_returns.rename("return")
 
-    logger.info(f"Predictions: {len(predictions)}, Returns: {len(returns)}")
+    logger.info(f"Predictions: {len(predictions)}, Daily returns: {len(daily_returns)}")
+    logger.info(f"  (model_target_horizon={PREDICTION_HORIZON_DAYS}d, pnl_horizon=1d)")
 
-    # Run backtest
+    # Run backtest with multiple configurations
     cost = CostModel()
     logger.info(f"Cost model: {cost.summary()}")
 
-    bt = PortfolioBacktest(top_k=args.top_k, cost_model=cost)
-    result = bt.run(
-        predictions=predictions.to_frame("score"),
-        returns=returns.to_frame("return"),
-    )
+    configs = [
+        {"name": "daily_rebal", "rebalance_freq": 1, "dropout_k": 0, "hold_bonus": 0},
+        {"name": "weekly_rebal", "rebalance_freq": 5, "dropout_k": 0, "hold_bonus": 0},
+        {"name": "weekly+dropout10", "rebalance_freq": 5, "dropout_k": 10, "hold_bonus": 0},
+        {"name": "weekly+bonus", "rebalance_freq": 5, "dropout_k": 0, "hold_bonus": 0.01},
+        {"name": "weekly+dropout+bonus", "rebalance_freq": 5, "dropout_k": 10, "hold_bonus": 0.01},
+        {"name": "biweekly+dropout", "rebalance_freq": 10, "dropout_k": 15, "hold_bonus": 0},
+    ]
 
-    # Print results
+    all_results = {}
+    for cfg in configs:
+        bt = PortfolioBacktest(
+            top_k=args.top_k, cost_model=cost,
+            rebalance_freq=cfg["rebalance_freq"],
+            dropout_k=cfg["dropout_k"],
+            hold_bonus=cfg["hold_bonus"],
+        )
+        r = bt.run(
+            predictions=predictions.to_frame("score"),
+            returns=daily_returns,
+            return_horizon_days=1,
+        )
+        all_results[cfg["name"]] = r
+        logger.info(f"  {cfg['name']:<25} annual={r.annual_return*100:+.1f}% "
+                    f"sharpe={r.sharpe_ratio:.3f} dd={r.max_drawdown*100:.1f}% "
+                    f"turnover={r.avg_turnover*100:.0f}% cost/ret={r.cost_to_return_ratio*100:.0f}%")
+
+    # Find best config
+    best_name = max(all_results, key=lambda k: all_results[k].sharpe_ratio)
+    result = all_results[best_name]
+    logger.info(f"\nBest config: {best_name}")
     print(result.summary())
+
+    # Also show comparison table
+    logger.info(f"\n{'='*90}")
+    logger.info(f"{'Config':<25} {'Raw Ann':>8} {'Net Ann':>8} {'Sharpe':>7} "
+                f"{'MaxDD':>7} {'Turn':>6} {'Cost/Ret':>8}")
+    logger.info("-" * 90)
+    for name, r in all_results.items():
+        marker = " ★" if name == best_name else ""
+        logger.info(f"{name:<25} {r.raw_annual_return*100:+.1f}%   "
+                    f"{r.annual_return*100:+.1f}%   {r.sharpe_ratio:+.3f}  "
+                    f"{r.max_drawdown*100:.1f}%  {r.avg_turnover*100:.0f}%   "
+                    f"{r.cost_to_return_ratio*100:.0f}%{marker}")
 
     # Gate check
     logger.info(f"\n{'='*50}")

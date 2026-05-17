@@ -124,6 +124,32 @@ def train_xgb(X_train, y_train, X_valid, y_valid, params=None):
     return model
 
 
+def load_daily_returns(index: pd.MultiIndex) -> pd.Series:
+    """Load 1-day realized returns for portfolio PnL accounting.
+
+    Returns close-to-close daily return: (D+1 close) / (D close) - 1.
+    Index date D means: if you hold on day D, the return you realize is
+    from D close to D+1 close.
+
+    IMPORTANT: This is NOT the model training label (which is N-day forward).
+    Never use model labels as PnL returns.
+    """
+    from qlib.data import D
+
+    insts = sorted(set(str(c) for c in index.get_level_values(1)))
+    dates = sorted(index.get_level_values(0).unique())
+
+    ret = D.features(
+        insts,
+        ["Ref($close, -1) / $close - 1"],
+        start_time=str(min(dates))[:10],
+        end_time=str(max(dates))[:10],
+    )
+    ret.columns = ["pnl_return_1d"]
+    ret = ret.swaplevel().sort_index()
+    return ret.replace([np.inf, -np.inf], np.nan).dropna()
+
+
 def evaluate_predictions(pred, label, index) -> dict:
     """Standard evaluation: IC, ICIR, RankIC, Top20 Spread."""
     from qlib.contrib.eva.alpha import calc_ic

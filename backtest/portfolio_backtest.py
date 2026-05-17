@@ -102,13 +102,17 @@ class PortfolioBacktest:
         cost_model: Optional[CostModel] = None,
         min_adv: float = 5e6,       # 最小日成交额 500 万
         max_weight: float = 0.08,   # 单票最大权重 8%
-        rebalance_freq: int = 1,    # 每天换仓
+        rebalance_freq: int = 5,    # 每 N 天换仓 (default: weekly)
+        dropout_k: int = 0,         # TopK dropout: only sell if falls below top_k + dropout_k
+        hold_bonus: float = 0.0,    # Score bonus for currently held stocks (reduces turnover)
     ):
         self.top_k = top_k
         self.cost = cost_model or CostModel()
         self.min_adv = min_adv
         self.max_weight = max_weight
         self.rebalance_freq = rebalance_freq
+        self.dropout_k = dropout_k
+        self.hold_bonus = hold_bonus
 
     def run(
         self,
@@ -118,13 +122,15 @@ class PortfolioBacktest:
         limit_down: Optional[pd.DataFrame] = None,
         suspended: Optional[pd.DataFrame] = None,
         adv: Optional[pd.DataFrame] = None,
+        return_horizon_days: int = 1,
     ) -> PortfolioResult:
         """Run backtest.
 
         Args:
             predictions: DataFrame indexed by (datetime, instrument) with column 'score'
-            returns: DataFrame indexed by (datetime, instrument) with column 'return'
-                     (T+1 return, i.e., return realized on the day AFTER the signal)
+            returns: DataFrame indexed by (datetime, instrument) with 1-day realized return
+                     (close-to-close daily return, NOT model training label)
+            return_horizon_days: Must be 1. Safety check to prevent passing multi-day labels.
             limit_up: Boolean DataFrame - True if stock hit limit up (cannot buy)
             limit_down: Boolean DataFrame - True if stock hit limit down (cannot sell)
             suspended: Boolean DataFrame - True if stock is suspended
@@ -133,6 +139,14 @@ class PortfolioBacktest:
         Returns:
             PortfolioResult
         """
+        # Safety: prevent passing multi-day model labels as daily PnL
+        if return_horizon_days != 1:
+            raise ValueError(
+                f"PortfolioBacktest requires daily realized returns (horizon=1), "
+                f"got horizon={return_horizon_days}. "
+                f"Do NOT pass model training labels as PnL returns."
+            )
+
         # Align predictions and returns
         if isinstance(predictions, pd.Series):
             predictions = predictions.to_frame("score")
@@ -140,7 +154,9 @@ class PortfolioBacktest:
             returns = returns.to_frame("return")
 
         dates = sorted(predictions.index.get_level_values(0).unique())
-        logger.info(f"Backtest: {len(dates)} dates, top_k={self.top_k}")
+        logger.info(f"Backtest: {len(dates)} dates, top_k={self.top_k}, "
+                    f"rebal_freq={self.rebalance_freq}, dropout_k={self.dropout_k}, "
+                    f"hold_bonus={self.hold_bonus}")
 
         daily_pnl_raw = []
         daily_pnl_net = []
@@ -148,6 +164,7 @@ class PortfolioBacktest:
         daily_turnovers = []
         daily_holdings_count = []
         prev_portfolio = set()
+        days_since_rebal = 0
 
         for i, date in enumerate(dates):
             # Get predictions for this date
@@ -172,7 +189,6 @@ class PortfolioBacktest:
                 day_susp = suspended.loc[date]
                 if isinstance(day_susp, pd.Series):
                     susp_set = set(day_susp[day_susp == True].index)
-                    # Remove suspended from candidate scores (cannot buy)
                     scores = scores[~scores.index.isin(susp_set)]
                 elif isinstance(day_susp, pd.DataFrame):
                     susp_set = set(day_susp[day_susp.iloc[:, 0] == True].index)
@@ -187,7 +203,6 @@ class PortfolioBacktest:
                     blocked = set(day_lu[day_lu.iloc[:, 0] == True].index)
                 else:
                     blocked = set()
-                # Only block new buys, existing holdings can stay
                 new_candidates = scores.index.difference(prev_portfolio)
                 new_blocked = blocked & set(new_candidates)
                 if new_blocked:
@@ -202,11 +217,46 @@ class PortfolioBacktest:
                 elif isinstance(day_ld, pd.DataFrame):
                     cannot_sell = set(day_ld[day_ld.iloc[:, 0] == True].index)
 
-            # Select top_k
-            if len(scores) < self.top_k:
-                target_portfolio = set(scores.index)
+            # === Rebalance decision ===
+            days_since_rebal += 1
+            is_rebal_day = (days_since_rebal >= self.rebalance_freq) or (not prev_portfolio)
+
+            if is_rebal_day:
+                days_since_rebal = 0
+
+                # Apply hold_bonus: boost scores for currently held stocks
+                if self.hold_bonus > 0 and prev_portfolio:
+                    scores = scores.copy()
+                    held_mask = scores.index.isin(prev_portfolio)
+                    scores[held_mask] += self.hold_bonus
+
+                # TopK Dropout: only sell if stock falls below top_k + dropout_k
+                if self.dropout_k > 0 and prev_portfolio:
+                    sell_threshold = self.top_k + self.dropout_k
+                    # Stocks in prev portfolio: keep unless they fall out of top sell_threshold
+                    if len(scores) >= sell_threshold:
+                        safe_zone = set(scores.nlargest(sell_threshold).index)
+                    else:
+                        safe_zone = set(scores.index)
+                    # Held stocks that are still in safe zone: keep them
+                    forced_keep = prev_portfolio & safe_zone
+                    # Fill remaining slots from top scores
+                    remaining_slots = self.top_k - len(forced_keep)
+                    if remaining_slots > 0:
+                        available = scores[~scores.index.isin(forced_keep)]
+                        new_picks = set(available.nlargest(remaining_slots).index)
+                        target_portfolio = forced_keep | new_picks
+                    else:
+                        target_portfolio = set(list(forced_keep)[:self.top_k])
+                else:
+                    # Simple top_k selection
+                    if len(scores) < self.top_k:
+                        target_portfolio = set(scores.index)
+                    else:
+                        target_portfolio = set(scores.nlargest(self.top_k).index)
             else:
-                target_portfolio = set(scores.nlargest(self.top_k).index)
+                # Not a rebalance day: hold current portfolio
+                target_portfolio = prev_portfolio
 
             # Force keep cannot_sell stocks from prev portfolio
             forced_keep = prev_portfolio & cannot_sell
