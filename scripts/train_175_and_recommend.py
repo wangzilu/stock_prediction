@@ -28,79 +28,17 @@ from models.feature_merger import FeatureMerger
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+from models.feature_pipeline import prepare_features_174, train_xgb, XGB_PARAMS
+
 DATA_DIR = PROJECT_ROOT / "data" / "storage"
 QLIB_DATA = str(DATA_DIR / "qlib_data" / "cn_data")
 LABEL_EXPR = f"Ref($close, -{PREDICTION_HORIZON_DAYS}) / Ref($close, -1) - 1"
 SEED = 42
 
-CUSTOM_EXPRS = [
-    "$pe", "$pb", "$turn", "$amount",
-    "$pe / Ref($pe, 20) - 1", "$pb / Ref($pb, 20) - 1",
-    "$turn / Mean($turn, 20)", "$turn / Mean($turn, 60)",
-    "$amount / Mean($amount, 20)", "Std($turn, 20)",
-    "1.0 / If(Abs($pe) > 0.01, $pe, 1.0)",
-    "1.0 / If(Abs($pb) > 0.01, $pb, 1.0)",
-    "($close - Min($close, 20)) / (Max($close, 20) - Min($close, 20) + 1e-8)",
-]
-CUSTOM_NAMES = [
-    "pe", "pb", "turn_raw", "amount_raw",
-    "pe_mom20", "pb_mom20", "turn_anom20", "turn_anom60",
-    "amount_anom20", "turn_vol20", "ep", "bp", "price_pos20",
-]
-
-
-def load_holder(index):
-    """Load 股东户数 (PIT-safe via ann_date)."""
-    path = DATA_DIR / "st_holder_number.parquet"
-    if not path.exists():
-        return None
-    df = pd.read_parquet(path)
-    if df.empty or "qlib_code" not in df.columns:
-        return None
-    df["holder_num"] = pd.to_numeric(df.get("holder_num"), errors="coerce")
-    df["ann_date"] = pd.to_datetime(df["ann_date"], format="%Y%m%d", errors="coerce")
-    df = df.dropna(subset=["ann_date", "holder_num"])
-    ts = df[["qlib_code", "ann_date", "holder_num"]].copy()
-    ts = ts.sort_values(["qlib_code", "ann_date"]).drop_duplicates(
-        ["qlib_code", "ann_date"], keep="last")
-    merger = FeatureMerger(DATA_DIR)
-    return merger._asof_merge_timeseries(ts, index, "ann_date", ["holder_num"])
-
 
 def prepare_segment(dataset, seg, merger):
-    """Prepare 175-dim features: Alpha158(158) + flow(3) + custom(13) + holder(1)."""
-    from qlib.data import D
-
-    X = dataset.prepare(seg, col_set="feature")
-    y = dataset.prepare(seg, col_set="label")
-    if isinstance(y, pd.DataFrame):
-        y = y.iloc[:, 0]
-
-    # Flow (proven)
-    flow = merger._load_capital_flow(X.index)
-    if flow is not None:
-        X = X.join(flow, how="left")
-
-    # Qlib custom (proven)
-    insts = list(set(str(c) for c in X.index.get_level_values(1)))
-    dates = sorted(X.index.get_level_values(0).unique())
-    custom = D.features(insts, CUSTOM_EXPRS,
-                        start_time=str(min(dates))[:10],
-                        end_time=str(max(dates))[:10])
-    if custom is not None and not custom.empty:
-        custom.columns = CUSTOM_NAMES
-        custom = custom.swaplevel().sort_index().reindex(X.index)
-        custom = custom.replace([np.inf, -np.inf], np.nan)
-        new_cols = [c for c in custom.columns if c not in set(X.columns)]
-        if new_cols:
-            X = X.join(custom[new_cols], how="left")
-
-    # Holder (new winner)
-    holder = load_holder(X.index)
-    if holder is not None:
-        X = X.join(holder, how="left")
-
-    return X, y
+    """Prepare 175-dim features using shared pipeline."""
+    return prepare_features_174(dataset, seg, merger, include_holder=True)
 
 
 def main():

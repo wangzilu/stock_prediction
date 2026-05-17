@@ -27,6 +27,10 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 from config.settings import PREDICTION_HORIZON_DAYS
 from config.qlib_runtime import init_qlib
 from models.feature_merger import FeatureMerger
+from models.feature_pipeline import (
+    prepare_segment_numpy, train_xgb as _train_xgb,
+    evaluate_predictions, XGB_PARAMS,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -35,49 +39,6 @@ DATA_DIR = PROJECT_ROOT / "data" / "storage"
 QLIB_DATA = str(DATA_DIR / "qlib_data" / "cn_data")
 LABEL_EXPR = f"Ref($close, -{PREDICTION_HORIZON_DAYS}) / Ref($close, -1) - 1"
 SEED = 42
-
-CUSTOM_EXPRS = [
-    "$pe", "$pb", "$turn", "$amount",
-    "$pe / Ref($pe, 20) - 1", "$pb / Ref($pb, 20) - 1",
-    "$turn / Mean($turn, 20)", "$turn / Mean($turn, 60)",
-    "$amount / Mean($amount, 20)", "Std($turn, 20)",
-    "1.0 / If(Abs($pe) > 0.01, $pe, 1.0)",
-    "1.0 / If(Abs($pb) > 0.01, $pb, 1.0)",
-    "($close - Min($close, 20)) / (Max($close, 20) - Min($close, 20) + 1e-8)",
-]
-CUSTOM_NAMES = [
-    "pe", "pb", "turn_raw", "amount_raw",
-    "pe_mom20", "pb_mom20", "turn_anom20", "turn_anom60",
-    "amount_anom20", "turn_vol20", "ep", "bp", "price_pos20",
-]
-
-
-def prepare_174(dataset, seg, merger):
-    """Prepare 174-dim features."""
-    from qlib.data import D
-    X = dataset.prepare(seg, col_set="feature")
-    y = dataset.prepare(seg, col_set="label")
-    if isinstance(y, pd.DataFrame):
-        y = y.iloc[:, 0]
-
-    flow = merger._load_capital_flow(X.index)
-    if flow is not None:
-        X = X.join(flow, how="left")
-
-    insts = list(set(str(c) for c in X.index.get_level_values(1)))
-    dates = sorted(X.index.get_level_values(0).unique())
-    custom = D.features(insts, CUSTOM_EXPRS,
-                        start_time=str(min(dates))[:10],
-                        end_time=str(max(dates))[:10])
-    if custom is not None and not custom.empty:
-        custom.columns = CUSTOM_NAMES
-        custom = custom.swaplevel().sort_index().reindex(X.index)
-        custom = custom.replace([np.inf, -np.inf], np.nan)
-        new_cols = [c for c in custom.columns if c not in set(X.columns)]
-        if new_cols:
-            X = X.join(custom[new_cols], how="left")
-
-    return X, y
 
 
 def returns_to_rank_label(y, index, n_bins=5):
@@ -90,19 +51,7 @@ def returns_to_rank_label(y, index, n_bins=5):
 
 
 def train_xgb(X_train, y_train, X_valid, y_valid):
-    import xgboost as xgb
-    dt = xgb.DMatrix(X_train, label=y_train)
-    dv = xgb.DMatrix(X_valid, label=y_valid)
-    params = {
-        "max_depth": 8, "learning_rate": 0.05,
-        "subsample": 0.8789, "colsample_bytree": 0.8879,
-        "reg_alpha": 205.6999, "reg_lambda": 580.9768,
-        "objective": "reg:squarederror", "nthread": 4,
-        "verbosity": 0, "seed": SEED,
-    }
-    model = xgb.train(params, dt, num_boost_round=500,
-                      evals=[(dv, "valid")], early_stopping_rounds=50, verbose_eval=0)
-    return model
+    return _train_xgb(X_train, y_train, X_valid, y_valid)
 
 
 def train_ranker(X_train, y_train, X_valid, y_valid, train_idx, valid_idx):
@@ -152,25 +101,7 @@ def ensemble_predictions(pred_xgb, pred_ranker, index, w_xgb=0.5, w_ranker=0.5):
 
 
 def evaluate(pred, label, index):
-    from qlib.contrib.eva.alpha import calc_ic
-    mask = np.isfinite(pred) & np.isfinite(label)
-    ps = pd.Series(pred[mask], index=index[mask])
-    ls = pd.Series(label[mask], index=index[mask])
-    ic, ric = calc_ic(ps, ls)
-    spreads = []
-    for _, g in pd.DataFrame({"pred": ps, "label": ls}).groupby(level=0):
-        if len(g) < 40:
-            continue
-        s = g.sort_values("pred", ascending=False)
-        spreads.append(s.head(20)["label"].mean() - s.tail(20)["label"].mean())
-    return {
-        "ic_mean": round(float(ic.mean()), 6),
-        "icir": round(float(ic.mean()) / (float(ic.std()) + 1e-8), 4),
-        "rank_ic_mean": round(float(ric.mean()), 6),
-        "rank_ic_pos": round(float((ric > 0).mean()), 4),
-        "top20_spread": round(float(np.mean(spreads)) if spreads else 0, 6),
-        "spread_pos": round(float(np.mean([s > 0 for s in spreads])) if spreads else 0, 4),
-    }
+    return evaluate_predictions(pred, label, index)
 
 
 def main():
@@ -218,12 +149,9 @@ def main():
     segs = {}
     for seg in ["train", "valid", "test"]:
         logger.info(f"Preparing {seg}...")
-        X, y = prepare_174(dataset, seg, merger)
-        Xn = X.values.astype(np.float32)
-        yn = y.values.astype(np.float32)
-        mask = np.isfinite(yn)
-        segs[seg] = (Xn[mask], yn[mask], X.index[mask])
-        logger.info(f"  {seg}: {Xn[mask].shape}")
+        Xn, yn, idx, _ = prepare_segment_numpy(dataset, seg, merger)
+        segs[seg] = (Xn, yn, idx)
+        logger.info(f"  {seg}: {Xn.shape}")
 
     X_train, y_train, train_idx = segs["train"]
     X_valid, y_valid, valid_idx = segs["valid"]
