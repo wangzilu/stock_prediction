@@ -30,6 +30,9 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 from config.settings import PREDICTION_HORIZON_DAYS
 from config.qlib_runtime import init_qlib
 from models.feature_merger import FeatureMerger
+from models.feature_pipeline import (
+    prepare_segment_numpy, train_xgb, evaluate_predictions, XGB_PARAMS,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -38,21 +41,6 @@ DATA_DIR = PROJECT_ROOT / "data" / "storage"
 QLIB_DATA = str(DATA_DIR / "qlib_data" / "cn_data")
 LABEL_EXPR = f"Ref($close, -{PREDICTION_HORIZON_DAYS}) / Ref($close, -1) - 1"
 SEED = 42
-
-CUSTOM_EXPRS = [
-    "$pe", "$pb", "$turn", "$amount",
-    "$pe / Ref($pe, 20) - 1", "$pb / Ref($pb, 20) - 1",
-    "$turn / Mean($turn, 20)", "$turn / Mean($turn, 60)",
-    "$amount / Mean($amount, 20)", "Std($turn, 20)",
-    "1.0 / If(Abs($pe) > 0.01, $pe, 1.0)",
-    "1.0 / If(Abs($pb) > 0.01, $pb, 1.0)",
-    "($close - Min($close, 20)) / (Max($close, 20) - Min($close, 20) + 1e-8)",
-]
-CUSTOM_NAMES = [
-    "pe", "pb", "turn_raw", "amount_raw",
-    "pe_mom20", "pb_mom20", "turn_anom20", "turn_anom60",
-    "amount_anom20", "turn_vol20", "ep", "bp", "price_pos20",
-]
 
 # Promotion gate thresholds (from CX plan, CC adjusted)
 GATE = {
@@ -67,47 +55,8 @@ GATE = {
 def get_trading_dates():
     """Get trading date calendar from Qlib."""
     from qlib.data import D
-    # Use a liquid stock to get trade dates
     cal = D.calendar(start_time="2020-01-01", end_time=datetime.now().strftime("%Y-%m-%d"))
     return sorted(cal)
-
-
-def prepare_174(dataset, seg, merger):
-    """Prepare 174-dim features: Alpha158 + flow + custom."""
-    from qlib.data import D
-    X = dataset.prepare(seg, col_set="feature")
-    y = dataset.prepare(seg, col_set="label")
-    if isinstance(y, pd.DataFrame):
-        y = y.iloc[:, 0]
-
-    flow = merger._load_capital_flow(X.index)
-    if flow is not None:
-        X = X.join(flow, how="left")
-
-    insts = list(set(str(c) for c in X.index.get_level_values(1)))
-    dates = sorted(X.index.get_level_values(0).unique())
-    custom = D.features(insts, CUSTOM_EXPRS,
-                        start_time=str(min(dates))[:10], end_time=str(max(dates))[:10])
-    if custom is not None and not custom.empty:
-        custom.columns = CUSTOM_NAMES
-        custom = custom.swaplevel().sort_index().reindex(X.index)
-        custom = custom.replace([np.inf, -np.inf], np.nan)
-        new_cols = [c for c in custom.columns if c not in set(X.columns)]
-        if new_cols:
-            X = X.join(custom[new_cols], how="left")
-    return X, y
-
-
-def train_xgb(X_train, y_train, X_valid, y_valid):
-    import xgboost as xgb
-    dt = xgb.DMatrix(X_train, label=y_train)
-    dv = xgb.DMatrix(X_valid, label=y_valid)
-    params = {"max_depth": 8, "learning_rate": 0.05, "subsample": 0.8789,
-              "colsample_bytree": 0.8879, "reg_alpha": 205.6999, "reg_lambda": 580.9768,
-              "objective": "reg:squarederror", "nthread": 4, "verbosity": 0, "seed": SEED}
-    model = xgb.train(params, dt, num_boost_round=500,
-                      evals=[(dv, "valid")], early_stopping_rounds=50, verbose_eval=0)
-    return model
 
 
 def evaluate_split(pred, label, index):
@@ -268,20 +217,12 @@ def main():
             })
 
             # Prepare features
+            include_holder = (args.model == "xgb_175")
             segs = {}
             for seg in ["train", "valid", "test"]:
-                X, y = prepare_174(dataset, seg, merger)
-
-                # Add holder for 175 model
-                if args.model == "xgb_175":
-                    holder = merger._load_st_holder_number(X.index)
-                    if holder is not None:
-                        X = X.join(holder, how="left")
-
-                Xn = X.values.astype(np.float32)
-                yn = y.values.astype(np.float32)
-                mask = np.isfinite(yn)
-                segs[seg] = (Xn[mask], yn[mask], X.index[mask])
+                Xn, yn, idx, _ = prepare_segment_numpy(
+                    dataset, seg, merger, include_holder=include_holder)
+                segs[seg] = (Xn, yn, idx)
 
             X_train, y_train, _ = segs["train"]
             X_valid, y_valid, _ = segs["valid"]
