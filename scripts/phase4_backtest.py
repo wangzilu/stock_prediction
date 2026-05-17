@@ -148,21 +148,28 @@ def main():
     logger.info(f"Cost model: {cost.summary()}")
 
     configs = [
-        {"name": "daily_rebal", "rebalance_freq": 1, "dropout_k": 0, "hold_bonus": 0},
-        {"name": "weekly_rebal", "rebalance_freq": 5, "dropout_k": 0, "hold_bonus": 0},
-        {"name": "weekly+dropout10", "rebalance_freq": 5, "dropout_k": 10, "hold_bonus": 0},
-        {"name": "weekly+bonus", "rebalance_freq": 5, "dropout_k": 0, "hold_bonus": 0.01},
-        {"name": "weekly+dropout+bonus", "rebalance_freq": 5, "dropout_k": 10, "hold_bonus": 0.01},
-        {"name": "biweekly+dropout", "rebalance_freq": 10, "dropout_k": 15, "hold_bonus": 0},
+        {"name": "daily_rebal", "mode": "fixed", "rebalance_freq": 1, "dropout_k": 0, "hold_bonus": 0},
+        {"name": "weekly+bonus", "mode": "fixed", "rebalance_freq": 5, "dropout_k": 0, "hold_bonus": 0.01},
+        {"name": "biweekly+dropout", "mode": "fixed", "rebalance_freq": 10, "dropout_k": 15, "hold_bonus": 0},
+        {"name": "buffered_partial", "mode": "buffered_partial", "rebalance_freq": 1, "dropout_k": 0, "hold_bonus": 0},
+        {"name": "buffered_conservative", "mode": "buffered_partial",
+         "rebalance_freq": 1, "dropout_k": 0, "hold_bonus": 0,
+         "extra": {"buffer": 8, "trade_rate": 0.25, "max_daily_turnover": 0.10}},
+        {"name": "buffered_aggressive", "mode": "buffered_partial",
+         "rebalance_freq": 1, "dropout_k": 0, "hold_bonus": 0,
+         "extra": {"buffer": 3, "trade_rate": 0.50, "max_daily_turnover": 0.20}},
     ]
 
     all_results = {}
     for cfg in configs:
+        extra = cfg.get("extra", {})
         bt = PortfolioBacktest(
             top_k=args.top_k, cost_model=cost,
+            mode=cfg["mode"],
             rebalance_freq=cfg["rebalance_freq"],
             dropout_k=cfg["dropout_k"],
             hold_bonus=cfg["hold_bonus"],
+            **extra,
         )
         r = bt.run(
             predictions=predictions.to_frame("score"),
