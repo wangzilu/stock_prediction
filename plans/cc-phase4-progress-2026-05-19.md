@@ -30,7 +30,8 @@
 | Δ RankIC>0 | — | 17/24 (71%) | 显著 |
 | Δ Spread>0 | — | 13/24 (54%) | 中等 |
 
-**结论：恒指/纳指 regime 信号确认有增量，建议升级 champion 从 174 维到 205 维。**
+**结论：恒指/纳指 regime 信号有增量（avg RankIC +30%），但最近 split 反而恶化（+0.006→-0.082）。
+建议 XGB 205 进入 shadow candidate，不直接升级 champion。需先跑 20 日 shadow + 成本后回测。**
 
 Regime 特征包括（每个指数 9 个）：
 - 1d/5d/20d return
@@ -54,17 +55,21 @@ Regime 特征包括（每个指数 9 个）：
 - 止损：跌破 20MA
 - 止盈：涨 20% 或远离 5MA 8%+
 
-**结论：MA timing 有择时能力但波动大。作为辅助策略，不替代 buffered_partial。**
+**结论：MA timing 有择时能力但波动极大（中位年化仅+13%，+683%极端拉高，最近split -48%）。
+定位：research_only / 辅助过滤，不进主链。**
 
 ---
 
-## 建议新 Champion 配置
+## 模型状态台账
 
-```
-模型: XGB 205 维 (174 base + 27 regime + 4 holder+flow)
-执行: buffered_partial (buffer=5, trade_rate=0.35, vol_throttle=1.5x)
-择时: MA timing 作为入场过滤（可选）
-```
+| 模型 | 状态 | 说明 |
+|------|:---:|------|
+| XGB 174 | **champion** | 不动，继续生产 |
+| XGB 205 + buffered_partial | **shadow candidate** | 等 20 日 shadow + 4D gate 全过才能谈 champion |
+| MA timing | research_only | 辅助过滤，不进主链 |
+
+**治理顺序：shadow 20 日 → 4D gate check → 成本后回测 → 暴露检查 → 才能 promote。
+不允许跳过任何步骤直接升级 champion。**
 
 ---
 
