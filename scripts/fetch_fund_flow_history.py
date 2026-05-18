@@ -537,8 +537,9 @@ def fetch_northbound_batch(days: int = 60) -> pd.DataFrame:
         return pd.DataFrame()
 
     result = pd.concat(all_dfs, ignore_index=True)
+    n_stocks = result['qlib_code'].nunique() if 'qlib_code' in result.columns else 0
     logger.info(f"Northbound batch: {len(result)} rows, "
-                f"{result['qlib_code'].nunique()} stocks, {len(trade_dates)} days")
+                f"{n_stocks} stocks, {len(trade_dates)} days")
     return result
 
 
