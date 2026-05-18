@@ -37,15 +37,23 @@ INDICES = {
 
 
 def fetch_hk_index(symbol: str, start: str) -> pd.DataFrame:
-    """Fetch HK index daily data via AKShare."""
+    """Fetch HK index daily data via AKShare (sina source)."""
     import akshare as ak
     try:
-        df = ak.stock_hk_index_daily_em(symbol=symbol)
+        df = ak.stock_hk_index_daily_sina(symbol=symbol)
         if df is None or df.empty:
-            return pd.DataFrame()
-        df["date"] = pd.to_datetime(df["日期"])
-        df = df.rename(columns={"开盘": "open", "最高": "high", "最低": "low",
-                                 "收盘": "close", "成交量": "volume"})
+            logger.warning(f"sina {symbol} returned empty, trying em...")
+            df = ak.stock_hk_index_daily_em(symbol=symbol)
+            if df is None or df.empty:
+                return pd.DataFrame()
+            df["date"] = pd.to_datetime(df["日期"])
+            df = df.rename(columns={"开盘": "open", "最高": "high", "最低": "low",
+                                     "收盘": "close", "成交量": "volume"})
+        else:
+            df["date"] = pd.to_datetime(df["date"])
+            for col in ["open", "high", "low", "close"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df["volume"] = pd.to_numeric(df.get("volume", 0), errors="coerce")
         df = df[df["date"] >= pd.to_datetime(start)]
         return df[["date", "open", "high", "low", "close", "volume"]].sort_values("date")
     except Exception as e:
