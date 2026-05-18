@@ -1003,6 +1003,8 @@ class FeatureMerger:
 
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
             df = df.dropna(subset=["date"]).sort_values("date")
+            # Normalize to ns precision to match Qlib index
+            df["date"] = df["date"].dt.as_unit("ns")
 
             factor_cols = [c for c in df.columns if c != "date" and df[c].notna().sum() > 10]
             if not factor_cols:
@@ -1013,7 +1015,7 @@ class FeatureMerger:
 
             # Broadcast to all stocks: merge by date only
             date_level = 0
-            train_dates = pd.to_datetime(index.get_level_values(date_level))
+            train_dates = pd.to_datetime(index.get_level_values(date_level)).as_unit("ns")
 
             # merge_asof on date (market-level, same for all stocks on same date)
             left = pd.DataFrame({"date": train_dates, "_pos": range(len(train_dates))})
