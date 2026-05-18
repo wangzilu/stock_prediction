@@ -431,6 +431,11 @@ class FeatureMerger:
         if st_holder is not None:
             frames.append(st_holder)
 
+        # Cross-market regime signals (恒生/纳指 - broadcast to all stocks per date)
+        cross_mkt = self._load_cross_market_regime(index)
+        if cross_mkt is not None:
+            frames.append(cross_mkt)
+
         if not frames:
             return None
 
@@ -978,6 +983,60 @@ class FeatureMerger:
             return result
         except Exception as e:
             logger.warning(f"ST holder_number load failed: {e}")
+            return None
+
+    def _load_cross_market_regime(self, index: pd.MultiIndex) -> pd.DataFrame | None:
+        """Load cross-market regime signals (恒生/纳指) and broadcast to all stocks.
+
+        These are market-level signals (same value for all stocks on a given date).
+        恒生/恒生科技 are leading indicators for A-share (faster price discovery).
+        纳斯达克 tech themes propagate to A-share with 1-3 day delay.
+        """
+        path = self.data_dir / "cross_market_indices.parquet"
+        if not path.exists():
+            return None
+
+        try:
+            df = pd.read_parquet(path)
+            if df.empty or "date" not in df.columns:
+                return None
+
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date"]).sort_values("date")
+
+            factor_cols = [c for c in df.columns if c != "date" and df[c].notna().sum() > 10]
+            if not factor_cols:
+                return None
+
+            for c in factor_cols:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+            # Broadcast to all stocks: merge by date only
+            date_level = 0
+            train_dates = pd.to_datetime(index.get_level_values(date_level))
+
+            # merge_asof on date (market-level, same for all stocks on same date)
+            left = pd.DataFrame({"date": train_dates, "_pos": range(len(train_dates))})
+            left = left.sort_values("date")
+            right = df[["date"] + factor_cols].drop_duplicates("date").sort_values("date")
+
+            merged = pd.merge_asof(left, right, on="date", direction="backward")
+
+            result_arrays = {}
+            for col in factor_cols:
+                arr = np.full(len(index), np.nan, dtype=np.float64)
+                for _, row in merged.iterrows():
+                    pos = int(row["_pos"])
+                    arr[pos] = row[col] if pd.notna(row.get(col)) else np.nan
+                result_arrays[col] = arr
+
+            result = pd.DataFrame(result_arrays, index=index)
+            n_nonnull = result.notna().any(axis=1).sum()
+            logger.info(f"Cross-market regime: {len(factor_cols)} factors, "
+                        f"{n_nonnull} non-null rows")
+            return result
+        except Exception as e:
+            logger.warning(f"Cross-market regime load failed: {e}")
             return None
 
 
