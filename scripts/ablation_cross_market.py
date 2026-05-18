@@ -122,7 +122,10 @@ def main():
             segs_regime = {}
             for seg in ["train", "valid", "test"]:
                 X, y = prepare_features_174(dataset, seg, merger)
-                # Cross-market features are now auto-loaded by FeatureMerger
+                # Manually add cross-market regime features
+                cross_mkt = merger._load_cross_market_regime(X.index)
+                if cross_mkt is not None and not cross_mkt.empty:
+                    X = X.join(cross_mkt, how="left")
                 Xn = X.values.astype(np.float32)
                 yn = y.values.astype(np.float32)
                 mask = np.isfinite(yn)
