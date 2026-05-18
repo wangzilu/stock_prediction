@@ -1013,24 +1013,21 @@ class FeatureMerger:
             for c in factor_cols:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
 
-            # Broadcast to all stocks: merge by date only
+            # Broadcast to all stocks: merge by date only (vectorized)
             date_level = 0
             train_dates = pd.to_datetime(index.get_level_values(date_level)).as_unit("ns")
 
-            # merge_asof on date (market-level, same for all stocks on same date)
-            left = pd.DataFrame({"date": train_dates, "_pos": range(len(train_dates))})
-            left = left.sort_values("date")
+            # Build date-only lookup: unique dates → regime values
             right = df[["date"] + factor_cols].drop_duplicates("date").sort_values("date")
+            unique_dates = pd.DataFrame({"date": train_dates.unique()}).sort_values("date")
+            date_map = pd.merge_asof(unique_dates, right, on="date", direction="backward")
+            date_map = date_map.set_index("date")
 
-            merged = pd.merge_asof(left, right, on="date", direction="backward")
-
+            # Vectorized broadcast: map each training date to its regime values
             result_arrays = {}
             for col in factor_cols:
-                arr = np.full(len(index), np.nan, dtype=np.float64)
-                for _, row in merged.iterrows():
-                    pos = int(row["_pos"])
-                    arr[pos] = row[col] if pd.notna(row.get(col)) else np.nan
-                result_arrays[col] = arr
+                mapped = date_map[col].reindex(train_dates.values).values
+                result_arrays[col] = mapped.astype(np.float64)
 
             result = pd.DataFrame(result_arrays, index=index)
             n_nonnull = result.notna().any(axis=1).sum()
