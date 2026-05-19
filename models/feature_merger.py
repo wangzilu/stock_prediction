@@ -540,6 +540,12 @@ class FeatureMerger:
         factor_cols = ["flow_net_mf_latest", "flow_net_mf_5d", "flow_net_mf_20d_avg"]
         flow_daily = df[["qlib_code", "trade_date"] + factor_cols].copy()
 
+        # PIT safety: capital flow data is published after market close on day T,
+        # so it should only be available for predictions on T+1.
+        # Shifting trade_date forward by 1 business day enforces lag1 alignment.
+        # (PIT audit confirmed flow_lag1 RankIC +0.043 > flow_lag0 +0.038)
+        flow_daily["trade_date"] = flow_daily["trade_date"] + pd.tseries.offsets.BDay(1)
+
         # Asof merge with training index
         result = self._asof_merge_timeseries(flow_daily, index, "trade_date", factor_cols)
         if result is not None:
