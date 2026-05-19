@@ -991,3 +991,383 @@ CX 指出现有后加因子（scripts/phase2_factor_ablation.py line 81）处理
 - 最值得重做：moneyflow / northbound / block_trade / top_inst / forecast / CYQ
 - 做风险过滤：pledge / margin / holder_num
 - 建议开 Phase 4I enhanced factor lab，先做 residual IC 预筛，不直接污染 champion
+
+---
+
+## 10. Audit of Existing 174 Baseline Features (16 non-Alpha158)
+
+**Date:** 2026-05-18
+**Author:** CC
+**Source files audited:**
+- `models/feature_pipeline.py` lines 18-34 (CUSTOM_EXPRS, CUSTOM_NAMES -- 13 features)
+- `models/feature_merger.py` lines 512-554 (`_load_capital_flow_from_history()` -- 3 features)
+
+### 10.0 Critical Finding: Normalization Gap
+
+**Alpha158 features (158 dims)** are self-normalizing by design. They use ratios, returns, rolling z-scores, and rank-based expressions internally (e.g., `$close / Ref($close, 5) - 1`, `Std($volume, 5) / Std($volume, 10)`). The default Alpha158 handler in Qlib applies `DropnaLabel` + `CSZScoreNorm` on **label only** (confirmed in `scripts/experiment_processors.py` lines 104-109). The features themselves are NOT globally normalized, but they are already scale-invariant ratios.
+
+**The 16 non-Alpha158 features bypass ALL normalization.** In `feature_pipeline.py` lines 81-89, custom Qlib expressions are fetched via `D.features()` and joined directly to X with only `inf -> NaN` replacement. In `feature_merger.py` lines 536-538, flow features are raw yuan amounts. No cross-sectional rank, no z-score, no winsorization.
+
+**This is a major engineering gap.** Some of the 16 features are raw levels (PE in absolute units, net money flow in yuan), while Alpha158 features are all ratios. XGB can still split on raw levels, but:
+1. Raw levels conflate cross-sectional signal with stock-level baseline (a stock with PE=50 always has PE=50)
+2. Outliers in raw amounts (e.g., a mega-cap with 10B yuan flow vs. small-cap with 10M) distort tree splits
+3. The model must waste splitting capacity learning what cross-sectional rank would provide for free
+
+**Recommendation:** At minimum, apply per-day cross-sectional rank (`groupby(date).rank(pct=True)`) to all 16 features. The FeatureMerger already has `_preprocess_supplementary()` with rank mode (lines 73-150), but the 174-dim pipeline in `feature_pipeline.py` does NOT call it -- it joins raw values directly.
+
+---
+
+### 10.1 Custom Feature #1: `pe` -- Raw PE Ratio
+
+**Expression:** `$pe`
+**What it computes:** Raw price-to-earnings ratio from Qlib's daily data. Absolute level, unbounded, can be negative.
+
+**Issues:**
+- **Not normalized.** PE=10 (banks) vs PE=200 (biotech) is a structural industry effect, not alpha.
+- **Outliers.** Stocks with near-zero earnings have PE in thousands or negative. `inf -> NaN` handles infinity but not extreme values like PE=5000.
+- **Partial redundancy.** Alpha158 does NOT contain PE directly, but `ep` (feature #11 below) is 1/PE, which is the inverse. Having both `pe` and `ep` means XGB gets the same information twice with different scaling.
+
+**v2 proposal:**
+- Remove raw `pe` in favor of `ep` (1/PE is better behaved near zero earnings).
+- If kept, apply per-day cross-sectional rank: `pe_rank = pe.groupby(date).rank(pct=True)`.
+- Better: industry-relative PE rank using `industry_mapping.parquet` (5523 stocks x 110 industries).
+
+---
+
+### 10.2 Custom Feature #2: `pb` -- Raw PB Ratio
+
+**Expression:** `$pb`
+**What it computes:** Raw price-to-book ratio. Absolute level.
+
+**Issues:**
+- Same normalization issues as PE. PB=1 (banks) vs PB=15 (tech) is industry structure.
+- Partial redundancy with `bp` (feature #12, which is 1/PB).
+- Alpha158 does NOT contain PB directly, so this is genuinely new information -- but only if properly normalized.
+
+**v2 proposal:**
+- Remove raw `pb` in favor of `bp` (1/PB), or keep only one.
+- Apply industry-relative rank: banks having low PB is not informative, but a bank with PB lower than other banks IS.
+- Alternative: PB percentile within its own 250-day history (`pb_ts_pctl = pb.groupby(stock).rank(pct=True, rolling=250)`).
+
+---
+
+### 10.3 Custom Feature #3: `turn_raw` -- Raw Turnover Rate
+
+**Expression:** `$turn`
+**What it computes:** Daily turnover rate (volume / float shares). Absolute level.
+
+**Issues:**
+- **Redundant with Alpha158.** Alpha158 includes `TURN0` (today's turnover), `TURN5` (5-day mean turnover), and related volume features like `VSTD5/10/20` (volume standard deviation). Raw `$turn` is identical to `TURN0`.
+- This feature is almost certainly adding zero incremental value.
+
+**v2 proposal:**
+- **REMOVE.** Already in Alpha158 as TURN0. Keeping it wastes one XGB split dimension and adds noise.
+
+---
+
+### 10.4 Custom Feature #4: `amount_raw` -- Raw Trading Amount
+
+**Expression:** `$amount`
+**What it computes:** Daily trading value in yuan. Absolute level, varies from millions (micro-cap) to tens of billions (mega-cap).
+
+**Issues:**
+- **Not normalized.** Raw amount is almost perfectly correlated with market cap. XGB learns "big stock vs small stock" rather than any alpha signal.
+- **Redundant with Alpha158.** Alpha158 includes `VWAP0` (volume-weighted average price) and volume-related features. Raw amount ~ price x volume, both of which are in Alpha158.
+- **Extreme range.** Kweichow Moutai might have 5B daily amount while a micro-cap has 5M. This 1000x range distorts tree splits.
+
+**v2 proposal:**
+- **REMOVE** raw amount. It is redundant with Alpha158 volume features and confounded with market cap.
+- If amount information is desired, use `amount_anom20` (feature #9) which is already the ratio version.
+
+---
+
+### 10.5 Custom Feature #5: `pe_mom20` -- PE 20-Day Momentum
+
+**Expression:** `$pe / Ref($pe, 20) - 1`
+**What it computes:** 20-day percent change in PE ratio. Self-normalizing ratio.
+
+**Issues:**
+- **Reasonably well-engineered.** This is a ratio, so it is scale-invariant. No urgent normalization issue.
+- **Window choice.** 20 days is reasonable for momentum, but PE changes slowly (driven by quarterly earnings updates). 60-day window may capture earnings-release-driven PE shifts better.
+- **Partial redundancy.** PE change = (price change) - (earnings change). Since earnings update quarterly, PE momentum over 20 days is mostly price momentum, which Alpha158 already has as `KLEN20` (20-day return). The incremental signal comes only from the earnings-change component.
+- **Outlier risk.** When `Ref($pe, 20)` is near zero, this ratio explodes. No clipping is applied.
+
+**v2 proposal:**
+- Add 60-day version: `pe_mom60 = $pe / Ref($pe, 60) - 1` (captures quarterly earnings shifts).
+- Clip to [-2, 2] to handle outliers from near-zero denominators.
+- Consider `pe_surprise = pe_mom20 - KLEN20` (PE change NOT explained by price change = pure earnings surprise).
+- Cross-sectional rank per day would make it more robust.
+
+---
+
+### 10.6 Custom Feature #6: `pb_mom20` -- PB 20-Day Momentum
+
+**Expression:** `$pb / Ref($pb, 20) - 1`
+**What it computes:** 20-day percent change in PB ratio.
+
+**Issues:**
+- Same as `pe_mom20`. PB changes even more slowly than PE (book value updates quarterly).
+- Over 20 days, PB momentum is almost entirely price momentum.
+- Same outlier risk with near-zero denominators.
+
+**v2 proposal:**
+- Extend to 60-day: `pb_mom60 = $pb / Ref($pb, 60) - 1`.
+- Extract pure book-value signal: `pb_surprise = pb_mom20 - KLEN20`.
+- Cross-sectional rank per day.
+
+---
+
+### 10.7 Custom Feature #7: `turn_anom20` -- Turnover Anomaly (20-day)
+
+**Expression:** `$turn / Mean($turn, 20)`
+**What it computes:** Today's turnover divided by its 20-day moving average. Values > 1 mean higher-than-usual turnover.
+
+**Issues:**
+- **Well-engineered.** This is a self-normalizing ratio centered around 1.0. It measures relative activity.
+- **Partial redundancy with Alpha158.** Alpha158 contains `WVMA5/10/20` (volume-weighted moving average ratios) and `VSTD5/10/20` (volume standard deviation). `turn_anom20` is similar to `Mean($volume, 1) / Mean($volume, 20)` which is close to one of Alpha158's volume ratio features. However, turnover (volume/float) is subtly different from raw volume because it normalizes by float shares. This gives genuine incremental information for stocks with recent share issuance/buyback.
+- **Distribution.** The ratio can spike to 10-50x during limit-up/down or event-driven trading. No clipping applied.
+
+**v2 proposal:**
+- Add clipping: `turn_anom20.clip(0.01, 10)` to handle extreme spikes.
+- Log-transform: `np.log(turn_anom20)` centers the distribution and handles right skew.
+- Keep -- it is NOT fully redundant because turnover normalizes by float shares while Alpha158 uses raw volume.
+
+---
+
+### 10.8 Custom Feature #8: `turn_anom60` -- Turnover Anomaly (60-day)
+
+**Expression:** `$turn / Mean($turn, 60)`
+**What it computes:** Today's turnover divided by 60-day moving average.
+
+**Issues:**
+- Same structure as `turn_anom20` but longer window. Captures medium-term activity shifts (e.g., a stock transitioning from dormant to actively traded over weeks).
+- **Moderate redundancy** with `turn_anom20` -- correlation between them is typically 0.6-0.8. The 60-day version is more stable but slower to react.
+- Same outlier risk as `turn_anom20`.
+
+**v2 proposal:**
+- Keep, but clip and log-transform same as `turn_anom20`.
+- Consider replacing with `turn_accel = turn_anom20 / turn_anom60` (acceleration: is short-term anomaly increasing relative to medium-term?). This would be more orthogonal to either alone.
+
+---
+
+### 10.9 Custom Feature #9: `amount_anom20` -- Amount Anomaly (20-day)
+
+**Expression:** `$amount / Mean($amount, 20)`
+**What it computes:** Today's trading amount divided by 20-day average amount. Self-normalizing ratio.
+
+**Issues:**
+- **Redundant with `turn_anom20`.** Amount = price x volume. Turnover = volume / float. Over 20 days, price changes are small, so amount_anom20 and turn_anom20 are highly correlated (typically r > 0.95). The only difference is the price-change component, which Alpha158 already captures.
+- **Redundant with Alpha158.** Alpha158's volume ratio features capture the same relative-volume signal.
+
+**v2 proposal:**
+- **REMOVE.** Near-duplicate of `turn_anom20`. The marginal information (price component) is already in Alpha158.
+- If kept, must be cross-sectional ranked to avoid conflation with size.
+
+---
+
+### 10.10 Custom Feature #10: `turn_vol20` -- Turnover Volatility (20-day)
+
+**Expression:** `Std($turn, 20)`
+**What it computes:** 20-day rolling standard deviation of daily turnover.
+
+**Issues:**
+- **Not normalized.** This is an absolute standard deviation. A liquid large-cap with mean turn=2% will have Std(turn)=0.5%, while an illiquid micro-cap with mean turn=0.3% might have Std(turn)=0.1%. The feature captures size/liquidity, not volatility regime.
+- **Partial redundancy with Alpha158.** Alpha158 includes `VSTD5/10/20/30/60` which are volume standard deviations. `turn_vol20` is the turnover analog.
+- The absolute Std has a highly right-skewed distribution.
+
+**v2 proposal:**
+- Normalize as coefficient of variation: `turn_cv20 = Std($turn, 20) / Mean($turn, 20)`. This makes it scale-invariant and measures "how erratic is turnover relative to its level?"
+- Alternative: cross-sectional rank per day.
+- Consider: `turn_vol_change = Std($turn, 20) / Std($turn, 60)` (is recent volatility elevated compared to longer history?).
+
+---
+
+### 10.11 Custom Feature #11: `ep` -- Earnings Yield (1/PE)
+
+**Expression:** `1.0 / If(Abs($pe) > 0.01, $pe, 1.0)`
+**What it computes:** Inverse of PE (earnings/price), with protection against division by zero.
+
+**Issues:**
+- **Better than raw PE** because it is bounded and well-behaved (small positive values for growth stocks, large values for value stocks). The guard `If(Abs($pe) > 0.01, $pe, 1.0)` returns 1.0 when PE is near zero, which maps to ep=1.0 -- a reasonable default.
+- **Not cross-sectionally normalized.** Industry effects dominate: bank ep=0.15 vs tech ep=0.01. Without industry adjustment, the model learns industry membership, not relative value.
+- **Redundant with raw `pe` (feature #1).** ep = 1/pe is a monotonic transformation. XGB can learn the same splits from either.
+
+**v2 proposal:**
+- Keep `ep`, remove raw `pe` (ep is better scaled).
+- **Critical improvement:** industry-relative ep. `ep_ind_rank = ep.groupby([date, industry]).rank(pct=True)`.
+- Time-series version: `ep_ts_zscore = (ep - ep.rolling(250).mean()) / ep.rolling(250).std()` -- "Is this stock cheap relative to its OWN history?"
+- Interaction: `ep x momentum` -- value stocks with improving momentum (value + momentum combination is well-documented alpha source, Asness 2013).
+
+---
+
+### 10.12 Custom Feature #12: `bp` -- Book Yield (1/PB)
+
+**Expression:** `1.0 / If(Abs($pb) > 0.01, $pb, 1.0)`
+**What it computes:** Inverse of PB (book/price).
+
+**Issues:**
+- Same analysis as `ep`. Better scaled than raw PB. Redundant with raw `pb` (feature #2).
+- Same industry-effect problem.
+- Not normalized.
+
+**v2 proposal:**
+- Keep `bp`, remove raw `pb`.
+- Industry-relative bp rank.
+- Time-series z-score vs own 250-day history.
+- Consider `bp - ep` or `pb/pe` as a DuPont decomposition proxy (ROE = EPS/BPS = ep/bp).
+
+---
+
+### 10.13 Custom Feature #13: `price_pos20` -- 20-Day Price Position
+
+**Expression:** `($close - Min($close, 20)) / (Max($close, 20) - Min($close, 20) + 1e-8)`
+**What it computes:** Position of current close within its 20-day high-low range. Bounded [0, 1].
+
+**Issues:**
+- **Well-engineered.** Self-normalizing, bounded, meaningful interpretation (0 = at 20-day low, 1 = at 20-day high).
+- **Redundant with Alpha158.** Alpha158 includes `HIGH0/LOW0` (daily high/low), `KLOW`/`KHIGH` features, and specifically `MAX5/10/20/30/60` and `MIN5/10/20/30/60` which compute similar range-relative positions. The expression `($close - Min($close, 20)) / (Max($close, 20) - Min($close, 20))` is essentially the same as Alpha158's `KSFT20` (or similar stochastic-like features).
+- Cross-sectional variation is naturally present because the ratio is stock-specific.
+
+**v2 proposal:**
+- **Likely redundant** -- check correlation with Alpha158's KSFT/MIN/MAX features. If correlation > 0.9, remove.
+- If kept, consider multi-window: add `price_pos60 = ($close - Min($close, 60)) / (Max($close, 60) - Min($close, 60))`.
+- Interaction: `price_pos20 x turn_anom20` -- breakout signal (price at top of range WITH elevated volume).
+
+---
+
+### 10.14 Flow Feature #14: `flow_net_mf_latest` -- Latest Net Money Flow
+
+**Expression:** Raw `net_mf_amount` from `fund_flow_history.parquet`, lag-1 adjusted (line 547).
+**What it computes:** Most recent day's net main-force money flow in yuan.
+
+**Issues:**
+- **NOT NORMALIZED.** This is an absolute yuan amount. A mega-cap stock might have +500M yuan net flow on a normal day, while the same +500M for a small-cap would be extraordinary. The feature is dominated by market cap.
+- **PIT-safe:** Correctly lag-1 adjusted (line 547: `trade_date + BDay(1)`).
+- **Useful information, terrible encoding.** Net money flow IS predictive (proven by the 174-dim model's existing use), but the raw yuan encoding wastes much of it.
+
+**v2 proposal:**
+- **Normalize by ADV (average daily volume in yuan):** `flow_net_mf_normed = net_mf_amount / Mean($amount, 20)`. This gives "net flow as a fraction of normal trading activity."
+- **Cross-sectional rank per day:** `flow_rank = flow_net_mf_latest.groupby(date).rank(pct=True)`.
+- **Industry-relative:** `flow_ind_rank = flow_net_mf_latest.groupby([date, industry]).rank(pct=True)`.
+- This is CX's recommendation in 9.3: "金额类必须标准化：除以 amount / ADV / circ_mv."
+
+---
+
+### 10.15 Flow Feature #15: `flow_net_mf_5d` -- 5-Day Cumulative Net Money Flow
+
+**Expression:** `x.rolling(5, min_periods=1).sum()` on `net_mf_amount` (line 537).
+**What it computes:** Sum of net main-force money flow over last 5 trading days, in yuan.
+
+**Issues:**
+- Same normalization problem as `flow_net_mf_latest`, amplified by 5x accumulation.
+- **Correlation with `flow_net_mf_latest`:** Typically r > 0.7. The 5-day sum is a smoothed version of the daily value.
+- **Useful for momentum detection** (persistent inflow over a week), but the raw yuan encoding hides this signal behind market cap.
+
+**v2 proposal:**
+- Normalize: `flow_5d_normed = flow_net_mf_5d / (Mean($amount, 20) * 5)`. This gives "cumulative net flow as a fraction of 5 normal days' trading."
+- Better: `flow_5d_zscore = (flow_net_mf_5d - flow_net_mf_5d.rolling(60).mean()) / flow_net_mf_5d.rolling(60).std()` -- "Is this week's flow unusual for this stock?"
+- Cross-sectional rank per day.
+
+---
+
+### 10.16 Flow Feature #16: `flow_net_mf_20d_avg` -- 20-Day Average Net Money Flow
+
+**Expression:** `x.rolling(20, min_periods=1).mean()` on `net_mf_amount` (line 538).
+**What it computes:** 20-day rolling average of daily net main-force money flow, in yuan.
+
+**Issues:**
+- Same normalization problem as the other two flow features.
+- **High correlation** with `flow_net_mf_5d` (typically r > 0.8). The 20-day average is a further-smoothed version.
+- All three flow features encode essentially the same information (net flow magnitude) at different smoothing windows, all in unnormalized yuan.
+
+**v2 proposal:**
+- Same normalization as above.
+- Consider replacing the 3-feature set with: `flow_rank_latest` (daily rank), `flow_zscore_60d` (time-series anomaly), `flow_persistence_10d` (fraction of positive-flow days in last 10). These 3 would be more orthogonal to each other AND to the rest of the baseline.
+
+---
+
+### 10.17 Summary Table: All 16 Features Audited
+
+| # | Feature | Expression | Normalized? | Redundancy | Severity | Recommendation |
+|:---:|:---|:---|:---:|:---|:---:|:---|
+| 1 | `pe` | `$pe` | NO | ep is 1/pe | HIGH | REMOVE (keep ep) |
+| 2 | `pb` | `$pb` | NO | bp is 1/pb | HIGH | REMOVE (keep bp) |
+| 3 | `turn_raw` | `$turn` | NO | Alpha158 TURN0 | CRITICAL | REMOVE (exact duplicate) |
+| 4 | `amount_raw` | `$amount` | NO | Alpha158 volume + size | CRITICAL | REMOVE (conflated with market cap) |
+| 5 | `pe_mom20` | `$pe / Ref($pe, 20) - 1` | Self-ratio | ~KLEN20 (price return) | LOW | KEEP, add 60d, clip outliers |
+| 6 | `pb_mom20` | `$pb / Ref($pb, 20) - 1` | Self-ratio | ~KLEN20 | LOW | KEEP, add 60d, clip outliers |
+| 7 | `turn_anom20` | `$turn / Mean($turn, 20)` | Self-ratio | Similar to WVMA20 | LOW | KEEP, clip + log-transform |
+| 8 | `turn_anom60` | `$turn / Mean($turn, 60)` | Self-ratio | Correlated with #7 | LOW | KEEP or replace with ratio #7/#8 |
+| 9 | `amount_anom20` | `$amount / Mean($amount, 20)` | Self-ratio | ~turn_anom20 (r>0.95) | HIGH | REMOVE (near-duplicate of #7) |
+| 10 | `turn_vol20` | `Std($turn, 20)` | NO | ~VSTD20 | MEDIUM | REPLACE with CV: Std/Mean |
+| 11 | `ep` | `1/If(Abs(pe)>0.01,pe,1)` | Bounded | Redundant with pe (#1) | LOW | KEEP, add industry-relative rank |
+| 12 | `bp` | `1/If(Abs(pb)>0.01,pb,1)` | Bounded | Redundant with pb (#2) | LOW | KEEP, add industry-relative rank |
+| 13 | `price_pos20` | `(close-Min20)/(Max20-Min20)` | Self-ratio [0,1] | ~Alpha158 KSFT/stochastic | MEDIUM | CHECK correlation; remove if >0.9 |
+| 14 | `flow_net_mf_latest` | raw net_mf_amount yuan | NO | None (unique data) | CRITICAL | Normalize by ADV or rank |
+| 15 | `flow_net_mf_5d` | 5d sum of net_mf yuan | NO | Correlated with #14 | CRITICAL | Normalize by ADV*5 or rank |
+| 16 | `flow_net_mf_20d_avg` | 20d avg of net_mf yuan | NO | Correlated with #14,#15 | CRITICAL | Normalize by ADV or rank |
+
+### 10.18 Immediate Action Items (Low-Hanging Fruit)
+
+**Tier 1: Remove pure redundancy (0 effort, reduces noise)**
+1. Remove `turn_raw` (#3) -- exact duplicate of Alpha158 TURN0
+2. Remove `amount_raw` (#4) -- conflated with market cap, Alpha158 has volume
+3. Remove `pe` (#1) -- keep `ep` instead
+4. Remove `pb` (#2) -- keep `bp` instead
+5. Remove `amount_anom20` (#9) -- near-duplicate of `turn_anom20`
+
+Result: 174 -> 169 features. Removing 5 noisy/redundant features should IMPROVE performance slightly by reducing feature dilution.
+
+**Tier 2: Normalize flow features (1 hour effort, potentially large impact)**
+6. Replace `flow_net_mf_latest` with `flow_latest_rank = flow_net_mf_latest.groupby(date).rank(pct=True)`
+7. Replace `flow_net_mf_5d` with `flow_5d_rank = flow_net_mf_5d.groupby(date).rank(pct=True)`
+8. Replace `flow_net_mf_20d_avg` with `flow_20d_rank = flow_net_mf_20d_avg.groupby(date).rank(pct=True)`
+
+This is a trivial code change in `feature_pipeline.py` (add 3 lines of groupby.rank after the join), but could meaningfully improve the flow features' contribution by removing the market-cap confound.
+
+**Tier 3: Fix remaining unnormalized features (2 hour effort)**
+9. Replace `turn_vol20` with `turn_cv20 = Std($turn, 20) / Mean($turn, 20)`
+10. Add cross-sectional rank to `ep` and `bp`
+11. Clip `pe_mom20` and `pb_mom20` to [-2, 2]
+
+**Tier 4: Add missing multi-window + interactions (1 day effort)**
+12. Add `pe_mom60`, `pb_mom60` (60-day valuation momentum)
+13. Add `turn_accel = turn_anom20 / turn_anom60` (turnover acceleration)
+14. Add `ep_ind_rank` and `bp_ind_rank` (industry-relative valuation)
+15. Add `price_pos20 x turn_anom20` interaction (breakout signal)
+16. Add `ep x KLEN20` interaction (value + momentum)
+
+### 10.19 Estimated Impact
+
+The 174-dim baseline achieves RankIC +0.0513. Based on this audit:
+
+- **Tier 1 (remove 5 features):** Expected delta +0.001 to +0.003 RankIC. Feature dilution is a real problem with colsample_bytree=0.88; removing noise features gives useful features more splits.
+- **Tier 2 (normalize 3 flow features):** Expected delta +0.002 to +0.005 RankIC. Flow features carry proven signal (they were the reason to go from 158 to 161 dims), but raw yuan encoding wastes much of it.
+- **Tier 3 (fix remaining normalization):** Expected delta +0.001 to +0.002 RankIC. Smaller impact because these features are less dominant.
+- **Tier 4 (new engineered features):** Speculative, but industry-relative valuation and interaction terms could add +0.003 to +0.008 RankIC based on academic evidence.
+
+**Combined realistic estimate:** +0.005 to +0.010 RankIC improvement WITHOUT any new data sources, just by fixing engineering deficiencies in the existing 16 features. This would bring the baseline from +0.051 to potentially +0.056-0.061, a meaningful improvement.
+
+### 10.20 Implementation Location
+
+All changes should be made in `models/feature_pipeline.py`:
+- Remove redundant expressions from `CUSTOM_EXPRS` / `CUSTOM_NAMES`
+- Add normalization after the `X = X.join(custom[new_cols], how="left")` step (line 89)
+- For flow normalization, add a post-join step after `X = X.join(flow, how="left")` (line 77)
+
+```python
+# After line 77 (flow join):
+if flow is not None:
+    flow_cols = [c for c in flow.columns if c in X.columns]
+    for c in flow_cols:
+        X[c] = X[c].groupby(level=0).rank(pct=True)
+
+# After line 89 (custom join):
+# Cross-sectional rank for raw-level features
+rank_cols = ["ep", "bp", "turn_vol20"]  # Only unnormalized customs
+for c in rank_cols:
+    if c in X.columns:
+        X[c] = X[c].groupby(level=0).rank(pct=True)
+```
+
+This preserves backward compatibility (same column names, same column count after Tier 1 removal) while fixing the normalization gap.
