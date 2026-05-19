@@ -87,28 +87,24 @@ def shuffle_within_date(df: pd.DataFrame) -> pd.DataFrame:
             break
 
     if is_market_level:
-        # Market-level: shuffle date → value mapping (break temporal signal)
-        logger.info("  Detected market-level factor, using DATE shuffle")
+        # Market-level: shuffle date → value mapping (vectorized)
+        logger.info("  Detected market-level factor, using DATE shuffle (vectorized)")
         dates = sorted(result.index.get_level_values(0).unique())
-        date_vals = {}
-        for col in result.columns:
-            # Get one value per date
-            vals_per_date = []
-            for d in dates:
-                mask = result.index.get_level_values(0) == d
-                v = result.loc[mask, col].dropna()
-                vals_per_date.append(v.iloc[0] if len(v) > 0 else np.nan)
-            arr = np.array(vals_per_date)
-            finite = np.isfinite(arr)
-            arr_finite = arr[finite].copy()
-            rng.shuffle(arr_finite)
-            arr[finite] = arr_finite
-            date_vals[col] = dict(zip(dates, arr))
 
-        # Rebuild with shuffled date mapping
+        # Extract one value per date per column (fast: groupby first)
+        date_level_vals = result.groupby(level=0).first()  # (n_dates, n_cols)
+
+        # Shuffle the date index
+        shuffled_dates = list(dates)
+        rng.shuffle(shuffled_dates)
+        date_remap = dict(zip(dates, shuffled_dates))
+
+        # Remap: each original date gets the values from a random other date
+        train_dates = result.index.get_level_values(0)
+        mapped_dates = train_dates.map(date_remap)
+
         for col in result.columns:
-            dmap = date_vals[col]
-            result[col] = result.index.get_level_values(0).map(dmap)
+            result[col] = date_level_vals[col].reindex(mapped_dates).values
     else:
         # Stock-level: shuffle instruments within each date
         logger.info("  Detected stock-level factor, using INSTRUMENT shuffle")
