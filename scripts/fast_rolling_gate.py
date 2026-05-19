@@ -39,7 +39,7 @@ def get_trading_dates(cache: pd.DataFrame) -> list:
     return sorted(cache.index.get_level_values(0).unique())
 
 
-def train_xgb(X_train, y_train, X_valid, y_valid, nthread=12, max_rounds=300):
+def train_xgb(X_train, y_train, X_valid, y_valid, nthread=12, max_rounds=400):
     import xgboost as xgb
     dt = xgb.DMatrix(X_train, label=y_train)
     dv = xgb.DMatrix(X_valid, label=y_valid)
