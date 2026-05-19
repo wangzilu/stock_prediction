@@ -1371,3 +1371,38 @@ for c in rank_cols:
 ```
 
 This preserves backward compatibility (same column names, same column count after Tier 1 removal) while fixing the normalization gap.
+
+---
+
+## 11. CX Final Review (2026-05-20)
+
+### 11.1 CX 7 条补充建议（全部采纳）
+
+1. **不直接改 champion，新建 FS-174v2** — 作为实验跑完整 gate
+2. **Tier 1 做四档对照** — FS-174 / FS-169-drop / FS-174-rank / FS-169-rank（已实现，在跑）
+3. **Flow 不只做 rank，保留 3 种表达** — flow_norm(net_mf/ADV20)、flow_rank、flow_z60、flow_persist10
+4. **PCA 先不做** — 日截面 PCA 方向不稳定，先用固定经济含义 composite
+5. **top_inst 是龙虎榜机构席位交易，不是调研** — 走短事件衰减 1/3/5/10 日
+6. **holder_num 不写死 ABANDON** — 保留 qoq_change + 交互项作为低优先级研究
+7. **补因子合同表**
+
+### 11.2 因子合同表（CX 要求）
+
+| 因子组 | effective_date | lag | max_age | 缺失处理 | 预筛指标 |
+|------|------|:---:|------|------|------|
+| moneyflow | trade_date+1BDay | 1 | 20d rolling | NaN/rank neutral | residual IC |
+| forecast | ann_date+1BDay | 1 | 90/120d | no event=0 + flag | event-study |
+| block_trade | trade_date+1BDay | 1 | 60d | no event=0 | matched non-event |
+| top_inst | trade_date+1BDay | 1 | 10d (短事件) | no event=0 | matched non-event |
+| pledge | end_date or ann_date | conservative | 180d | stale flag | risk drawdown |
+| CYQ | trade_date+1BDay | 1 | daily | NaN | residual IC |
+| northbound | trade_date+1BDay | 1 | 20d rolling | NaN/rank neutral | residual IC |
+| 两融 | trade_date+1BDay | 1 | 20d rolling | NaN | 风险过滤 |
+
+### 11.3 执行顺序（CX 确认）
+
+1. **FS-174v2 四档对照** — 验证工程缺陷（在跑）
+2. **flow_v2** — 3 种表达 + composite
+3. **事件框架** — block_trade + top_inst + forecast
+4. **CYQ + holder 交互** — 低优先级
+5. **质押/两融** — 风险过滤，不进 alpha
