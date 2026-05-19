@@ -139,11 +139,15 @@ def main():
             logger.warning(f"  Empty!")
 
     # Fetch US index
+    # CRITICAL: NASDAQ T close = China T+1 4am CST. Must shift +1 bday for PIT safety.
     logger.info(f"Fetching 纳斯达克 (IXIC)...")
     df_us = fetch_us_index("IXIC", args.start)
     if not df_us.empty:
         logger.info(f"  Got {len(df_us)} rows, {df_us['date'].min()} ~ {df_us['date'].max()}")
         features = compute_regime_features(df_us, "nasdaq")
+        # Shift NASDAQ dates +1 business day: US date T → available for China T+1
+        features["date"] = features["date"] + pd.tseries.offsets.BDay(1)
+        logger.info(f"  NASDAQ dates shifted +1 bday for PIT safety")
         all_features.append(features)
     else:
         logger.warning(f"  Empty!")
