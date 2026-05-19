@@ -1,7 +1,7 @@
-"""Collect daily stock news from AKShare and save as JSONL.
+"""Collect daily stock news from ST_CLIENT (primary) or AKShare (fallback).
 
 Usage:
-    python -m scripts.collect_daily_news [--date 2024-01-15] [--portfolio]
+    python scripts/collect_daily_news.py [--date 2024-01-15] [--portfolio]
 
 By default collects news for the top 100 most liquid A-share stocks.
 With --portfolio, collects only for stocks in the current Top20 portfolio.
@@ -11,11 +11,15 @@ Output: data/storage/daily_news/YYYY-MM-DD.jsonl
 import argparse
 import json
 import logging
+import os
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
-import akshare as ak
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
 import pandas as pd
 
 from config.settings import DATA_DIR
@@ -27,28 +31,51 @@ NEWS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_liquid_stocks(top_n: int = 100) -> list[dict]:
-    """Get top N most liquid A-share stocks by turnover.
+    """Get top N most liquid A-share stocks.
 
-    Returns:
-        List of dicts with keys: code (e.g. '600519'), name, qlib_code (e.g. 'SH600519')
+    Tries ST_CLIENT (reliable) first, AKShare as fallback.
     """
+    # Try ST_CLIENT first
     try:
-        df = ak.stock_zh_a_spot_em()
-        # Filter out ST / delisted
-        df = df[~df["名称"].str.contains("ST|退", na=False)]
-        # Sort by turnover (成交额) descending
-        df = df.sort_values("成交额", ascending=False).head(top_n)
+        from ST_CLIENT import StockToday
+        token_file = PROJECT_ROOT / ".st_token"
+        token = token_file.read_text().strip() if token_file.exists() else ""
+        if token:
+            st = StockToday(token=token)
+            date_str = datetime.now().strftime("%Y%m%d")
+            result = st.bak_basic(trade_date=date_str)
+            if isinstance(result, list) and result:
+                df = pd.DataFrame(result)
+                df = df[~df["name"].str.contains("ST|退", na=False)]
+                df = df.head(top_n)
+                results = []
+                for _, row in df.iterrows():
+                    ts = str(row["ts_code"])
+                    code = ts[:6]
+                    prefix = "SH" if ts.endswith(".SH") else "SZ"
+                    results.append({
+                        "code": code,
+                        "name": row["name"],
+                        "qlib_code": f"{prefix}{code}",
+                        "ts_code": ts,
+                    })
+                logger.info(f"Got {len(results)} stocks from ST_CLIENT")
+                return results
+    except Exception as e:
+        logger.warning(f"ST_CLIENT failed: {e}")
 
+    # Fallback to AKShare
+    try:
+        import akshare as ak
+        df = ak.stock_zh_a_spot_em()
+        df = df[~df["名称"].str.contains("ST|退", na=False)]
+        df = df.sort_values("成交额", ascending=False).head(top_n)
         results = []
         for _, row in df.iterrows():
             code = str(row["代码"]).zfill(6)
             prefix = "SH" if code.startswith(("6", "9")) else "SZ" if code.startswith(("0", "3")) else "BJ"
-            results.append({
-                "code": code,
-                "name": row["名称"],
-                "qlib_code": f"{prefix}{code}",
-            })
-        logger.info(f"Got {len(results)} liquid stocks")
+            results.append({"code": code, "name": row["名称"], "qlib_code": f"{prefix}{code}"})
+        logger.info(f"Got {len(results)} liquid stocks from AKShare")
         return results
     except Exception as e:
         logger.error(f"Failed to get liquid stocks: {e}")
@@ -99,7 +126,35 @@ def collect_news_for_stock(code: str, name: str, max_items: int = 10) -> list[di
     Returns:
         List of news dicts with standardized fields
     """
+    # Try ST_CLIENT news first (anns_d for announcements)
     try:
+        from ST_CLIENT import StockToday
+        token_file = PROJECT_ROOT / ".st_token"
+        token = token_file.read_text().strip() if token_file.exists() else ""
+        if token:
+            st = StockToday(token=token)
+            ts_code = f"{code}.SH" if code.startswith("6") else f"{code}.SZ"
+            result = st.anns_d(ts_code=ts_code)
+            if isinstance(result, list) and result:
+                records = []
+                for item in result[:max_items]:
+                    records.append({
+                        "stock_code": code,
+                        "stock_name": name,
+                        "title": str(item.get("title", "")),
+                        "content_snippet": str(item.get("content", ""))[:500],
+                        "source": "交易所公告",
+                        "publish_time": str(item.get("ann_date", "")),
+                        "url": str(item.get("url", "")),
+                    })
+                if records:
+                    return records
+    except Exception:
+        pass
+
+    # Fallback to AKShare
+    try:
+        import akshare as ak
         df = ak.stock_news_em(symbol=code)
         if df is None or df.empty:
             return []
