@@ -42,8 +42,13 @@ def get_liquid_stocks(top_n: int = 100) -> list[dict]:
         token = token_file.read_text().strip() if token_file.exists() else ""
         if token:
             st = StockToday(token=token)
-            date_str = datetime.now().strftime("%Y%m%d")
-            result = st.bak_basic(trade_date=date_str)
+            # Use yesterday's date (today's data may not be available yet)
+            from datetime import timedelta
+            for days_back in range(0, 5):
+                date_str = (datetime.now() - timedelta(days=days_back)).strftime("%Y%m%d")
+                result = st.bak_basic(trade_date=date_str)
+                if isinstance(result, list) and len(result) > 100:
+                    break
             if isinstance(result, list) and result:
                 df = pd.DataFrame(result)
                 df = df[~df["name"].str.contains("ST|退", na=False)]
@@ -62,7 +67,9 @@ def get_liquid_stocks(top_n: int = 100) -> list[dict]:
                 logger.info(f"Got {len(results)} stocks from ST_CLIENT")
                 return results
     except Exception as e:
-        logger.warning(f"ST_CLIENT failed: {e}")
+        logger.warning(f"ST_CLIENT stock list failed: {e}")
+        import traceback
+        traceback.print_exc()
 
     # Fallback to AKShare
     try:
