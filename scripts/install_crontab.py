@@ -80,6 +80,7 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         ),
         CronJob("lgb_after_close_train", "15 18 * * 1-5", [py, str(scripts / "train_lgb.py")], "lgb_after_close_train.log"),
         CronJob("lgb_after_close_smoke", "35 18 * * 1-5", [py, str(scripts / "smoke_lgb_predict.py")], "lgb_after_close_smoke.log"),
+        CronJob("shadow_daily_compare", "40 18 * * 1-5", [py, str(scripts / "shadow_daily_inference.py")], "shadow_daily.log"),
         CronJob("factor_decay_monitor", "45 18 * * 1-5", [py, str(scripts / "monitor_factor_decay.py")], "factor_decay.log"),
         CronJob("brinson_attribution", "50 18 * * 1-5", [py, str(scripts / "run_brinson_attribution.py")], "brinson_attribution.log"),
         CronJob("nightly_train", "0 4 * * *", [py, str(scripts / "nightly_train.py")], "train.log"),
