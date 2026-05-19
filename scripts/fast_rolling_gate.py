@@ -73,6 +73,53 @@ def evaluate(pred, label, index):
     }
 
 
+def _run_one_split(args_tuple):
+    """Worker function for parallel splits. No Qlib dependency."""
+    (split_idx, X_train, y_train, X_valid, y_valid, X_test, y_test,
+     test_idx_values, test_idx_tuples, feature_sets_cols, n_splits) = args_tuple
+
+    import xgboost as xgb
+    results = {"split": split_idx + 1}
+
+    for fs_name, col_indices in feature_sets_cols.items():
+        t1 = time.time()
+        Xtr = X_train[:, col_indices]
+        Xva = X_valid[:, col_indices]
+        Xte = X_test[:, col_indices]
+
+        model = train_xgb(Xtr, y_train, Xva, y_valid)
+        pred = model.predict(xgb.DMatrix(Xte))
+
+        # Inline evaluate (no Qlib dependency)
+        mask = np.isfinite(pred) & np.isfinite(y_test)
+        ps = pd.Series(pred[mask], index=pd.MultiIndex.from_tuples(
+            [test_idx_tuples[i] for i in range(len(mask)) if mask[i]]))
+        ls = pd.Series(y_test[mask], index=ps.index)
+
+        # Rank IC
+        ric_vals = []
+        spreads = []
+        for date in ps.index.get_level_values(0).unique():
+            p_day = ps.loc[date]
+            l_day = ls.loc[date]
+            if len(p_day) < 40:
+                continue
+            ric_vals.append(float(p_day.corr(l_day, method="spearman")))
+            s = pd.DataFrame({"p": p_day, "l": l_day}).sort_values("p", ascending=False)
+            spreads.append(s.head(20)["l"].mean() - s.tail(20)["l"].mean())
+
+        ric_arr = np.array(ric_vals)
+        metrics = {
+            "rank_ic_mean": round(float(np.nanmean(ric_arr)), 6) if len(ric_arr) > 0 else 0,
+            "rank_ic_pos": round(float(np.nanmean(ric_arr > 0)), 4) if len(ric_arr) > 0 else 0,
+            "top20_spread": round(float(np.mean(spreads)), 6) if spreads else 0,
+            "spread_pos": round(float(np.mean([s > 0 for s in spreads])), 4) if spreads else 0,
+        }
+        results[fs_name] = {"n_feat": len(col_indices), **metrics, "time_s": round(time.time() - t1, 1)}
+
+    return results
+
+
 def main():
     import xgboost as xgb
     from config.qlib_runtime import init_qlib
@@ -90,6 +137,8 @@ def main():
                         help="Run ablation: base vs base+extra columns")
     parser.add_argument("--extra-cols", type=str, default="hsi_*,hstech_*,nasdaq_*",
                         help="Extra column patterns for ablation (comma-separated globs)")
+    parser.add_argument("--parallel", type=int, default=0,
+                        help="Number of parallel workers (0=sequential)")
     args = parser.parse_args()
 
     # Load cache
