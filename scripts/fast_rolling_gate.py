@@ -52,24 +52,34 @@ def train_xgb(X_train, y_train, X_valid, y_valid, nthread=12, max_rounds=400):
 
 
 def evaluate(pred, label, index):
-    from qlib.contrib.eva.alpha import calc_ic
+    """Fast evaluation: argpartition for TopK, scipy spearmanr for RankIC."""
+    from scipy.stats import spearmanr
     mask = np.isfinite(pred) & np.isfinite(label)
     ps = pd.Series(pred[mask], index=index[mask])
     ls = pd.Series(label[mask], index=index[mask])
-    ic, ric = calc_ic(ps, ls)
+
+    ric_vals = []
     spreads = []
-    for _, g in pd.DataFrame({"pred": ps, "label": ls}).groupby(level=0):
-        if len(g) < 40:
+    for date in ps.index.get_level_values(0).unique():
+        p = ps.loc[date].values
+        l = ls.loc[date].values
+        n = len(p)
+        if n < 40:
             continue
-        s = g.sort_values("pred", ascending=False)
-        spreads.append(s.head(20)["label"].mean() - s.tail(20)["label"].mean())
+        corr, _ = spearmanr(p, l)
+        if np.isfinite(corr):
+            ric_vals.append(corr)
+        k = min(20, n // 2)
+        top_idx = np.argpartition(p, -k)[-k:]
+        bot_idx = np.argpartition(p, k)[:k]
+        spreads.append(l[top_idx].mean() - l[bot_idx].mean())
+
+    ric = np.array(ric_vals)
     return {
-        "ic_mean": round(float(ic.mean()), 6),
-        "icir": round(float(ic.mean()) / (float(ic.std()) + 1e-8), 4),
-        "rank_ic_mean": round(float(ric.mean()), 6),
-        "rank_ic_pos": round(float((ric > 0).mean()), 4),
-        "top20_spread": round(float(np.mean(spreads)) if spreads else 0, 6),
-        "spread_pos": round(float(np.mean([s > 0 for s in spreads])) if spreads else 0, 4),
+        "rank_ic_mean": round(float(np.nanmean(ric)), 6) if len(ric) > 0 else 0,
+        "rank_ic_pos": round(float(np.nanmean(ric > 0)), 4) if len(ric) > 0 else 0,
+        "top20_spread": round(float(np.mean(spreads)), 6) if spreads else 0,
+        "spread_pos": round(float(np.mean([s > 0 for s in spreads])), 4) if spreads else 0,
     }
 
 

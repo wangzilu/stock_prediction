@@ -180,58 +180,62 @@ def main():
         logger.error("No factor data loaded!")
         sys.exit(1)
 
-    # Rolling ablation
+    # Rolling ablation — train baseline ONCE per split, reuse for all factors
     all_results = {}
     t_total = time.time()
 
-    for fg, fdf in factor_data.items():
-        logger.info(f"\n{'='*60}")
-        logger.info(f"ABLATION: base vs base+{fg}")
-        logger.info(f"{'='*60}")
+    # Pre-compute split specs
+    split_specs = []
+    dl = cache.index.get_level_values(0)
+    for split_idx in range(args.n_splits):
+        test_end_idx = today_idx - split_idx * args.test_days
+        test_start_idx = test_end_idx - args.test_days
+        valid_end_idx = test_start_idx - 1
+        valid_start_idx = valid_end_idx - args.valid_days
+        train_end_idx = valid_start_idx - 1
+        train_start_idx = train_end_idx - args.train_days
+        if train_start_idx < 0:
+            break
+        split_specs.append({
+            "idx": split_idx,
+            "tm": (dl >= trade_dates[train_start_idx]) & (dl <= trade_dates[train_end_idx]),
+            "vm": (dl >= trade_dates[valid_start_idx]) & (dl <= trade_dates[valid_end_idx]),
+            "em": (dl >= trade_dates[test_start_idx]) & (dl <= trade_dates[test_end_idx]),
+        })
 
-        fg_cols = list(fdf.columns)
-        results = []
+    # Init result storage for each factor
+    for fg in factor_data:
+        all_results[fg] = {"splits": [], "fg_cols": list(factor_data[fg].columns)}
 
-        for split_idx in range(args.n_splits):
-            test_end_idx = today_idx - split_idx * args.test_days
-            test_start_idx = test_end_idx - args.test_days
-            valid_end_idx = test_start_idx - 1
-            valid_start_idx = valid_end_idx - args.valid_days
-            train_end_idx = valid_start_idx - 1
-            train_start_idx = train_end_idx - args.train_days
+    for spec in split_specs:
+        split_idx = spec["idx"]
+        tm, vm, em = spec["tm"], spec["vm"], spec["em"]
 
-            if train_start_idx < 0:
-                break
+        y_tr = cache.loc[tm, label_col].values.astype(np.float32)
+        y_va = cache.loc[vm, label_col].values.astype(np.float32)
+        y_te = cache.loc[em, label_col].values.astype(np.float32)
+        mtr = np.isfinite(y_tr); mva = np.isfinite(y_va); mte = np.isfinite(y_te)
+        test_idx = cache.index[em]
 
-            test_start = trade_dates[test_start_idx]
-            test_end = trade_dates[test_end_idx]
-            train_start = trade_dates[train_start_idx]
-            train_end = trade_dates[train_end_idx]
-            valid_start = trade_dates[valid_start_idx]
-            valid_end = trade_dates[valid_end_idx]
+        # === Train baseline ONCE ===
+        X_tr = cache.loc[tm, base_cols].values.astype(np.float32)
+        X_va = cache.loc[vm, base_cols].values.astype(np.float32)
+        X_te = cache.loc[em, base_cols].values.astype(np.float32)
 
-            dl = cache.index.get_level_values(0)
-            tm = (dl >= train_start) & (dl <= train_end)
-            vm = (dl >= valid_start) & (dl <= valid_end)
-            em = (dl >= test_start) & (dl <= test_end)
+        t1 = time.time()
+        m_base = train_xgb(X_tr[mtr], y_tr[mtr], X_va[mva], y_va[mva])
+        p_base = m_base.predict(xgb.DMatrix(X_te[mte]))
+        e_base = evaluate(p_base, y_te[mte], test_idx[mte])
+        base_time = time.time() - t1
 
-            y_tr = cache.loc[tm, label_col].values.astype(np.float32)
-            y_va = cache.loc[vm, label_col].values.astype(np.float32)
-            y_te = cache.loc[em, label_col].values.astype(np.float32)
-            mtr = np.isfinite(y_tr); mva = np.isfinite(y_va); mte = np.isfinite(y_te)
-            test_idx = cache.index[em]
+        # Compute residual for future use
+        residual = y_te[mte] - p_base
 
-            # Base
-            X_tr = cache.loc[tm, base_cols].values.astype(np.float32)
-            X_va = cache.loc[vm, base_cols].values.astype(np.float32)
-            X_te = cache.loc[em, base_cols].values.astype(np.float32)
+        logger.info(f"\nSplit {split_idx+1}/{len(split_specs)}: "
+                    f"base RankIC={e_base['rank_ic_mean']:+.4f} [{base_time:.0f}s]")
 
-            t1 = time.time()
-            m_base = train_xgb(X_tr[mtr], y_tr[mtr], X_va[mva], y_va[mva])
-            p_base = m_base.predict(xgb.DMatrix(X_te[mte]))
-            e_base = evaluate(p_base, y_te[mte], test_idx[mte])
-
-            # Base + factor
+        # === Test each factor against cached baseline ===
+        for fg, fdf in factor_data.items():
             fg_tr = fdf.loc[tm].values.astype(np.float32)
             fg_va = fdf.loc[vm].values.astype(np.float32)
             fg_te = fdf.loc[em].values.astype(np.float32)
@@ -240,15 +244,16 @@ def main():
             X_va2 = np.hstack([X_va, fg_va])
             X_te2 = np.hstack([X_te, fg_te])
 
+            t2 = time.time()
             m_plus = train_xgb(X_tr2[mtr], y_tr[mtr], X_va2[mva], y_va[mva])
             p_plus = m_plus.predict(xgb.DMatrix(X_te2[mte]))
             e_plus = evaluate(p_plus, y_te[mte], test_idx[mte])
-            elapsed = time.time() - t1
+            fg_time = time.time() - t2
 
             delta_ric = e_plus["rank_ic_mean"] - e_base["rank_ic_mean"]
             delta_spr = e_plus["top20_spread"] - e_base["top20_spread"]
 
-            results.append({
+            all_results[fg]["splits"].append({
                 "split": split_idx + 1,
                 "base_ric": e_base["rank_ic_mean"],
                 "plus_ric": e_plus["rank_ic_mean"],
@@ -258,36 +263,37 @@ def main():
                 "delta_spr": round(delta_spr, 6),
             })
 
-            logger.info(f"  Split {split_idx+1}: base RankIC={e_base['rank_ic_mean']:+.4f} "
-                        f"+{fg} RankIC={e_plus['rank_ic_mean']:+.4f} "
-                        f"Δ={delta_ric:+.4f} [{elapsed:.0f}s]")
+            logger.info(f"  +{fg}: RankIC={e_plus['rank_ic_mean']:+.4f} "
+                        f"Δ={delta_ric:+.4f} [{fg_time:.0f}s]")
 
-        # Summary
+    # Compute summaries
+    for fg, data in all_results.items():
+        results = data["splits"]
         n = len(results)
+        if n == 0:
+            continue
         d_rics = [r["delta_ric"] for r in results]
         d_sprs = [r["delta_spr"] for r in results]
         ric_helps = sum(1 for d in d_rics if d > 0)
         spr_helps = sum(1 for d in d_sprs if d > 0)
 
-        summary = {
+        data.update({
             "factor": fg,
-            "n_cols": len(fg_cols),
+            "n_cols": len(data["fg_cols"]),
             "n_splits": n,
             "avg_delta_ric": round(float(np.mean(d_rics)), 6),
             "avg_delta_spr": round(float(np.mean(d_sprs)), 6),
             "ric_helps_pct": round(ric_helps / n, 4),
             "spr_helps_pct": round(spr_helps / n, 4),
             "pass_70pct": ric_helps / n >= 0.7 or spr_helps / n >= 0.7,
-            "splits": results,
-        }
-        all_results[fg] = summary
+        })
 
         logger.info(f"\n  {fg} summary ({n} splits):")
         logger.info(f"    avg Δ RankIC: {np.mean(d_rics):+.4f}")
         logger.info(f"    avg Δ Spread: {np.mean(d_sprs)*100:+.3f}%")
         logger.info(f"    Δ RankIC>0: {ric_helps}/{n} ({ric_helps/n:.0%})")
         logger.info(f"    Δ Spread>0: {spr_helps}/{n} ({spr_helps/n:.0%})")
-        logger.info(f"    Phase 2 gate (≥70%): {'✅ PASS' if summary['pass_70pct'] else '❌ FAIL'}")
+        logger.info(f"    Phase 2 gate (≥70%): {'✅ PASS' if data['pass_70pct'] else '❌ FAIL'}")
 
     # Final summary
     total_time = time.time() - t_total
