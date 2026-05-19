@@ -24,6 +24,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+# Qlib init deferred to method call to avoid import at module load
+
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "storage"
@@ -167,19 +169,47 @@ class PaperOMS:
         target = list(remaining | actual_buys)
         return target, list(actual_sells), list(actual_buys)
 
+    def _load_real_prices(self, date: str) -> dict:
+        """Load real closing prices for the given date from Qlib or cache."""
+        prices = {}
+        try:
+            # Try lgb_latest_predictions cache (has stock codes but not prices)
+            # Use Qlib daily data for actual close prices
+            from qlib.data import D
+            import pandas as pd
+            insts = list(self.state.get("positions", {}).keys())
+            if not insts:
+                return prices
+            # Normalize codes for Qlib
+            qlib_insts = [c.lower() for c in insts]
+            df = D.features(qlib_insts, ["$close"],
+                           start_time=date, end_time=date)
+            if df is not None and not df.empty:
+                for idx, row in df.iterrows():
+                    inst = str(idx[1]).upper() if isinstance(idx, tuple) else str(idx).upper()
+                    price = float(row.iloc[0])
+                    if np.isfinite(price) and price > 0:
+                        prices[inst] = price
+        except Exception as e:
+            logger.warning(f"Failed to load real prices: {e}")
+        return prices
+
     def execute_orders(self, sells: list, buys: list, date: str):
-        """Simulate order execution with costs."""
+        """Simulate order execution with costs. Uses real closing prices."""
         cash = self.state["cash"]
         positions = self.state["positions"]
         trades = []
+
+        # Load real prices for all relevant stocks
+        all_codes = list(set(sells + buys + list(positions.keys())))
+        prices = self._load_real_prices(date)
 
         # Execute sells
         for code in sells:
             if code not in positions:
                 continue
             pos = positions[code]
-            # Simulate: sell at previous close * (1 - slippage)
-            sell_price = pos["avg_price"]  # simplified: use avg_price as proxy
+            sell_price = prices.get(code, pos["avg_price"])  # real price or fallback to avg
             amount = pos["shares"] * sell_price
             commission = max(amount * self.commission_rate, 5.0)
             stamp_tax = amount * self.stamp_tax_rate
@@ -190,7 +220,7 @@ class PaperOMS:
             del positions[code]
             trades.append({
                 "date": date, "code": code, "side": "sell",
-                "shares": pos["shares"], "price": sell_price,
+                "shares": pos["shares"], "price": round(sell_price, 4),
                 "cost": round(commission + stamp_tax + slippage, 2),
                 "net": round(net, 2),
             })
@@ -204,7 +234,10 @@ class PaperOMS:
             for code in buys:
                 if per_stock_value < 1000:  # minimum trade value
                     break
-                buy_price = 10.0  # placeholder — in production, use real price
+                buy_price = prices.get(code, 0)
+                if buy_price <= 0:
+                    logger.warning(f"  No price for {code}, skip buy")
+                    continue
                 shares = int(per_stock_value / buy_price / 100) * 100  # round to 100 shares
                 if shares <= 0:
                     continue
@@ -242,11 +275,22 @@ class PaperOMS:
                 self.state["positions"][code].get("holding_days", 0) + 1
 
     def compute_daily_pnl(self, date: str) -> dict:
-        """Compute daily PnL (simplified: uses position count as proxy)."""
+        """Compute daily PnL using real prices where available."""
+        # Dedup guard: skip if already recorded this date
+        history = self.state.get("daily_pnl_history", [])
+        if history and history[-1].get("date") == date:
+            logger.warning(f"  Date {date} already recorded, skipping duplicate")
+            return history[-1]
+
         positions = self.state["positions"]
         n_positions = len(positions)
-        total_value = self.state["cash"] + sum(
-            p["shares"] * p["avg_price"] for p in positions.values())
+
+        # Use real prices for valuation
+        prices = self._load_real_prices(date)
+        total_value = self.state["cash"]
+        for code, p in positions.items():
+            price = prices.get(code, p["avg_price"])
+            total_value += p["shares"] * price
 
         pnl_record = {
             "date": date,
