@@ -898,3 +898,96 @@ Market-level features (regime) and low-variation features (pledge_ratio = same v
 ---
 
 *This document should be treated as a research plan, not a commitment. All estimates of alpha improvement are speculative until validated through the rolling ablation framework.*
+
+---
+
+## 9. CX Review and Consolidated Enhancement Framework (2026-05-19)
+
+CX reviewed CC's research and provided the following consolidated guidance.
+
+### 9.1 CX's Top 5 Priority Enhancement Groups
+
+| Priority | Factor Group | Why It's Weak Now | How to Make It Strong |
+|:---:|------|------|------|
+| 1 | 北向/资金流 | 原始净流入太像成交额和动量 | 主动买入增量/ADV、持股占比变化zscore、连续增持、低关注度下北向增持、高持仓+流出=拥挤踩踏 |
+| 2 | moneyflow 大单小单 | 18列原始金额稀释信号 | 订单失衡: 大单净买/成交额、大单买小单卖背离、流入surprise、10日持续性、行业内rank |
+| 3 | 大宗交易/龙虎榜 | 只用count/amount太粗 | 大宗折溢价(block_price/close-1)、龙虎榜机构净买、席位集中度、上榜原因、事件半衰期 |
+| 4 | 财报预告/快报 | forecast被旧公告污染 | 事件型PEAD: 公告后30/60/90日衰减、SUE、业绩修正、预告区间宽度 |
+| 5 | CYQ筹码 | 原始成本价和价格高度重合 | 成本压力位、筹码集中压缩、获利盘+换手、资金流进入低筹码分散区的交互 |
+
+### 9.2 定位为风控而非Alpha的因子
+
+| Factor | CX Positioning |
+|------|------|
+| 质押 | crash-risk penalty: 高质押×下跌×高波动×负资金流 → 降仓/剔除 |
+| 两融 | 拥挤度/情绪过热: 融资余额/流通市值、融资买入/成交额 |
+| holder_num | 原始level放弃，但 qoq_change + 户均持股变化 + 横盘+大单流入 = 低优先级交互 |
+| dividend/broker | 数据太稀，长期质量/事件用，不进短线主链 |
+
+### 9.3 CX 推荐的统一计算框架
+
+1. **PIT 和索引统一**：所有事件因子必须有 effective_date，资金流至少 lag1，forecast 不能 asof 无限前推
+2. **金额类必须标准化**：除以 amount / ADV / circ_mv，不然模型学到的是市值
+3. **三种表达**：每个因子至少生成 time-series zscore、date/industry rank、residualized vs 174 base
+4. **稀疏事件衰减核**：signal × exp(-age / half_life)，设置最大有效期
+5. **组内 composite**：不喂 50 个新列，先压成 moneyflow_score、northbound_score、event_score、fundamental_surprise_score、risk_penalty_score
+
+### 9.4 Phase 4I: Alternative Factor Enhancement Lab
+
+CX 建议新增 Phase 4I，放在 Phase 4 完成后、Phase 5 RL 前。
+
+执行顺序：
+- 4I.0: 因子契约（PIT、lag、coverage、index 对齐、事件有效期）
+- 4I.1: 北向 + moneyflow v2（最高优先级）
+- 4I.2: 大宗交易 + 龙虎榜 + forecast/express 事件框架
+- 4I.3: 财务质量/业绩 surprise（中周期 20-60 日）
+- 4I.4: CYQ × moneyflow 交互
+- 质押/两融/holder → 风险过滤和仓位控制，不争 champion alpha
+
+### 9.5 CX 验收门槛
+
+**单因子预筛：**
+- residual RankIC > +0.005
+- RankIC 正日期占比 >= 55%
+- top-bottom spread 为正且不是少数日期撑起来
+- shuffled stock/date negative control 必须明显弱于真实因子
+
+**进入模型消融：**
+- 12/24 split 中 ΔRankIC 正 >= 70%
+- ΔSpread 正 >= 70%
+- 最差 split 不能灾难性恶化
+- 事件因子还要做 matched non-event control
+
+### 9.6 CX 引用的学术支撑
+
+- Gu, Kelly & Xiu (2020): 树模型/神经网络的优势来自非线性交互和截面rank处理，不是堆原始列
+- Green, Hand & Zhang (RFS 2017): 真正独立有效的因子很少，必须做残差和多重检验控制
+- Stock Connect 研究: 北向投资者在公司基本面信息上有额外优势，周度 long-short 有超额
+- PEAD: 业绩事件的标准框架
+- 质押研究: 更像 crash-risk 控制而非买入 alpha
+
+### 9.7 CX 对现有 174 维中后加因子的诊断
+
+CX 指出现有后加因子（scripts/phase2_factor_ablation.py line 81）处理方式是"读原始列→numeric→asof merge→直接训练"，derived 也只是 pct_change/rolling mean/std（scripts/build_derived_factors.py line 27）。对已有 Alpha158 强基线来说太容易被淹没。
+
+**CX 推荐的 6 种更有效的因子形态：**
+
+| 类型 | 例子 | 为什么更猛 |
+|------|------|------|
+| 异常值 | 今日大单流入相对自身 60 日 zscore | 不是绝对金额，能识别突然变化 |
+| 截面 rank | 行业内资金流排名、北向增持排名 | 去掉市值/行业偏差 |
+| 残差 | 对 size、行业、Alpha158 score 残差化 | 逼它提供 174 之外的信息 |
+| 事件衰减 | forecast/龙虎榜/大宗交易半衰期 | 避免旧事件污染 |
+| 交互 | 资金流×低波动、CYQ集中×放量 | 树模型可以学但直接给更稳 |
+| 风险惩罚 | 质押×下跌×负资金流 | 不当 alpha，当仓位过滤器 |
+
+**CX 最典型的例子 — 资金流：**
+
+现在 champion 里已有 3 个资金流特征（latest/5d/20d_avg）。再塞 18 个原始买卖金额，模型只学到"成交额/市值/热度"的噪声。
+
+正确方向：大单净买/成交额 → 超大单-小单背离 → 流入 zscore60 → 连续净流入天数 → 行业内资金流 percentile → 最后压成 1-3 个 composite flow score。
+
+**CX 结论：有机会更猛，但不是全体都能更猛。**
+- 最值得重做：moneyflow / northbound / block_trade / top_inst / forecast / CYQ
+- 做风险过滤：pledge / margin / holder_num
+- 建议开 Phase 4I enhanced factor lab，先做 residual IC 预筛，不直接污染 champion
