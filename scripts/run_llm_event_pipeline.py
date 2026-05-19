@@ -11,9 +11,15 @@ Crontab example (run at 16:30 after market close):
 """
 import argparse
 import logging
+import os
 import sys
 import traceback
 from datetime import datetime
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 logger = logging.getLogger(__name__)
 
