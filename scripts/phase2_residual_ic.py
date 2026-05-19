@@ -189,10 +189,11 @@ def main():
     # Save
     out_path = DATA_DIR / "phase4" / "phase2_residual_ic.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    from utils.json_utils import json_default
     with open(str(out_path), "w") as f:
         json.dump({"evaluated_at": datetime.now().isoformat(timespec="seconds"),
                     "total_time_s": round(total_time, 1),
-                    "factors": summary}, f, indent=2)
+                    "factors": summary}, f, indent=2, default=json_default)
     logger.info(f"\nSaved: {out_path}")
     logger.info("Done!")
 

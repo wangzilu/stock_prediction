@@ -33,9 +33,8 @@ DATA_DIR = PROJECT_ROOT / "data" / "storage"
 QLIB_DATA = str(DATA_DIR / "qlib_data" / "cn_data")
 SHADOW_LOG = DATA_DIR / "phase4" / "shadow_ledger.jsonl"
 
-# Model paths
-CHAMPION_MODEL = DATA_DIR / "lgb_model.pkl"  # production model
-SHADOW_MODEL = DATA_DIR / "xgb_175_holder_model.json"  # or xgb_205
+# Model paths — loaded from registry, not hardcoded
+from models.registry import ModelRegistry
 
 
 def load_latest_predictions():
@@ -127,6 +126,13 @@ def main():
     logger.info("=== Shadow Daily Inference ===")
     t0 = time.time()
 
+    # Load model paths from registry
+    reg = ModelRegistry()
+    champion_info = reg.get_champion()
+    shadow_info = reg.get_shadow()
+
+    logger.info(f"  Registry: champion={reg.status()['champion']}, shadow={reg.status()['shadow']}")
+
     # Champion: load from prediction cache (already computed by after_close_pipeline)
     logger.info("Loading champion predictions from cache...")
     ch_preds, ch_meta = load_latest_predictions()
@@ -137,10 +143,18 @@ def main():
     else:
         logger.warning("  Champion predictions not available!")
 
-    # Shadow: load XGB model and predict on latest cache data
-    logger.info("Loading shadow model and predicting...")
-    shadow_cache = DATA_DIR / "feature_cache_174_holder_regime_ma.parquet"
-    sh_preds = predict_with_xgb_model(str(SHADOW_MODEL), str(shadow_cache))
+    # Shadow: load model from registry path
+    shadow_model_path = shadow_info.get("model_path", "") if shadow_info else ""
+    shadow_cache_path = DATA_DIR / "feature_cache_174_holder_regime_ma.parquet"
+    if not shadow_model_path:
+        # Fallback to known paths
+        for fallback in ["xgb_205_regime_model.json", "xgb_175_holder_model.json"]:
+            if (DATA_DIR / fallback).exists():
+                shadow_model_path = str(DATA_DIR / fallback)
+                break
+
+    logger.info(f"Loading shadow model: {shadow_model_path}")
+    sh_preds = predict_with_xgb_model(shadow_model_path, str(shadow_cache_path))
     if sh_preds:
         logger.info(f"  Shadow: {len(sh_preds)} predictions")
     else:
@@ -150,8 +164,8 @@ def main():
     result = compare_predictions(ch_preds or {}, sh_preds)
     result["date"] = datetime.now().strftime("%Y-%m-%d")
     result["compared_at"] = datetime.now().isoformat(timespec="seconds")
-    result["champion_model"] = "xgb_174"
-    result["shadow_model"] = "xgb_205"
+    result["champion_model"] = reg.status()["champion"] or "xgb_174"
+    result["shadow_model"] = reg.status()["shadow"] or "xgb_205"
     result["inference_time_s"] = round(time.time() - t0, 1)
 
     logger.info(f"\n  Overlap: {result.get('overlap', 0)}/{result.get('top_k', 20)} "
