@@ -66,22 +66,63 @@ def evaluate(pred, label, index):
 def shuffle_within_date(df: pd.DataFrame) -> pd.DataFrame:
     """Shuffle factor values within each date, breaking stock-specific signal.
 
-    Preserves: per-date distribution, coverage, NaN pattern per date.
-    Breaks: which stock gets which value.
+    For stock-level factors: shuffle instruments within each date.
+    For market-level factors (broadcast): shuffle dates instead.
     """
     rng = np.random.RandomState(SEED)
     result = df.copy()
-    for date in result.index.get_level_values(0).unique():
+
+    # Detect if market-level: check if all stocks have same value per date
+    is_market_level = True
+    sample_dates = list(result.index.get_level_values(0).unique()[:10])
+    for date in sample_dates:
         mask = result.index.get_level_values(0) == date
         sub = result.loc[mask]
         for col in result.columns:
-            vals = sub[col].values.copy()
-            # Only shuffle non-NaN values
-            finite_mask = np.isfinite(vals) if vals.dtype.kind == 'f' else ~pd.isna(vals)
-            finite_vals = vals[finite_mask]
-            rng.shuffle(finite_vals)
-            vals[finite_mask] = finite_vals
-            result.loc[mask, col] = vals
+            vals = sub[col].dropna().unique()
+            if len(vals) > 1:
+                is_market_level = False
+                break
+        if not is_market_level:
+            break
+
+    if is_market_level:
+        # Market-level: shuffle date → value mapping (break temporal signal)
+        logger.info("  Detected market-level factor, using DATE shuffle")
+        dates = sorted(result.index.get_level_values(0).unique())
+        date_vals = {}
+        for col in result.columns:
+            # Get one value per date
+            vals_per_date = []
+            for d in dates:
+                mask = result.index.get_level_values(0) == d
+                v = result.loc[mask, col].dropna()
+                vals_per_date.append(v.iloc[0] if len(v) > 0 else np.nan)
+            arr = np.array(vals_per_date)
+            finite = np.isfinite(arr)
+            arr_finite = arr[finite].copy()
+            rng.shuffle(arr_finite)
+            arr[finite] = arr_finite
+            date_vals[col] = dict(zip(dates, arr))
+
+        # Rebuild with shuffled date mapping
+        for col in result.columns:
+            dmap = date_vals[col]
+            result[col] = result.index.get_level_values(0).map(dmap)
+    else:
+        # Stock-level: shuffle instruments within each date
+        logger.info("  Detected stock-level factor, using INSTRUMENT shuffle")
+        for date in result.index.get_level_values(0).unique():
+            mask = result.index.get_level_values(0) == date
+            sub = result.loc[mask]
+            for col in result.columns:
+                vals = sub[col].values.copy()
+                finite_mask = np.isfinite(vals) if vals.dtype.kind == 'f' else ~pd.isna(vals)
+                finite_vals = vals[finite_mask]
+                rng.shuffle(finite_vals)
+                vals[finite_mask] = finite_vals
+                result.loc[mask, col] = vals
+
     return result
 
 
