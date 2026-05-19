@@ -39,15 +39,15 @@ def get_trading_dates(cache: pd.DataFrame) -> list:
     return sorted(cache.index.get_level_values(0).unique())
 
 
-def train_xgb(X_train, y_train, X_valid, y_valid):
+def train_xgb(X_train, y_train, X_valid, y_valid, nthread=12, max_rounds=300):
     import xgboost as xgb
     dt = xgb.DMatrix(X_train, label=y_train)
     dv = xgb.DMatrix(X_valid, label=y_valid)
     params = {"max_depth": 8, "learning_rate": 0.05, "subsample": 0.8789,
               "colsample_bytree": 0.8879, "reg_alpha": 205.6999, "reg_lambda": 580.9768,
-              "objective": "reg:squarederror", "nthread": 4, "verbosity": 0, "seed": SEED}
-    model = xgb.train(params, dt, num_boost_round=500,
-                      evals=[(dv, "valid")], early_stopping_rounds=50, verbose_eval=0)
+              "objective": "reg:squarederror", "nthread": nthread, "verbosity": 0, "seed": SEED}
+    model = xgb.train(params, dt, num_boost_round=max_rounds,
+                      evals=[(dv, "valid")], early_stopping_rounds=30, verbose_eval=0)
     return model
 
 
@@ -182,9 +182,15 @@ def main():
     today_idx = len(trade_dates) - 1
     logger.info(f"  Trading dates: {len(trade_dates)}")
 
-    # Rolling
-    all_results = []
-    t_total = time.time()
+    # Pre-compute column indices for each feature set (for parallel mode)
+    all_cols = list(cache.columns)
+    feature_sets_col_indices = {}
+    for fs_name, cols in feature_sets.items():
+        feature_sets_col_indices[fs_name] = [all_cols.index(c) for c in cols]
+
+    # Pre-slice all splits
+    dates_level = cache.index.get_level_values(0)
+    split_specs = []
 
     for split_idx in range(args.n_splits):
         test_end_idx = today_idx - split_idx * args.test_days
@@ -199,59 +205,160 @@ def main():
 
         test_end = trade_dates[test_end_idx]
         test_start = trade_dates[test_start_idx]
-        valid_end = trade_dates[valid_end_idx]
         valid_start = trade_dates[valid_start_idx]
-        train_end = trade_dates[train_end_idx]
+        valid_end = trade_dates[valid_end_idx]
         train_start = trade_dates[train_start_idx]
+        train_end = trade_dates[train_end_idx]
 
-        logger.info(f"\nSplit {split_idx+1}/{args.n_splits}: "
-                    f"test {str(test_start)[:10]}~{str(test_end)[:10]}")
+        split_specs.append({
+            "split_idx": split_idx,
+            "test": f"{str(test_start)[:10]}~{str(test_end)[:10]}",
+            "train_start": train_start, "train_end": train_end,
+            "valid_start": valid_start, "valid_end": valid_end,
+            "test_start": test_start, "test_end": test_end,
+        })
 
-        # Slice cache by date
-        dates_level = cache.index.get_level_values(0)
-        train_mask = (dates_level >= train_start) & (dates_level <= train_end)
-        valid_mask = (dates_level >= valid_start) & (dates_level <= valid_end)
-        test_mask = (dates_level >= test_start) & (dates_level <= test_end)
+    logger.info(f"  {len(split_specs)} splits prepared, parallel={args.parallel}")
 
-        split_result = {"split": split_idx + 1,
-                        "test": f"{str(test_start)[:10]}~{str(test_end)[:10]}"}
+    # Rolling
+    all_results = []
+    t_total = time.time()
 
-        for fs_name, cols in feature_sets.items():
-            # Extract numpy arrays
-            y_train = cache.loc[train_mask, label_col].values.astype(np.float32)
-            y_valid = cache.loc[valid_mask, label_col].values.astype(np.float32)
-            y_test = cache.loc[test_mask, label_col].values.astype(np.float32)
+    if args.parallel > 1:
+        # === Parallel mode ===
+        # Pre-slice ALL splits in main thread (pandas GIL bottleneck),
+        # then dispatch only numpy arrays to threads (XGB releases GIL).
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import xgboost as xgb
 
-            X_train = cache.loc[train_mask, cols].values.astype(np.float32)
-            X_valid = cache.loc[valid_mask, cols].values.astype(np.float32)
-            X_test = cache.loc[test_mask, cols].values.astype(np.float32)
+        logger.info(f"  Pre-slicing {len(split_specs)} splits in main thread...")
+        t_pre = time.time()
 
-            test_idx = cache.index[test_mask]
+        prepped_splits = []
+        for spec in split_specs:
+            tm = (dates_level >= spec["train_start"]) & (dates_level <= spec["train_end"])
+            vm = (dates_level >= spec["valid_start"]) & (dates_level <= spec["valid_end"])
+            em = (dates_level >= spec["test_start"]) & (dates_level <= spec["test_end"])
 
-            # NaN filter
-            mask_tr = np.isfinite(y_train)
-            mask_va = np.isfinite(y_valid)
-            mask_te = np.isfinite(y_test)
+            split_data = {"split_idx": spec["split_idx"], "test": spec["test"], "fs": {}}
 
-            t1 = time.time()
-            model = train_xgb(X_train[mask_tr], y_train[mask_tr],
-                               X_valid[mask_va], y_valid[mask_va])
-            pred = model.predict(xgb.DMatrix(X_test[mask_te]))
-            metrics = evaluate(pred, y_test[mask_te], test_idx[mask_te])
-            elapsed = time.time() - t1
+            for fs_name, cols in feature_sets.items():
+                y_tr = cache.loc[tm, label_col].values.astype(np.float32)
+                y_va = cache.loc[vm, label_col].values.astype(np.float32)
+                y_te = cache.loc[em, label_col].values.astype(np.float32)
+                X_tr = cache.loc[tm, cols].values.astype(np.float32)
+                X_va = cache.loc[vm, cols].values.astype(np.float32)
+                X_te = cache.loc[em, cols].values.astype(np.float32)
+                test_idx = cache.index[em]
 
-            split_result[fs_name] = {"n_feat": len(cols), **metrics, "time_s": round(elapsed, 1)}
-            logger.info(f"  {fs_name}({len(cols)}): RankIC={metrics['rank_ic_mean']:+.4f} "
-                        f"Spread={metrics['top20_spread']*100:+.3f}% [{elapsed:.1f}s]")
+                mtr = np.isfinite(y_tr); mva = np.isfinite(y_va); mte = np.isfinite(y_te)
 
-        if args.ablation:
-            delta_ric = split_result["base+extra"]["rank_ic_mean"] - split_result["base"]["rank_ic_mean"]
-            delta_spr = split_result["base+extra"]["top20_spread"] - split_result["base"]["top20_spread"]
-            split_result["delta_rank_ic"] = round(delta_ric, 6)
-            split_result["delta_spread"] = round(delta_spr, 6)
-            logger.info(f"  Δ RankIC={delta_ric:+.4f} Δ Spread={delta_spr*100:+.3f}%")
+                split_data["fs"][fs_name] = {
+                    "X_tr": X_tr[mtr], "y_tr": y_tr[mtr],
+                    "X_va": X_va[mva], "y_va": y_va[mva],
+                    "X_te": X_te[mte], "y_te": y_te[mte],
+                    "test_idx": test_idx[mte], "n_feat": len(cols),
+                }
 
-        all_results.append(split_result)
+            prepped_splits.append(split_data)
+
+        logger.info(f"  Pre-sliced in {time.time()-t_pre:.1f}s")
+
+        # Use more cores for parallel: nthread=3 * 4 workers = 12 of 14 cores
+        parallel_xgb_params = {"max_depth": 8, "learning_rate": 0.05, "subsample": 0.8789,
+                               "colsample_bytree": 0.8879, "reg_alpha": 205.6999,
+                               "reg_lambda": 580.9768, "objective": "reg:squarederror",
+                               "nthread": 3, "verbosity": 0, "seed": SEED}
+
+        def _train_xgb_single(X_tr, y_tr, X_va, y_va):
+            dt = xgb.DMatrix(X_tr, label=y_tr)
+            dv = xgb.DMatrix(X_va, label=y_va)
+            return xgb.train(parallel_xgb_params, dt, num_boost_round=500,
+                             evals=[(dv, "valid")], early_stopping_rounds=50, verbose_eval=0)
+
+        def train_and_eval(split_data):
+            """Thread worker: only XGB train + predict + evaluate. No pandas slicing."""
+            result = {"split": split_data["split_idx"] + 1, "test": split_data["test"]}
+            for fs_name, d in split_data["fs"].items():
+                t1 = time.time()
+                model = _train_xgb_single(d["X_tr"], d["y_tr"], d["X_va"], d["y_va"])
+                pred = model.predict(xgb.DMatrix(d["X_te"]))
+                metrics = evaluate(pred, d["y_te"], d["test_idx"])
+                result[fs_name] = {"n_feat": d["n_feat"], **metrics,
+                                   "time_s": round(time.time() - t1, 1)}
+            if args.ablation and "base" in result and "base+extra" in result:
+                result["delta_rank_ic"] = round(
+                    result["base+extra"]["rank_ic_mean"] - result["base"]["rank_ic_mean"], 6)
+                result["delta_spread"] = round(
+                    result["base+extra"]["top20_spread"] - result["base"]["top20_spread"], 6)
+            return result
+
+        logger.info(f"  Launching {args.parallel} threads for {len(prepped_splits)} splits...")
+        with ThreadPoolExecutor(max_workers=args.parallel) as executor:
+            futures = {executor.submit(train_and_eval, sd): sd for sd in prepped_splits}
+            results = []
+            for future in as_completed(futures):
+                try:
+                    r = future.result(timeout=300)
+                    results.append(r)
+                    # Quick log
+                    fs0 = list(feature_sets.keys())[0]
+                    m = r.get(fs0, {})
+                    logger.info(f"  Split {r['split']} done ({len(results)}/{len(prepped_splits)}) "
+                                f"RankIC={m.get('rank_ic_mean',0):+.4f} [{m.get('time_s',0):.0f}s]")
+                except Exception as e:
+                    sd = futures[future]
+                    logger.error(f"  Split {sd['split_idx']+1} FAILED: {e}")
+
+        for r in sorted(results, key=lambda x: x["split"]):
+            all_results.append(r)
+
+    else:
+        # === Sequential mode (original) ===
+        for spec in split_specs:
+            split_idx = spec["split_idx"]
+            logger.info(f"\nSplit {split_idx+1}/{args.n_splits}: test {spec['test']}")
+
+            train_mask = (dates_level >= spec["train_start"]) & (dates_level <= spec["train_end"])
+            valid_mask = (dates_level >= spec["valid_start"]) & (dates_level <= spec["valid_end"])
+            test_mask = (dates_level >= spec["test_start"]) & (dates_level <= spec["test_end"])
+
+            split_result = {"split": split_idx + 1, "test": spec["test"]}
+
+            for fs_name, cols in feature_sets.items():
+                y_train = cache.loc[train_mask, label_col].values.astype(np.float32)
+                y_valid = cache.loc[valid_mask, label_col].values.astype(np.float32)
+                y_test = cache.loc[test_mask, label_col].values.astype(np.float32)
+
+                X_train = cache.loc[train_mask, cols].values.astype(np.float32)
+                X_valid = cache.loc[valid_mask, cols].values.astype(np.float32)
+                X_test = cache.loc[test_mask, cols].values.astype(np.float32)
+
+                test_idx = cache.index[test_mask]
+
+                mask_tr = np.isfinite(y_train)
+                mask_va = np.isfinite(y_valid)
+                mask_te = np.isfinite(y_test)
+
+                t1 = time.time()
+                model = train_xgb(X_train[mask_tr], y_train[mask_tr],
+                                   X_valid[mask_va], y_valid[mask_va])
+                pred = model.predict(xgb.DMatrix(X_test[mask_te]))
+                metrics = evaluate(pred, y_test[mask_te], test_idx[mask_te])
+                elapsed = time.time() - t1
+
+                split_result[fs_name] = {"n_feat": len(cols), **metrics, "time_s": round(elapsed, 1)}
+                logger.info(f"  {fs_name}({len(cols)}): RankIC={metrics['rank_ic_mean']:+.4f} "
+                            f"Spread={metrics['top20_spread']*100:+.3f}% [{elapsed:.1f}s]")
+
+            if args.ablation:
+                delta_ric = split_result["base+extra"]["rank_ic_mean"] - split_result["base"]["rank_ic_mean"]
+                delta_spr = split_result["base+extra"]["top20_spread"] - split_result["base"]["top20_spread"]
+                split_result["delta_rank_ic"] = round(delta_ric, 6)
+                split_result["delta_spread"] = round(delta_spr, 6)
+                logger.info(f"  Δ RankIC={delta_ric:+.4f} Δ Spread={delta_spr*100:+.3f}%")
+
+            all_results.append(split_result)
 
     # Summary
     total_time = time.time() - t_total
