@@ -742,7 +742,7 @@ class FeatureMerger:
         look up the most recent row in ts_df where ts_df.date <= training_date.
 
         ts_df must have columns: qlib_code, date_col, and factor_cols.
-        Uses vectorized merge_asof per stock for performance.
+        Vectorized: uses np.searchsorted per stock instead of pd.merge_asof.
         """
         if ts_df.empty:
             return None
@@ -753,51 +753,63 @@ class FeatureMerger:
         ts_df = ts_df.copy()
         ts_df["qlib_code"] = ts_df["qlib_code"].astype(str).str.upper()
         ts_df[date_col] = pd.to_datetime(ts_df[date_col], errors="coerce")
-        ts_df = ts_df.dropna(subset=[date_col]).sort_values(date_col)
+        ts_df = ts_df.dropna(subset=[date_col])
 
-        # Build flat training frame with integer position for write-back
+        # Ensure numeric
+        for col in factor_cols:
+            ts_df[col] = pd.to_numeric(ts_df[col], errors="coerce")
+
+        # Sort and deduplicate: keep last per (stock, date)
+        ts_df = ts_df.sort_values(["qlib_code", date_col])
+        ts_df = ts_df.drop_duplicates(["qlib_code", date_col], keep="last")
+
         train_dates = pd.to_datetime(index.get_level_values(date_level))
         train_insts = index.get_level_values(inst_level).astype(str).str.upper()
 
-        # Initialize result arrays (faster than DataFrame write)
         n = len(index)
         result_arrays = {col: np.full(n, np.nan, dtype=np.float64) for col in factor_cols}
 
-        # Build per-stock position mapping
-        inst_positions = {}
-        for i, inst in enumerate(train_insts):
-            inst_positions.setdefault(inst, []).append(i)
+        # Group training index by stock
+        train_inst_arr = train_insts.values if hasattr(train_insts, 'values') else np.array(train_insts)
+        train_date_arr = train_dates.values
 
+        # Group factor data by stock
         stocks_in_ts = set(ts_df["qlib_code"].unique())
-        processed = 0
 
-        for stock, positions in inst_positions.items():
+        # Build stock→positions mapping (vectorized with pandas groupby)
+        inst_series = pd.Series(np.arange(n), index=train_inst_arr)
+        inst_groups = inst_series.groupby(inst_series.index)
+
+        processed = 0
+        for stock, pos_idx in inst_groups:
             if stock not in stocks_in_ts:
                 continue
 
-            positions = sorted(positions)
-            stock_dates = train_dates[positions].values
+            positions = pos_idx.values  # numpy array of row positions
+            query_dates = train_date_arr[positions]
 
-            stock_data = ts_df.loc[ts_df["qlib_code"] == stock,
-                                   [date_col] + factor_cols].sort_values(date_col)
-            stock_data = stock_data.rename(columns={date_col: "date"})
+            # Get this stock's factor data (sorted by date)
+            stock_mask = ts_df["qlib_code"] == stock
+            stock_data = ts_df.loc[stock_mask]
             if stock_data.empty:
                 continue
 
-            # Prepare for merge_asof
-            left = pd.DataFrame({"date": stock_dates, "_pos": positions})
-            left = left.sort_values("date")
-            right = stock_data.copy()
-            right["date"] = pd.to_datetime(right["date"])
+            ts_dates = stock_data[date_col].values  # sorted
+            ts_values = stock_data[factor_cols].values  # (n_ts, n_factors)
 
-            merged = pd.merge_asof(left, right, on="date", direction="backward")
+            # searchsorted: find insertion points (rightmost position where date <= query)
+            insert_idx = np.searchsorted(ts_dates, query_dates, side="right") - 1
 
-            # Write back by position
-            for col in factor_cols:
-                if col in merged.columns:
-                    pos_vals = merged[["_pos", col]].dropna(subset=[col])
-                    for _, row in pos_vals.iterrows():
-                        result_arrays[col][int(row["_pos"])] = row[col]
+            # Valid: insert_idx >= 0 means we found a date <= query
+            valid = insert_idx >= 0
+
+            if valid.any():
+                valid_positions = positions[valid]
+                valid_idx = insert_idx[valid]
+
+                for j, col in enumerate(factor_cols):
+                    vals = ts_values[valid_idx, j]
+                    result_arrays[col][valid_positions] = vals
 
             processed += 1
 
