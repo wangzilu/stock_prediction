@@ -42,30 +42,42 @@ def get_liquid_stocks(top_n: int = 100) -> list[dict]:
         token = token_file.read_text().strip() if token_file.exists() else ""
         if token:
             st = StockToday(token=token)
-            # Use yesterday's date (today's data may not be available yet)
             from datetime import timedelta
-            for days_back in range(0, 5):
+            result = None
+            for days_back in range(0, 10):
                 date_str = (datetime.now() - timedelta(days=days_back)).strftime("%Y%m%d")
-                result = st.bak_basic(trade_date=date_str)
-                if isinstance(result, list) and len(result) > 100:
+                resp = st.bak_basic(trade_date=date_str)
+                logger.debug(f"bak_basic({date_str}): type={type(resp).__name__}, len={len(resp) if isinstance(resp, list) else 'N/A'}")
+                if isinstance(resp, list) and len(resp) > 100:
+                    result = resp
+                    logger.info(f"bak_basic found {len(result)} stocks for {date_str}")
                     break
             if isinstance(result, list) and result:
                 df = pd.DataFrame(result)
-                df = df[~df["name"].str.contains("ST|退", na=False)]
-                df = df.head(top_n)
-                results = []
-                for _, row in df.iterrows():
-                    ts = str(row["ts_code"])
-                    code = ts[:6]
-                    prefix = "SH" if ts.endswith(".SH") else "SZ"
-                    results.append({
-                        "code": code,
-                        "name": row["name"],
-                        "qlib_code": f"{prefix}{code}",
-                        "ts_code": ts,
-                    })
-                logger.info(f"Got {len(results)} stocks from ST_CLIENT")
-                return results
+                # Columns may be 'name'/'ts_code' — verify they exist
+                if "name" not in df.columns or "ts_code" not in df.columns:
+                    logger.warning(f"bak_basic unexpected columns: {list(df.columns)[:10]}")
+                else:
+                    df = df[~df["name"].str.contains("ST|退", na=False)]
+                    df = df.head(top_n)
+                    results = []
+                    for _, row in df.iterrows():
+                        ts = str(row["ts_code"])
+                        code = ts[:6]
+                        prefix = "SH" if ts.endswith(".SH") else "SZ"
+                        results.append({
+                            "code": code,
+                            "name": row["name"],
+                            "qlib_code": f"{prefix}{code}",
+                            "ts_code": ts,
+                        })
+                    if results:
+                        logger.info(f"Got {len(results)} stocks from ST_CLIENT bak_basic")
+                        return results
+            else:
+                logger.warning(f"bak_basic returned no usable data (last response type: {type(resp).__name__})")
+        else:
+            logger.warning("No ST_CLIENT token found at .st_token")
     except Exception as e:
         logger.warning(f"ST_CLIENT stock list failed: {e}")
         import traceback

@@ -46,6 +46,12 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("daily_summary", "30 15 * * 1-5", [py, main_py, "--daily-summary"], "cron_daily_summary.log"),
         CronJob("evening_outlook", "0 22 * * 1-5", [py, main_py, "--evening-outlook"], "cron_evening_outlook.log"),
         CronJob("risk_check", "35 9-15 * * 1-5", [py, main_py, "--risk-check"], "cron_risk_check.log"),
+        CronJob(
+            "llm_event_pipeline",
+            "30 16 * * 1-5",  # 16:30 — after market close, news published after 15:00
+            [py, str(scripts / "run_llm_event_pipeline.py")],
+            "llm_event_pipeline.log",
+        ),
         CronJob("spot_cache_warmup", "5 17 * * 1-5", [py, main_py, "--warm-spot-cache"], "cron_spot_cache_warmup.log"),
         CronJob(
             "qlib_data_update",
@@ -158,6 +164,7 @@ def is_legacy_project_line(line: str, project_root: Path = PROJECT_ROOT) -> bool
         "scripts/nightly_train.py",
         "scripts/train_lgb.py",
         "scripts/smoke_lgb_predict.py",
+        "scripts/run_llm_event_pipeline.py",
     )
     return any(marker in line for marker in legacy_markers)
 
