@@ -113,14 +113,27 @@ class PortfolioResult:
         return "\n".join(lines)
 
 
-def _build_listing_day_count(predictions: pd.DataFrame) -> dict[str, pd.Series]:
-    """Build a per-stock cumulative trading day count from prediction index.
+def _build_listing_day_count(
+    predictions: pd.DataFrame,
+    full_history_index: Optional[pd.MultiIndex] = None,
+) -> dict[str, pd.Series]:
+    """Build a per-stock cumulative trading day count.
 
     Returns dict mapping instrument -> Series(date -> cumulative_day_count).
     Used for IPO filtering: stocks with count < threshold on a given date
     are considered too new.
+
+    Args:
+        predictions: DataFrame with (datetime, instrument) index — only used if
+                     full_history_index is not provided.
+        full_history_index: Optional MultiIndex covering the full data history.
+                           When provided, listing days are counted from the first
+                           appearance in this index (not just the test period).
+                           This is critical: test periods are typically 20-40 days,
+                           so using predictions alone would filter out ALL stocks
+                           when min_listing_days > test_days.
     """
-    idx = predictions.index
+    idx = full_history_index if full_history_index is not None else predictions.index
     dates_by_stock: dict[str, list] = {}
     for dt, inst in idx:
         inst_str = str(inst)
@@ -194,6 +207,7 @@ class PortfolioBacktest:
         adv: Optional[pd.DataFrame] = None,
         return_horizon_days: int = 1,
         benchmark_returns: Optional[pd.Series] = None,
+        full_history_index: Optional[pd.MultiIndex] = None,
     ) -> PortfolioResult:
         """Run backtest.
 
@@ -234,7 +248,7 @@ class PortfolioBacktest:
         # --- IPO filter: build per-stock cumulative day count ---
         listing_counts: Optional[dict] = None
         if self.min_listing_days > 0:
-            listing_counts = _build_listing_day_count(predictions)
+            listing_counts = _build_listing_day_count(predictions, full_history_index)
 
         daily_pnl_raw = []
         daily_pnl_net = []
