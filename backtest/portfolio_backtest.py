@@ -151,11 +151,12 @@ def _build_listing_day_count(
 
 
 class PortfolioBacktest:
-    """TopK equal-weight portfolio backtest with T+1 and cost model.
+    """TopK portfolio backtest with T+1 and cost model.
 
     Supports multiple execution modes:
     - "fixed": fixed-frequency rebalance with optional dropout/bonus
     - "buffered_partial": Garleanu-Pedersen style partial trading + buffer zone + vol throttle
+    - "optimizer_v2": turnover-constrained alpha-proportional weights
     """
 
     def __init__(
@@ -170,7 +171,7 @@ class PortfolioBacktest:
         # --- IPO filter ---
         min_listing_days: int = 60, # exclude stocks listed < N trading days
         # --- Buffered Partial Rebalance params ---
-        mode: str = "fixed",        # "fixed" or "buffered_partial"
+        mode: str = "fixed",        # "fixed", "buffered_partial", or "optimizer_v2"
         buffer: int = 5,            # no-trade zone: stocks ranked top_k+1 ~ top_k+buffer are safe
         trade_rate: float = 0.35,   # fraction to trade toward target per day (Garleanu-Pedersen)
         min_hold_days: int = 2,     # minimum holding days (T+1 + 1 extra)
@@ -179,6 +180,8 @@ class PortfolioBacktest:
         vol_threshold: float = 1.5, # if current vol > threshold * median, reduce trading
         # --- Drawdown stop-loss ---
         drawdown_stop: float = 0.0, # if > 0, force sell all when drawdown exceeds this (e.g. 0.08 = 8%)
+        # --- Optimizer V2 ---
+        optimizer=None,             # TurnoverConstrainedOptimizer instance
     ):
         self.top_k = top_k
         self.cost = cost_model or CostModel()
@@ -196,6 +199,7 @@ class PortfolioBacktest:
         self.vol_window = vol_window
         self.vol_threshold = vol_threshold
         self.drawdown_stop = drawdown_stop
+        self.optimizer = optimizer
 
     def run(
         self,
@@ -256,6 +260,7 @@ class PortfolioBacktest:
         daily_turnovers = []
         daily_holdings_count = []
         prev_portfolio = set()
+        prev_weights = {}  # {stock: weight} for optimizer_v2 mode
         days_since_rebal = 0
         holding_days = {}  # {stock: days_held}
         recent_pnl = []    # last N daily returns for vol estimation
@@ -343,7 +348,28 @@ class PortfolioBacktest:
             if in_drawdown_stop:
                 # Force to cash: sell everything
                 target_portfolio = set()
+                target_weights = {}
                 turnover_override = 1.0 if prev_portfolio else 0.0
+            elif self.mode == "optimizer_v2" and self.optimizer is not None:
+                # Turnover-constrained optimizer: weighted portfolio
+                from backtest.constraints import PortfolioConstraints
+                cons = PortfolioConstraints(
+                    min_hold_days=self.min_hold_days,
+                    cannot_sell=cannot_sell,
+                )
+                target_weights = self.optimizer.optimize(
+                    alpha_scores=scores,
+                    prev_weights=prev_weights,
+                    constraints=cons,
+                    holding_days=holding_days,
+                )
+                target_portfolio = set(target_weights.keys())
+                # Compute weight-based turnover
+                all_s = set(target_weights.keys()) | set(prev_weights.keys())
+                turnover_override = sum(
+                    abs(target_weights.get(s, 0) - prev_weights.get(s, 0))
+                    for s in all_s
+                ) / 2.0
             elif self.mode == "buffered_partial":
                 target_portfolio, turnover_override = self._buffered_partial_step(
                     scores, prev_portfolio, holding_days, recent_pnl, cannot_sell)
@@ -414,7 +440,7 @@ class PortfolioBacktest:
                     if isinstance(day_returns, pd.DataFrame):
                         day_returns = day_returns.iloc[:, 0]
 
-                    # Equal weight portfolio return with frozen valuation for suspended stocks
+                    # Portfolio return with frozen valuation for suspended stocks
                     port_stocks = list(target_portfolio)
                     port_rets = day_returns.reindex(port_stocks)
 
@@ -429,7 +455,16 @@ class PortfolioBacktest:
                         port_rets = port_rets.fillna(0.0)
 
                     if len(port_rets) > 0:
-                        raw_ret = port_rets.mean()
+                        if self.mode == "optimizer_v2" and target_weights:
+                            # Weighted portfolio return
+                            w = pd.Series(target_weights).reindex(port_rets.index).fillna(0)
+                            w_sum = w.sum()
+                            if w_sum > 0:
+                                raw_ret = float((port_rets * w).sum() / w_sum)
+                            else:
+                                raw_ret = port_rets.mean()
+                        else:
+                            raw_ret = port_rets.mean()
                     else:
                         raw_ret = 0.0
                 else:
@@ -453,6 +488,8 @@ class PortfolioBacktest:
                 recent_pnl = recent_pnl[-self.vol_window:]
 
             prev_portfolio = target_portfolio
+            if self.mode == "optimizer_v2" and target_weights:
+                prev_weights = dict(target_weights)
 
         # Compute result metrics
         if not daily_pnl_net:
