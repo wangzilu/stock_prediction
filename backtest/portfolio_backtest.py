@@ -1,23 +1,24 @@
 """Portfolio backtest engine for Qlib model predictions.
 
-Takes daily model predictions → forms TopK portfolio → tracks PnL with costs.
+Takes daily model predictions -> forms TopK portfolio -> tracks PnL with costs.
 
-Execution assumption: T日收盘后出信号, T+1 close-to-close 记账.
-T+1 open/VWAP 成交模拟可作为后续扩展，但不能和训练 label 混用。
+Execution assumption: T close signal, T+1 open execution (or close-to-close as fallback).
+Supports close-to-close and open-to-open pricing via load_daily_returns(execution_price=).
 
 Constraints:
 - T+1 (no same-day sell)
-- Limit-up: cannot buy (涨停不可买)
-- Limit-down: cannot sell (跌停不可卖)
-- Suspended: cannot trade (停牌不可交易)
+- Limit-up: cannot buy
+- Limit-down: cannot sell
+- Suspended: cannot trade
 - ST: excluded from universe
 - Min ADV filter (minimum daily turnover)
+- IPO filter: new stocks with < min_listing_days trading days excluded
 
 Usage:
     from backtest.portfolio_backtest import PortfolioBacktest
     from backtest.cost_model import CostModel
 
-    bt = PortfolioBacktest(top_k=20, cost_model=CostModel())
+    bt = PortfolioBacktest(top_k=20, cost_model=CostModel(), min_listing_days=60)
     result = bt.run(predictions, price_data)
 """
 import logging
@@ -54,20 +55,29 @@ class PortfolioResult:
     raw_annual_return: float = 0.0
     raw_sharpe: float = 0.0
 
+    # Benchmark excess return
+    excess_return: float = 0.0          # total: portfolio - benchmark
+    annual_excess_return: float = 0.0
+    information_ratio: float = 0.0      # annualized excess / tracking error
+
     # Metadata
     n_days: int = 0
     avg_holdings: float = 0.0
+    suspended_days: int = 0  # stock-days where held stock was suspended (frozen valuation)
+    ipo_filtered_count: int = 0  # total stock-day removals due to IPO filter
 
     # Time series
     daily_pnl: pd.Series = field(default_factory=pd.Series)
     daily_turnover: pd.Series = field(default_factory=pd.Series)
     daily_cost: pd.Series = field(default_factory=pd.Series)
+    daily_benchmark: pd.Series = field(default_factory=pd.Series)
+    daily_excess: pd.Series = field(default_factory=pd.Series)
 
     def summary(self) -> str:
         lines = [
-            "═" * 50,
+            "=" * 50,
             "PORTFOLIO BACKTEST RESULT",
-            "═" * 50,
+            "=" * 50,
             f"Period:          {self.n_days} trading days",
             f"Avg holdings:    {self.avg_holdings:.1f} stocks",
             "",
@@ -85,13 +95,46 @@ class PortfolioResult:
             f"Max drawdown:    {self.max_drawdown*100:.2f}%",
             f"Win rate (day):  {self.win_rate*100:.1f}%",
             "",
+            "--- Benchmark ---",
+            f"Excess return:   {self.excess_return*100:+.2f}%",
+            f"Annual excess:   {self.annual_excess_return*100:+.2f}%",
+            f"Info ratio:      {self.information_ratio:.3f}",
+            "",
             "--- Cost ---",
             f"Total cost:      {self.total_cost*100:.3f}%",
             f"Cost/Return:     {self.cost_to_return_ratio*100:.1f}%",
             f"Avg turnover:    {self.avg_turnover*100:.1f}%",
-            "═" * 50,
+            "",
+            "--- Filters ---",
+            f"Suspended days:  {self.suspended_days} stock-days (frozen valuation)",
+            f"IPO filtered:    {self.ipo_filtered_count} stock-day removals",
+            "=" * 50,
         ]
         return "\n".join(lines)
+
+
+def _build_listing_day_count(predictions: pd.DataFrame) -> dict[str, pd.Series]:
+    """Build a per-stock cumulative trading day count from prediction index.
+
+    Returns dict mapping instrument -> Series(date -> cumulative_day_count).
+    Used for IPO filtering: stocks with count < threshold on a given date
+    are considered too new.
+    """
+    idx = predictions.index
+    dates_by_stock: dict[str, list] = {}
+    for dt, inst in idx:
+        inst_str = str(inst)
+        if inst_str not in dates_by_stock:
+            dates_by_stock[inst_str] = []
+        dates_by_stock[inst_str].append(dt)
+
+    result = {}
+    for inst, dt_list in dates_by_stock.items():
+        dt_sorted = sorted(set(dt_list))
+        result[inst] = pd.Series(
+            range(1, len(dt_sorted) + 1), index=dt_sorted
+        )
+    return result
 
 
 class PortfolioBacktest:
@@ -106,11 +149,13 @@ class PortfolioBacktest:
         self,
         top_k: int = 20,
         cost_model: Optional[CostModel] = None,
-        min_adv: float = 5e6,       # 最小日成交额 500 万
-        max_weight: float = 0.08,   # 单票最大权重 8%
-        rebalance_freq: int = 5,    # 每 N 天换仓 (default: weekly)
+        min_adv: float = 5e6,       # min daily turnover 5M
+        max_weight: float = 0.08,   # max single-stock weight 8%
+        rebalance_freq: int = 5,    # rebalance every N days (default: weekly)
         dropout_k: int = 0,         # TopK dropout: only sell if falls below top_k + dropout_k
         hold_bonus: float = 0.0,    # Score bonus for currently held stocks (reduces turnover)
+        # --- IPO filter ---
+        min_listing_days: int = 60, # exclude stocks listed < N trading days
         # --- Buffered Partial Rebalance params ---
         mode: str = "fixed",        # "fixed" or "buffered_partial"
         buffer: int = 5,            # no-trade zone: stocks ranked top_k+1 ~ top_k+buffer are safe
@@ -129,6 +174,7 @@ class PortfolioBacktest:
         self.rebalance_freq = rebalance_freq
         self.dropout_k = dropout_k
         self.hold_bonus = hold_bonus
+        self.min_listing_days = min_listing_days
         self.mode = mode
         self.buffer = buffer
         self.trade_rate = trade_rate
@@ -147,18 +193,21 @@ class PortfolioBacktest:
         suspended: Optional[pd.DataFrame] = None,
         adv: Optional[pd.DataFrame] = None,
         return_horizon_days: int = 1,
+        benchmark_returns: Optional[pd.Series] = None,
     ) -> PortfolioResult:
         """Run backtest.
 
         Args:
             predictions: DataFrame indexed by (datetime, instrument) with column 'score'
             returns: DataFrame indexed by (datetime, instrument) with 1-day realized return
-                     (close-to-close daily return, NOT model training label)
+                     (close-to-close or open-to-open daily return, NOT model training label)
             return_horizon_days: Must be 1. Safety check to prevent passing multi-day labels.
             limit_up: Boolean DataFrame - True if stock hit limit up (cannot buy)
             limit_down: Boolean DataFrame - True if stock hit limit down (cannot sell)
             suspended: Boolean DataFrame - True if stock is suspended
             adv: Average daily volume (for liquidity filter)
+            benchmark_returns: Optional Series indexed by datetime with daily benchmark return.
+                               Use backtest.benchmark.load_benchmark_returns() to obtain.
 
         Returns:
             PortfolioResult
@@ -180,7 +229,12 @@ class PortfolioBacktest:
         dates = sorted(predictions.index.get_level_values(0).unique())
         logger.info(f"Backtest: {len(dates)} dates, top_k={self.top_k}, "
                     f"rebal_freq={self.rebalance_freq}, dropout_k={self.dropout_k}, "
-                    f"hold_bonus={self.hold_bonus}")
+                    f"hold_bonus={self.hold_bonus}, min_listing_days={self.min_listing_days}")
+
+        # --- IPO filter: build per-stock cumulative day count ---
+        listing_counts: Optional[dict] = None
+        if self.min_listing_days > 0:
+            listing_counts = _build_listing_day_count(predictions)
 
         daily_pnl_raw = []
         daily_pnl_net = []
@@ -191,6 +245,8 @@ class PortfolioBacktest:
         days_since_rebal = 0
         holding_days = {}  # {stock: days_held}
         recent_pnl = []    # last N daily returns for vol estimation
+        total_suspended_days = 0  # stock-days with frozen valuation
+        total_ipo_filtered = 0    # stock-day removals due to IPO filter
 
         for i, date in enumerate(dates):
             # Get predictions for this date
@@ -209,6 +265,22 @@ class PortfolioBacktest:
                 day_adv = adv.loc[date]
                 liquid = day_adv[day_adv > self.min_adv].index
                 scores = scores[scores.index.isin(liquid)]
+
+            # Filter: IPO — exclude stocks with < min_listing_days trading days
+            if listing_counts is not None and self.min_listing_days > 0:
+                mature_stocks = []
+                for inst in scores.index:
+                    inst_str = str(inst)
+                    if inst_str in listing_counts:
+                        cnt_series = listing_counts[inst_str]
+                        if date in cnt_series.index and cnt_series[date] >= self.min_listing_days:
+                            mature_stocks.append(inst)
+                    # If stock not in listing_counts, it has no history — skip
+                n_before = len(scores)
+                scores = scores[scores.index.isin(mature_stocks)]
+                n_removed = n_before - len(scores)
+                if n_removed > 0:
+                    total_ipo_filtered += n_removed
 
             # Filter: suspended stocks cannot be traded
             if suspended is not None and date in suspended.index.get_level_values(0):
@@ -328,9 +400,19 @@ class PortfolioBacktest:
                     if isinstance(day_returns, pd.DataFrame):
                         day_returns = day_returns.iloc[:, 0]
 
-                    # Equal weight portfolio return
+                    # Equal weight portfolio return with frozen valuation for suspended stocks
                     port_stocks = list(target_portfolio)
-                    port_rets = day_returns.reindex(port_stocks).dropna()
+                    port_rets = day_returns.reindex(port_stocks)
+
+                    # Suspended stock handling: NaN return -> frozen valuation (0 return)
+                    n_suspended = int(port_rets.isna().sum())
+                    if n_suspended > 0:
+                        total_suspended_days += n_suspended
+                        logger.warning(
+                            f"{next_date}: {n_suspended} held stock(s) suspended, "
+                            f"using frozen valuation (0 return)"
+                        )
+                        port_rets = port_rets.fillna(0.0)
 
                     if len(port_rets) > 0:
                         raw_ret = port_rets.mean()
@@ -393,6 +475,28 @@ class PortfolioBacktest:
         total_cost = float(np.sum(costs))
         cost_ratio = total_cost / (abs(raw_total) + 1e-8) if raw_total != 0 else 0
 
+        # --- Benchmark excess return ---
+        excess_ret = 0.0
+        annual_excess = 0.0
+        info_ratio = 0.0
+        daily_bm = pd.Series(dtype=float)
+        daily_ex = pd.Series(dtype=float)
+
+        if benchmark_returns is not None and len(benchmark_returns) > 0:
+            # Align benchmark to backtest dates
+            bm_aligned = benchmark_returns.reindex(dates[:n_days]).fillna(0.0)
+            daily_bm = bm_aligned
+            daily_ex = pd.Series(pnl_net, index=dates[:n_days]) - bm_aligned
+
+            bm_total = float(np.prod(1 + bm_aligned.values) - 1)
+            excess_ret = total_ret - bm_total
+            annual_excess = float((1 + total_ret) ** annual_factor - 1) - \
+                            float((1 + bm_total) ** annual_factor - 1)
+
+            # Information ratio: annualized excess / tracking error
+            tracking_error = float(daily_ex.std() * np.sqrt(250))
+            info_ratio = annual_excess / (tracking_error + 1e-8)
+
         result = PortfolioResult(
             total_return=total_ret,
             annual_return=annual_ret,
@@ -407,11 +511,18 @@ class PortfolioBacktest:
             raw_total_return=raw_total,
             raw_annual_return=raw_annual,
             raw_sharpe=raw_sharpe,
+            excess_return=excess_ret,
+            annual_excess_return=annual_excess,
+            information_ratio=info_ratio,
             n_days=n_days,
             avg_holdings=float(np.mean(daily_holdings_count)),
+            suspended_days=total_suspended_days,
+            ipo_filtered_count=total_ipo_filtered,
             daily_pnl=pd.Series(pnl_net, index=dates[:n_days]),
             daily_turnover=pd.Series(turnovers, index=dates[:n_days]),
             daily_cost=pd.Series(costs, index=dates[:n_days]),
+            daily_benchmark=daily_bm,
+            daily_excess=daily_ex,
         )
 
         return result
@@ -463,7 +574,7 @@ class PortfolioBacktest:
                 if median_vol > 0 and current_vol / median_vol > self.vol_threshold:
                     effective_rate *= 0.5  # halve trade speed in high-vol
 
-        # Step 4: Partial trading — only trade a fraction of desired changes
+        # Step 4: Partial trading -- only trade a fraction of desired changes
         n_sells = int(len(sell_candidates) * effective_rate + 0.5)
         n_sells = min(n_sells, int(self.max_daily_turnover * len(prev_portfolio)))
 

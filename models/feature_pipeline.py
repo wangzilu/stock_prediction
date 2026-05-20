@@ -124,28 +124,51 @@ def train_xgb(X_train, y_train, X_valid, y_valid, params=None):
     return model
 
 
-def load_daily_returns(index: pd.MultiIndex) -> pd.Series:
+def load_daily_returns(index: pd.MultiIndex, execution_price: str = "close") -> pd.Series:
     """Load 1-day realized returns for portfolio PnL accounting.
 
-    Returns close-to-close daily return: (D+1 close) / (D close) - 1.
-    Index date D means: if you hold on day D, the return you realize is
-    from D close to D+1 close.
+    Args:
+        index: MultiIndex (datetime, instrument) defining the universe.
+        execution_price: "close" or "open".
+            - "close": close-to-close return = (D+1 close) / (D close) - 1.
+              Signal at D close, PnL from D close to D+1 close.
+            - "open": open-to-open return = (D+1 open) / (D open) - 1.
+              Signal at D-1 close, execute at D open, PnL from D open to D+1 open.
+              More realistic: avoids lookahead on execution price.
 
     IMPORTANT: This is NOT the model training label (which is N-day forward).
     Never use model labels as PnL returns.
     """
     from qlib.data import D
 
+    if execution_price not in ("close", "open"):
+        raise ValueError(f"execution_price must be 'close' or 'open', got '{execution_price}'")
+
     insts = sorted(set(str(c) for c in index.get_level_values(1)))
     dates = sorted(index.get_level_values(0).unique())
+    start = str(min(dates))[:10]
+    end = str(max(dates))[:10]
 
-    ret = D.features(
-        insts,
-        ["Ref($close, -1) / $close - 1"],
-        start_time=str(min(dates))[:10],
-        end_time=str(max(dates))[:10],
-    )
-    ret.columns = ["pnl_return_1d"]
+    if execution_price == "close":
+        ret = D.features(
+            insts,
+            ["Ref($close, -1) / $close - 1"],
+            start_time=start,
+            end_time=end,
+        )
+        ret.columns = ["pnl_return_1d"]
+    else:
+        # Open-to-open: load both open prices and compute manually.
+        # Ref($open, -1) is tomorrow's open; Ref($open, -1) / $open - 1
+        # gives the return from today's open to tomorrow's open.
+        ret = D.features(
+            insts,
+            ["Ref($open, -1) / $open - 1"],
+            start_time=start,
+            end_time=end,
+        )
+        ret.columns = ["pnl_return_1d"]
+
     ret = ret.swaplevel().sort_index()
     return ret.replace([np.inf, -np.inf], np.nan).dropna()
 

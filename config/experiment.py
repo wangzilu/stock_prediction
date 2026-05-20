@@ -157,9 +157,32 @@ PORTFOLIO_DROPOUT_K = 15        # Only sell if falls below top 35
 PORTFOLIO_HOLD_BONUS = 0.0
 
 
-def experiment_metadata() -> dict:
-    """Return a metadata dict to embed in every experiment artifact."""
+def experiment_metadata(
+    cache_path=None,
+    model_version: str = "xgb_174",
+) -> dict:
+    """Return a metadata dict to embed in every experiment artifact.
+
+    Includes full version binding (data, code, config, qlib calendar)
+    so every result can be traced to its exact inputs.
+
+    Parameters
+    ----------
+    cache_path : Path or str, optional
+        Feature cache parquet path (for data_version fingerprint).
+    model_version : str
+        Human-readable model tag, e.g. "xgb_174".
+    """
+    from utils.versioning import get_experiment_metadata
+
+    version_info = get_experiment_metadata(
+        cache_path=cache_path,
+        model_version=model_version,
+    )
     return {
+        # --- version binding ---
+        **version_info,
+        # --- experiment parameters ---
         "seed": SEED,
         "universe": UNIVERSE,
         "target_label": TARGET_LABEL_EXPR,
