@@ -162,22 +162,34 @@ class PaperOMS:
 
         # Buy: fill vacated slots from top candidates
         remaining = current_positions - actual_sells
-        n_buys = min(len(actual_sells), self.top_k - len(remaining))
+        open_slots = self.top_k - len(remaining)
+        if current_positions:
+            # Existing portfolio: only buy to replace sold stocks (partial rebalance)
+            n_buys = min(len(actual_sells), open_slots)
+        else:
+            # Empty portfolio (first day or after reset): buy up to top_k
+            n_buys = open_slots
         buy_candidates = [k for k, _ in sorted_preds[:self.top_k] if k not in remaining]
         actual_buys = set(buy_candidates[:max(0, n_buys)])
 
         target = list(remaining | actual_buys)
         return target, list(actual_sells), list(actual_buys)
 
-    def _load_real_prices(self, date: str) -> dict:
+    def _load_real_prices(self, date: str, extra_codes: list = None) -> dict:
         """Load real closing prices for the given date from Qlib or cache."""
         prices = {}
         try:
-            # Try lgb_latest_predictions cache (has stock codes but not prices)
-            # Use Qlib daily data for actual close prices
             from qlib.data import D
             import pandas as pd
+            # Ensure Qlib is initialized
+            try:
+                D.calendar(freq="day", start_time="2020-01-01", end_time="2020-01-02")
+            except Exception:
+                from config.qlib_runtime import init_qlib
+                init_qlib(str(DATA_DIR / "qlib_data" / "cn_data"))
             insts = list(self.state.get("positions", {}).keys())
+            if extra_codes:
+                insts = list(set(insts + extra_codes))
             if not insts:
                 return prices
             # Normalize codes for Qlib
@@ -186,7 +198,8 @@ class PaperOMS:
                            start_time=date, end_time=date)
             if df is not None and not df.empty:
                 for idx, row in df.iterrows():
-                    inst = str(idx[1]).upper() if isinstance(idx, tuple) else str(idx).upper()
+                    # Qlib returns MultiIndex (instrument, datetime)
+                    inst = str(idx[0]).upper() if isinstance(idx, tuple) else str(idx).upper()
                     price = float(row.iloc[0])
                     if np.isfinite(price) and price > 0:
                         prices[inst] = price
@@ -200,9 +213,9 @@ class PaperOMS:
         positions = self.state["positions"]
         trades = []
 
-        # Load real prices for all relevant stocks
+        # Load real prices for all relevant stocks (positions + buy candidates)
         all_codes = list(set(sells + buys + list(positions.keys())))
-        prices = self._load_real_prices(date)
+        prices = self._load_real_prices(date, extra_codes=all_codes)
 
         # Execute sells
         for code in sells:
