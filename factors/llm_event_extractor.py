@@ -116,7 +116,7 @@ class LLMEventExtractor:
                         ],
                         "max_tokens": 512,
                     },
-                    timeout=30,
+                    timeout=(5, 15),  # (connect, read) timeout
                 )
 
                 if resp.status_code != 200:
@@ -254,8 +254,15 @@ class LLMEventExtractor:
             for i, (code, news_list) in enumerate(stock_news.items()):
                 # Take top N most recent news for this stock
                 selected = news_list[:max_news_per_stock]
+                stock_start = time.time()
 
                 for news_item in selected:
+                    # Per-stock timeout: 60s max per stock to prevent hang
+                    if time.time() - stock_start > 60:
+                        logger.warning(f"Stock {code} timeout (>60s), skipping remaining news")
+                        total_failed += len(selected)
+                        break
+
                     title = news_item.get("title", "")
                     snippet = news_item.get("content_snippet", "")
                     name = news_item.get("stock_name", "")

@@ -57,18 +57,33 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False):
         logger.debug(traceback.format_exc())
         return False
 
-    # Step 2: Extract events via LLM
+    # Step 2: Extract events via LLM (with 15-min total timeout)
     logger.info("[Step 2/3] Extracting events via MiniMax LLM...")
     try:
+        import signal as _signal
         from factors.llm_event_extractor import LLMEventExtractor
 
-        extractor = LLMEventExtractor()
-        events_path = extractor.extract_from_news_file(
-            news_path=news_path,
-            max_news_per_stock=3,
-            target_date=target_date,
-        )
-        logger.info(f"  Events extracted -> {events_path}")
+        class _Timeout(Exception):
+            pass
+
+        def _handler(signum, frame):
+            raise _Timeout("LLM extraction exceeded 15-minute timeout")
+
+        old_handler = _signal.signal(_signal.SIGALRM, _handler)
+        _signal.alarm(900)  # 15 minutes
+        try:
+            extractor = LLMEventExtractor()
+            events_path = extractor.extract_from_news_file(
+                news_path=news_path,
+                max_news_per_stock=3,
+                target_date=target_date,
+            )
+            logger.info(f"  Events extracted -> {events_path}")
+        except _Timeout:
+            logger.warning("  LLM extraction timed out at 15 min — partial results saved")
+        finally:
+            _signal.alarm(0)
+            _signal.signal(_signal.SIGALRM, old_handler)
     except Exception as e:
         logger.error(f"  Event extraction failed: {e}")
         logger.debug(traceback.format_exc())
