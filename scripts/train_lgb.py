@@ -277,6 +277,58 @@ def main():
             },
         }
         print("Training LightGBM (fallback)...")
+    # ---- Apply tradable mask: filter ST/IPO/suspended/一字板 from training data ----
+    tradable_mask_path = os.path.join(DATA_DIR, "tradable_mask.parquet")
+    winsorized_label_path = os.path.join(DATA_DIR, "label_5d_winsorized.parquet")
+
+    if os.path.exists(tradable_mask_path):
+        try:
+            from qlib.data.dataset.handler import DataHandlerLP
+
+            mask_df = pd.read_parquet(tradable_mask_path)
+            tradable = mask_df["tradable"]
+
+            handler = dataset.handler
+            for attr in ('_learn', '_data'):
+                df = getattr(handler, attr, None)
+                if df is None:
+                    continue
+                # Align mask to handler index
+                common = tradable.index.intersection(df.index)
+                untradable = tradable.loc[common]
+                untradable = untradable[~untradable]  # False entries
+                if len(untradable) > 0:
+                    # Set labels of untradable stock-days to NaN
+                    # Qlib's DropnaLabel processor will then exclude them from training
+                    label_cols = [c for c in df.columns if c[0] == "label"]
+                    for lc in label_cols:
+                        df.loc[untradable.index.intersection(df.index), lc] = np.nan
+                    n_masked = len(untradable.index.intersection(df.index))
+                    print(f"Tradable mask applied to {attr}: {n_masked} untradable samples masked to NaN")
+
+            # Optionally apply winsorized labels
+            if os.path.exists(winsorized_label_path):
+                win_df = pd.read_parquet(winsorized_label_path)
+                win_label = win_df["label_5d_win"]
+                for attr in ('_learn', '_data'):
+                    df = getattr(handler, attr, None)
+                    if df is None:
+                        continue
+                    label_cols = [c for c in df.columns if c[0] == "label"]
+                    if label_cols:
+                        lc = label_cols[0]
+                        common = win_label.index.intersection(df.index)
+                        valid_win = win_label.loc[common].dropna()
+                        df.loc[valid_win.index, lc] = valid_win.values
+                        print(f"Winsorized labels applied to {attr}: {len(valid_win)} samples")
+
+        except Exception as e:
+            print(f"Tradable mask application failed (continuing without filter): {e}")
+            import traceback; traceback.print_exc()
+    else:
+        print("No tradable mask found — training on full universe")
+        print("  Run: python scripts/build_tradable_mask.py")
+
     model = init_instance_by_config(model_config)
     model.fit(dataset)
     print("Training complete!")
