@@ -171,23 +171,52 @@ def collect_news_for_stock(code: str, name: str, max_items: int = 10) -> list[di
     except Exception:
         pass
 
-    # Fallback to AKShare
+    # Fallback: direct Eastmoney news API (bypasses AKShare regex bug)
     try:
-        import akshare as ak
-        df = ak.stock_news_em(symbol=code)
-        if df is None or df.empty:
-            return []
+        import requests
+        url = "https://search-api-web.eastmoney.com/search/jsonp"
+        params = {
+            "cb": "jQuery_cb",
+            "param": (
+                f'{{"uid":"","keyword":"{code}","type":["cmsArticleWebOld"],'
+                f'"client":"web","clientType":"web","clientVersion":"curr",'
+                f'"param":{{"cmsArticleWebOld":{{"searchScope":"default",'
+                f'"sort":"default","pageIndex":1,"pageSize":{max_items},'
+                f'"preTag":"<em>","postTag":"</em>"}}}}}}'
+            ),
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+            "Referer": "https://so.eastmoney.com/",
+        }
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        text = resp.text
+        # Strip JSONP wrapper: jQuery_cb({...})
+        if text.startswith("jQuery_cb("):
+            text = text[len("jQuery_cb("):-1]
+        import json as _json
+        data = _json.loads(text)
+        raw = data.get("result", {}).get("cmsArticleWebOld", [])
+        # API returns either a list directly or a dict with "list" key
+        if isinstance(raw, list):
+            articles = raw
+        elif isinstance(raw, dict):
+            articles = raw.get("list", [])
+        else:
+            articles = []
 
         records = []
-        for _, row in df.head(max_items).iterrows():
+        for item in articles[:max_items]:
+            title = item.get("title", "").replace("<em>", "").replace("</em>", "")
+            content = item.get("content", "").replace("<em>", "").replace("</em>", "")
             records.append({
                 "stock_code": code,
                 "stock_name": name,
-                "title": str(row.get("新闻标题", "")),
-                "content_snippet": str(row.get("新闻内容", ""))[:500],
-                "source": str(row.get("文章来源", "")),
-                "publish_time": str(row.get("发布时间", "")),
-                "url": str(row.get("新闻链接", "")),
+                "title": title,
+                "content_snippet": content[:500],
+                "source": item.get("mediaName", "eastmoney"),
+                "publish_time": item.get("date", ""),
+                "url": item.get("url", ""),
             })
         return records
 
