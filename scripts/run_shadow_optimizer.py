@@ -145,13 +145,21 @@ def run_daily(date: str = None):
         logger.info("  Already ran today, skipping")
         return state
 
-    # Load predictions
+    # Load predictions and filter universe
     predictions = load_predictions()
     if not predictions:
         logger.warning("  No predictions, holding current")
         _record_daily_pnl(state, date, {})
         save_state(state)
         return state
+
+    # Universe filter (ST, BSE, etc.)
+    try:
+        from models.universe_filter import UniverseFilter
+        uf = UniverseFilter()
+        predictions = uf.filter_predictions(predictions)
+    except Exception as e:
+        logger.warning(f"  Universe filter failed: {e}")
 
     logger.info(f"  Predictions: {len(predictions)}")
 

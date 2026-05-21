@@ -330,8 +330,19 @@ class PaperOMS:
         date = date or datetime.now().strftime("%Y-%m-%d")
         logger.info(f"Paper OMS: running for {date}")
 
-        # Load predictions
+        # Load predictions and filter universe (ST, BSE, etc.)
         predictions = self.load_predictions()
+        if predictions:
+            try:
+                from models.universe_filter import UniverseFilter
+                uf = UniverseFilter()
+                n_before = len(predictions)
+                predictions = uf.filter_predictions(predictions)
+                n_after = len(predictions)
+                if n_before != n_after:
+                    logger.info(f"  Universe filter: {n_before} -> {n_after} predictions")
+            except Exception as e:
+                logger.warning(f"  Universe filter failed (continuing unfiltered): {e}")
         if not predictions:
             logger.warning("  No predictions, holding current positions")
             self.update_holding_days()
