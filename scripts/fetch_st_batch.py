@@ -213,6 +213,10 @@ def fetch_source(name: str, config: dict, stock_list: list = None):
 
         if all_records:
             df = pd.DataFrame(all_records)
+            # Fix mixed types: convert all object columns to str
+            for col in df.columns:
+                if df[col].dtype == object:
+                    df[col] = df[col].astype(str)
             df.to_parquet(str(output_path), index=False)
             logger.info(f"  ✅ {name}: {len(df)} records -> {output_path.name}")
             return df
@@ -232,11 +236,17 @@ def fetch_source(name: str, config: dict, stock_list: list = None):
                 data = result.get("data")
                 if isinstance(data, list) and data:
                     df = pd.DataFrame(data)
+                    for col in df.columns:
+                        if df[col].dtype == object:
+                            df[col] = df[col].astype(str)
                     df.to_parquet(str(output_path), index=False)
                     logger.info(f"  ✅ {name}: {len(df)} records -> {output_path.name}")
                     return df
             elif isinstance(result, list) and result:
                 df = pd.DataFrame(result)
+                for col in df.columns:
+                    if df[col].dtype == object:
+                        df[col] = df[col].astype(str)
                 df.to_parquet(str(output_path), index=False)
                 logger.info(f"  ✅ {name}: {len(df)} records -> {output_path.name}")
                 return df
