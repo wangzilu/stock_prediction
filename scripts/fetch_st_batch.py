@@ -63,8 +63,8 @@ SOURCES = {
     "stk_holdertrade": {
         "desc": "股东增减持",
         "method": "stk_holdertrade",
-        "per_stock": False,
-        "kwargs": lambda: {"start_date": "20210101", "end_date": "20261231"},
+        "per_stock": True,
+        "kwargs": lambda code: {"ts_code": code, "start_date": "20210101", "end_date": "20261231"},
     },
     "share_float": {
         "desc": "限售解禁",
@@ -76,8 +76,8 @@ SOURCES = {
     "suspend_d": {
         "desc": "停牌信息",
         "method": "suspend_d",
-        "per_stock": False,
-        "kwargs": lambda: {"start_date": "20210101", "end_date": "20261231"},
+        "per_stock": True,
+        "kwargs": lambda code: {"ts_code": code, "start_date": "20210101", "end_date": "20261231"},
     },
     "adj_factor": {
         "desc": "复权因子",
@@ -94,15 +94,15 @@ SOURCES = {
     "stk_limit": {
         "desc": "涨跌停价格",
         "method": "stk_limit",
-        "per_stock": False,
-        "kwargs": lambda: {"start_date": "20240101", "end_date": "20261231"},
+        "per_stock": True,
+        "kwargs": lambda code: {"ts_code": code, "start_date": "20240101", "end_date": "20261231"},
     },
     # ===== 指数 =====
     "index_weight": {
         "desc": "指数权重(中证500)",
         "method": "index_weight",
         "per_stock": False,
-        "kwargs": lambda: {"index_code": "000905.SH", "start_date": "20210101", "end_date": "20261231"},
+        "kwargs": lambda: {"index_code": "000905.SH"},
     },
     # ===== 北向资金 =====
     "hsgt_top10": {
@@ -115,15 +115,15 @@ SOURCES = {
     "disclosure_date": {
         "desc": "财报披露日期",
         "method": "disclosure_date",
-        "per_stock": False,
-        "kwargs": lambda: {"end_date": "20261231"},
+        "per_stock": True,
+        "kwargs": lambda code: {"ts_code": code, "end_date": "20261231"},
     },
     # ===== 其他 =====
     "namechange": {
         "desc": "股票更名历史",
         "method": "namechange",
-        "per_stock": False,
-        "kwargs": lambda: {"start_date": "20100101", "end_date": "20261231"},
+        "per_stock": True,
+        "kwargs": lambda code: {"ts_code": code},
     },
     "stk_holdernumber": {
         "desc": "股东人数",
