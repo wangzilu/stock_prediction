@@ -50,6 +50,7 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False):
         news_path = collect_daily_news(
             target_date=target_date,
             use_portfolio=use_portfolio,
+            top_n=300,  # 300 stocks for better coverage (was 100)
         )
         logger.info(f"  News collected -> {news_path}")
     except Exception as e:
@@ -75,7 +76,7 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False):
             extractor = LLMEventExtractor()
             events_path = extractor.extract_from_news_file(
                 news_path=news_path,
-                max_news_per_stock=3,
+                max_news_per_stock=2,  # 2 per stock (was 3) to stay within timeout
                 target_date=target_date,
             )
             logger.info(f"  Events extracted -> {events_path}")
