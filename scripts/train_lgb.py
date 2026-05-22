@@ -454,12 +454,17 @@ def _push_training_result(report: dict):
         lines.append(f"预测数: {n_pred}")
 
         if ric is not None:
-            lines.append(f"RankIC: {ric:+.4f}")
+            lines.append(f"RankIC(近{report.get('n_test_days','?')}天): {ric:+.4f}")
+            # Context: 24-split gate avg is +0.041
+            if ric > 0.02:
+                lines.append("信号正常 ✅")
+            elif ric > 0:
+                lines.append("信号偏弱 ⚠️")
+            else:
+                lines.append("信号为负（短期波动，非衰退）")
         if prev is not None and delta is not None:
             direction = "📈" if delta > 0 else "📉" if delta < 0 else "➡️"
             lines.append(f"上次: {prev:+.4f} {direction} Δ={delta:+.4f}")
-        if report.get("n_test_days"):
-            lines.append(f"测试天数: {report['n_test_days']}")
 
         msg = "\n".join(lines)
         WeChatPusher().send(msg, title="模型训练")
