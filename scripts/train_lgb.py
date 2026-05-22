@@ -295,18 +295,18 @@ def main():
                     continue
                 # Align mask to handler index
                 common = tradable.index.intersection(df.index)
-                untradable = tradable.loc[common]
-                untradable = untradable[~untradable]  # False entries
-                if len(untradable) > 0:
-                    # Set labels of untradable stock-days to NaN
-                    # Qlib's DropnaLabel processor will then exclude them from training
-                    label_cols = [c for c in df.columns if c[0] == "label"]
-                    for lc in label_cols:
-                        df.loc[untradable.index.intersection(df.index), lc] = np.nan
-                    n_masked = len(untradable.index.intersection(df.index))
-                    print(f"Tradable mask applied to {attr}: {n_masked} untradable samples masked to NaN")
+                untradable_idx = tradable.loc[common]
+                untradable_idx = untradable_idx[~untradable_idx].index  # indices where tradable=False
 
-            # Optionally apply winsorized labels
+                if len(untradable_idx) > 0:
+                    drop_idx = untradable_idx.intersection(df.index)
+                    n_before = len(df)
+                    # Drop untradable rows entirely (NaN label causes XGB crash)
+                    setattr(handler, attr, df.drop(drop_idx))
+                    n_after = len(getattr(handler, attr))
+                    print(f"Tradable mask applied to {attr}: dropped {n_before - n_after} untradable rows ({n_before} -> {n_after})")
+
+            # Optionally apply winsorized labels (only overwrite non-NaN values)
             if os.path.exists(winsorized_label_path):
                 win_df = pd.read_parquet(winsorized_label_path)
                 win_label = win_df["label_5d_win"]
@@ -319,8 +319,10 @@ def main():
                         lc = label_cols[0]
                         common = win_label.index.intersection(df.index)
                         valid_win = win_label.loc[common].dropna()
-                        df.loc[valid_win.index, lc] = valid_win.values
-                        print(f"Winsorized labels applied to {attr}: {len(valid_win)} samples")
+                        valid_win = valid_win[valid_win.index.isin(df.index)]
+                        if len(valid_win) > 0:
+                            df.loc[valid_win.index, lc] = valid_win.values
+                            print(f"Winsorized labels applied to {attr}: {len(valid_win)} samples")
 
         except Exception as e:
             print(f"Tradable mask application failed (continuing without filter): {e}")
