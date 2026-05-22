@@ -306,7 +306,7 @@ class LLMEventExtractor:
             except Exception as e:
                 return ("fail", None)
 
-        n_workers = 8  # 8 concurrent API calls
+        n_workers = 16  # 16 concurrent API calls
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
             futures = {executor.submit(_process_one, t): i for i, t in enumerate(tasks)}
             done_count = 0

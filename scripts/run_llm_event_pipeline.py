@@ -50,7 +50,7 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False):
         news_path = collect_daily_news(
             target_date=target_date,
             use_portfolio=use_portfolio,
-            top_n=300,  # 300 stocks for better coverage (was 100)
+            top_n=1000,  # 1000 stocks for ~20% coverage
         )
         logger.info(f"  News collected -> {news_path}")
     except Exception as e:
@@ -71,12 +71,12 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False):
             raise _Timeout("LLM extraction exceeded 15-minute timeout")
 
         old_handler = _signal.signal(_signal.SIGALRM, _handler)
-        _signal.alarm(900)  # 15 minutes
+        _signal.alarm(1500)  # 25 minutes (1000 stocks × 16 concurrent)
         try:
             extractor = LLMEventExtractor()
             events_path = extractor.extract_from_news_file(
                 news_path=news_path,
-                max_news_per_stock=2,  # 2 per stock (was 3) to stay within timeout
+                max_news_per_stock=1,  # 1 per stock for 1000 stocks within timeout
                 target_date=target_date,
             )
             logger.info(f"  Events extracted -> {events_path}")
