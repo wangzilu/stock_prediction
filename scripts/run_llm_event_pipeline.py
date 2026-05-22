@@ -50,7 +50,7 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False):
         news_path = collect_daily_news(
             target_date=target_date,
             use_portfolio=use_portfolio,
-            top_n=1000,  # 1000 stocks for ~20% coverage
+            top_n=3000,  # 3000 stocks — concurrent collection makes this feasible
         )
         logger.info(f"  News collected -> {news_path}")
     except Exception as e:

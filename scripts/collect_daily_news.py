@@ -263,25 +263,40 @@ def collect_daily_news(
 
     logger.info(f"Collecting news for {len(stocks)} stocks on {target_date}")
 
-    total_news = 0
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+
+    all_results = []
+    results_lock = threading.Lock()
+
+    def _fetch_one(stock):
+        items = collect_news_for_stock(stock["code"], stock["name"], max_items=3)
+        for item in items:
+            item["qlib_code"] = stock["qlib_code"]
+            item["collect_date"] = target_date
+        time.sleep(0.1)  # light rate limit per thread
+        return items
+
+    n_workers = 8
+    done_count = 0
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(_fetch_one, s): s for s in stocks}
+        for future in as_completed(futures):
+            done_count += 1
+            items = future.result()
+            if items:
+                with results_lock:
+                    all_results.extend(items)
+            if done_count % 100 == 0:
+                logger.info(f"  Progress: {done_count}/{len(stocks)} stocks, {len(all_results)} news items")
+
+    # Write all at once (sorted for reproducibility)
+    all_results.sort(key=lambda x: x.get("stock_code", ""))
     with open(output_path, "w", encoding="utf-8") as f:
-        for i, stock in enumerate(stocks):
-            news_items = collect_news_for_stock(stock["code"], stock["name"])
+        for item in all_results:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
-            for item in news_items:
-                item["qlib_code"] = stock["qlib_code"]
-                item["collect_date"] = target_date
-                f.write(json.dumps(item, ensure_ascii=False) + "\n")
-                total_news += 1
-
-            # Rate limit: AKShare may throttle
-            if (i + 1) % 10 == 0:
-                logger.info(f"  Progress: {i+1}/{len(stocks)} stocks, {total_news} news items")
-                time.sleep(1.0)
-            else:
-                time.sleep(0.3)
-
-    logger.info(f"Collected {total_news} news items for {len(stocks)} stocks -> {output_path}")
+    logger.info(f"Collected {len(all_results)} news items for {len(stocks)} stocks -> {output_path}")
     return output_path
 
 
