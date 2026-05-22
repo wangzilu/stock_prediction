@@ -137,6 +137,55 @@ SOURCES = {
         "per_stock": True,
         "kwargs": lambda code: {"ts_code": code, "period": "20251231", "type": "P"},
     },
+    # === 新增高价值数据 ===
+    "kpl_concept": {
+        "desc": "开盘啦概念板块列表",
+        "method": "kpl_concept",
+        "per_stock": False,
+        "kwargs": lambda: {},
+    },
+    "kpl_concept_cons": {
+        "desc": "开盘啦概念板块成分",
+        "method": "kpl_concept_cons",
+        "per_stock": False,
+        "kwargs": lambda: {},
+    },
+    "limit_list_ths": {
+        "desc": "同花顺涨跌停股票列表",
+        "method": "limit_list_ths",
+        "per_stock": False,
+        "kwargs": lambda: {"start_date": "20240101", "end_date": "20261231"},
+    },
+    "limit_step": {
+        "desc": "连板晋级数据",
+        "method": "limit_step",
+        "per_stock": False,
+        "kwargs": lambda: {"start_date": "20240101", "end_date": "20261231"},
+    },
+    "stk_factor_pro": {
+        "desc": "ST专业技术因子",
+        "method": "stk_factor_pro",
+        "per_stock": True,
+        "kwargs": lambda code: {"ts_code": code, "start_date": "20240101", "end_date": "20261231"},
+    },
+    "research_report": {
+        "desc": "券商研报",
+        "method": "research_report",
+        "per_stock": False,
+        "kwargs": lambda: {"start_date": "20240101", "end_date": "20261231"},
+    },
+    "moneyflow_ths": {
+        "desc": "同花顺资金流",
+        "method": "moneyflow_ths",
+        "per_stock": True,
+        "kwargs": lambda code: {"ts_code": code, "start_date": "20240101", "end_date": "20261231"},
+    },
+    "index_member_all": {
+        "desc": "指数成分历史",
+        "method": "index_member_all",
+        "per_stock": False,
+        "kwargs": lambda: {"index_code": "000905.SH"},
+    },
 }
 
 
