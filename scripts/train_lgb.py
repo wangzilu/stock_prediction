@@ -346,6 +346,9 @@ def main():
     for key, value in stats.items():
         print(f"  {key}: {value}")
 
+    # --- Evaluate: RankIC on test set + compare with previous ---
+    train_report = _evaluate_and_compare(pred, dataset, stats)
+
     # Save model + dataset only after finite prediction validation passes.
     _save_artifacts_atomically(model, dataset)
     print(f"Model saved to {MODEL_PATH}")
@@ -353,7 +356,116 @@ def main():
     print(f"\nPredictions shape: {pred.shape}")
     print(f"Last 5 predictions:")
     print(pred.tail(5))
+
+    # Push training result
+    _push_training_result(train_report)
+
     return 0
+
+
+def _evaluate_and_compare(pred, dataset, health_stats) -> dict:
+    """Evaluate model on test set and compare with previous training."""
+    from scipy.stats import spearmanr
+    import json as _json
+
+    report = {
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "prediction_count": health_stats.get("latest_finite_prediction_count", 0),
+        "rank_ic": None,
+        "prev_rank_ic": None,
+        "delta_ic": None,
+        "status": "success",
+    }
+
+    # Compute RankIC on test set
+    try:
+        test_pred = pred
+        if isinstance(test_pred, pd.DataFrame):
+            test_pred = test_pred.iloc[:, 0]
+
+        test_label = dataset.prepare("test", col_set="label")
+        if isinstance(test_label, pd.DataFrame):
+            test_label = test_label.iloc[:, 0]
+
+        # Align
+        common = test_pred.index.intersection(test_label.index)
+        p = test_pred.loc[common].values.astype(float)
+        l = test_label.loc[common].values.astype(float)
+        mask = np.isfinite(p) & np.isfinite(l)
+        p, l = p[mask], l[mask]
+
+        if len(p) > 100:
+            # Per-date RankIC
+            pred_s = pd.Series(p, index=common[mask])
+            label_s = pd.Series(l, index=common[mask])
+            rics = []
+            for dt, g in pred_s.groupby(level=0):
+                gl = label_s.reindex(g.index).dropna()
+                c = g.index.intersection(gl.index)
+                if len(c) >= 40:
+                    ric = spearmanr(g.loc[c].values, gl.loc[c].values).statistic
+                    if np.isfinite(ric):
+                        rics.append(ric)
+            if rics:
+                report["rank_ic"] = round(float(np.mean(rics)), 4)
+                report["rank_ic_std"] = round(float(np.std(rics)), 4)
+                report["n_test_days"] = len(rics)
+                print(f"\nTest RankIC: {report['rank_ic']:+.4f} (±{report['rank_ic_std']:.4f}, {len(rics)} days)")
+    except Exception as e:
+        print(f"RankIC evaluation failed: {e}")
+
+    # Load previous training log for comparison
+    eval_log_path = os.path.join(DATA_DIR, "train_eval_history.jsonl")
+    try:
+        if os.path.exists(eval_log_path):
+            with open(eval_log_path) as f:
+                lines = f.readlines()
+            if lines:
+                prev = _json.loads(lines[-1])
+                report["prev_rank_ic"] = prev.get("rank_ic")
+                if report["rank_ic"] is not None and report["prev_rank_ic"] is not None:
+                    report["delta_ic"] = round(report["rank_ic"] - report["prev_rank_ic"], 4)
+                    direction = "↑" if report["delta_ic"] > 0 else "↓" if report["delta_ic"] < 0 else "→"
+                    print(f"vs Previous: {report['prev_rank_ic']:+.4f} → {report['rank_ic']:+.4f} ({direction}{abs(report['delta_ic']):.4f})")
+    except Exception:
+        pass
+
+    # Append to eval history
+    try:
+        with open(eval_log_path, "a") as f:
+            f.write(_json.dumps(report) + "\n")
+    except Exception:
+        pass
+
+    return report
+
+
+def _push_training_result(report: dict):
+    """Push training result via WeChat."""
+    try:
+        from push.wechat import WeChatPusher
+
+        ric = report.get("rank_ic")
+        prev = report.get("prev_rank_ic")
+        delta = report.get("delta_ic")
+        n_pred = report.get("prediction_count", 0)
+
+        lines = [f"🔧 模型训练完成 {report.get('date', '')}"]
+        lines.append(f"预测数: {n_pred}")
+
+        if ric is not None:
+            lines.append(f"RankIC: {ric:+.4f}")
+        if prev is not None and delta is not None:
+            direction = "📈" if delta > 0 else "📉" if delta < 0 else "➡️"
+            lines.append(f"上次: {prev:+.4f} {direction} Δ={delta:+.4f}")
+        if report.get("n_test_days"):
+            lines.append(f"测试天数: {report['n_test_days']}")
+
+        msg = "\n".join(lines)
+        WeChatPusher().send(msg, title="模型训练")
+        print(f"Training result pushed")
+    except Exception as e:
+        print(f"Push failed: {e}")
 
 
 if __name__ == "__main__":
