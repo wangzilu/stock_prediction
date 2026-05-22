@@ -85,7 +85,9 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
             [py, str(scripts / "fetch_fundamental_valuation.py"), "--days", "10", "--incremental"],
             "valuation_update.log",
         ),
-        CronJob("lgb_after_close_train", "15 18 * * 1-5", [py, str(scripts / "train_lgb.py")], "lgb_after_close_train.log"),
+        # Training: Wed 18:15 (mid-week) + Sat 04:00 (full retrain). NOT daily.
+        CronJob("midweek_train", "15 18 * * 3", [py, str(scripts / "train_lgb.py")], "lgb_after_close_train.log"),
+        # Smoke test (inference only): daily — uses existing model + new data
         CronJob("lgb_after_close_smoke", "35 18 * * 1-5", [py, str(scripts / "smoke_lgb_predict.py")], "lgb_after_close_smoke.log"),
         CronJob("shadow_optimizer", "40 18 * * 1-5", [py, str(scripts / "run_shadow_optimizer.py")], "shadow_optimizer.log"),
         CronJob("paper_trading", "42 18 * * 1-5", [py, str(scripts / "run_paper_trading.py")], "paper_trading.log"),
