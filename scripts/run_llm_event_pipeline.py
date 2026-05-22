@@ -71,7 +71,7 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False):
             raise _Timeout("LLM extraction exceeded 15-minute timeout")
 
         old_handler = _signal.signal(_signal.SIGALRM, _handler)
-        _signal.alarm(1500)  # 25 minutes (1000 stocks × 16 concurrent)
+        _signal.alarm(1800)  # 30 minutes (3000 stocks × 8 concurrent collection + 16 concurrent LLM)
         try:
             extractor = LLMEventExtractor()
             events_path = extractor.extract_from_news_file(
