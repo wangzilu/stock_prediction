@@ -83,18 +83,20 @@ class LLMEventExtractor:
         self.api_url = "https://api.minimax.io/v1/chat/completions"
         self.max_calls_per_minute = max_calls_per_minute
         self._call_timestamps: list[float] = []
+        import threading
+        self._rate_lock = threading.Lock()
 
     def _rate_limit(self):
-        """Enforce rate limit by waiting if necessary."""
-        now = time.time()
-        # Remove timestamps older than 60 seconds
-        self._call_timestamps = [t for t in self._call_timestamps if now - t < 60]
-        if len(self._call_timestamps) >= self.max_calls_per_minute:
-            wait_time = 60 - (now - self._call_timestamps[0]) + 0.1
-            if wait_time > 0:
-                logger.info(f"Rate limit: waiting {wait_time:.1f}s")
-                time.sleep(wait_time)
-        self._call_timestamps.append(time.time())
+        """Enforce rate limit by waiting if necessary. Thread-safe."""
+        with self._rate_lock:
+            now = time.time()
+            self._call_timestamps = [t for t in self._call_timestamps if now - t < 60]
+            if len(self._call_timestamps) >= self.max_calls_per_minute:
+                wait_time = 60 - (now - self._call_timestamps[0]) + 0.1
+                if wait_time > 0:
+                    logger.info(f"Rate limit: waiting {wait_time:.1f}s")
+                    time.sleep(wait_time)
+            self._call_timestamps.append(time.time())
 
     def _call_llm(self, system: str, user: str) -> str:
         """Call MiniMax API with retry. Returns response text."""
@@ -247,59 +249,86 @@ class LLMEventExtractor:
 
         logger.info(f"Processing news for {len(stock_news)} stocks from {news_path.name}")
 
+        # Build task list: (code, name, title, snippet, news_item) for each news
+        tasks = []
+        seen_titles = set()  # dedup by title
+        for code, news_list in stock_news.items():
+            selected = news_list[:max_news_per_stock]
+            for news_item in selected:
+                title = news_item.get("title", "").strip()
+                if not title:
+                    continue
+                # Title dedup: skip if we've seen very similar title
+                title_key = title[:30]  # first 30 chars as dedup key
+                if title_key in seen_titles:
+                    continue
+                seen_titles.add(title_key)
+                tasks.append((code, news_item))
+
+        logger.info(f"  {len(tasks)} unique news items to process (after dedup from {sum(len(v[:max_news_per_stock]) for v in stock_news.values())})")
+
+        # Concurrent LLM extraction
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+
         total_extracted = 0
         total_failed = 0
+        results_lock = threading.Lock()
+        all_records = []
 
-        with open(output_path, "w", encoding="utf-8") as f:
-            for i, (code, news_list) in enumerate(stock_news.items()):
-                # Take top N most recent news for this stock
-                selected = news_list[:max_news_per_stock]
-                stock_start = time.time()
+        def _process_one(task):
+            """Process a single news item. Thread-safe."""
+            code, news_item = task
+            title = news_item.get("title", "")
+            snippet = news_item.get("content_snippet", "")
+            name = news_item.get("stock_name", "")
+            try:
+                event = self.extract_single(code, name, title, snippet)
+                if event is not None:
+                    source = news_item.get("source", "unknown")
+                    source_quality = _source_quality_score(source)
+                    record = {
+                        "stock_code": code,
+                        "stock_name": name,
+                        "qlib_code": news_item.get("qlib_code", ""),
+                        "publish_time": news_item.get("publish_time", ""),
+                        "news_title": title,
+                        "raw_text": snippet[:500],
+                        "source": source,
+                        "source_quality": source_quality,
+                        "model_version": "minimax-m2.5-highspeed",
+                        "prompt_version": "v1",
+                        "extract_date": target_date,
+                        **event,
+                    }
+                    return ("ok", record)
+                return ("fail", None)
+            except Exception as e:
+                return ("fail", None)
 
-                for news_item in selected:
-                    # Per-stock timeout: 60s max per stock to prevent hang
-                    if time.time() - stock_start > 60:
-                        logger.warning(f"Stock {code} timeout (>60s), skipping remaining news")
-                        total_failed += len(selected)
-                        break
-
-                    title = news_item.get("title", "")
-                    snippet = news_item.get("content_snippet", "")
-                    name = news_item.get("stock_name", "")
-
-                    if not title:
-                        continue
-
-                    event = self.extract_single(code, name, title, snippet)
-
-                    if event is not None:
-                        # CX audit trail: raw text + source + model/prompt version
-                        source = news_item.get("source", "unknown")
-                        source_quality = _source_quality_score(source)
-                        record = {
-                            "stock_code": code,
-                            "stock_name": name,
-                            "qlib_code": news_item.get("qlib_code", ""),
-                            "publish_time": news_item.get("publish_time", ""),
-                            "news_title": title,
-                            "raw_text": snippet[:500],  # audit trail
-                            "source": source,
-                            "source_quality": source_quality,
-                            "model_version": "minimax-m2.5-highspeed",
-                            "prompt_version": "v1",
-                            "extract_date": target_date,
-                            **event,
-                        }
-                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-                        total_extracted += 1
-                    else:
-                        total_failed += 1
-
-                if (i + 1) % 20 == 0:
+        n_workers = 8  # 8 concurrent API calls
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = {executor.submit(_process_one, t): i for i, t in enumerate(tasks)}
+            done_count = 0
+            for future in as_completed(futures):
+                done_count += 1
+                status, record = future.result()
+                if status == "ok" and record:
+                    all_records.append(record)
+                    total_extracted += 1
+                else:
+                    total_failed += 1
+                if done_count % 50 == 0:
                     logger.info(
-                        f"  Progress: {i+1}/{len(stock_news)} stocks, "
+                        f"  Progress: {done_count}/{len(tasks)} items, "
                         f"{total_extracted} extracted, {total_failed} failed"
                     )
+
+        # Write all records to file (sorted by stock code for consistency)
+        all_records.sort(key=lambda r: r.get("stock_code", ""))
+        with open(output_path, "w", encoding="utf-8") as f:
+            for record in all_records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
         logger.info(
             f"Extraction complete: {total_extracted} events extracted, "
