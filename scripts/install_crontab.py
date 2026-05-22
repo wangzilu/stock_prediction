@@ -91,6 +91,7 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("paper_trading", "42 18 * * 1-5", [py, str(scripts / "run_paper_trading.py")], "paper_trading.log"),
         CronJob("factor_decay_monitor", "45 18 * * 1-5", [py, str(scripts / "monitor_factor_decay.py")], "factor_decay.log"),
         CronJob("brinson_attribution", "50 18 * * 1-5", [py, str(scripts / "run_brinson_attribution.py")], "brinson_attribution.log"),
+        CronJob("daily_health_check", "55 18 * * 1-5", [py, str(scripts / "daily_health_check.py")], "health_check.log"),
         # Weekly full retrain on Saturday (replaces daily 04:00 — 18:15 daily train is sufficient)
         CronJob("weekly_full_retrain", "0 4 * * 6", [py, str(scripts / "nightly_train.py")], "weekly_retrain.log"),
         # Weekly ST list refresh on Saturday before retrain
