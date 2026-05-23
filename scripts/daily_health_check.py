@@ -150,6 +150,35 @@ def check_guba(date: str) -> tuple[str, str]:
     return "✅", f"人气榜{n}只"
 
 
+def check_promotion_eligibility() -> tuple[str, str]:
+    """Check if shadow has enough data for promotion."""
+    compare_path = DATA_DIR / "paper_shadow" / "daily_compare.jsonl"
+    shadow_state_path = DATA_DIR / "paper_shadow" / "oms_state.json"
+    champion_state_path = DATA_DIR / "paper" / "oms_state.json"
+
+    if not shadow_state_path.exists():
+        return "❌", "Shadow 未运行"
+
+    shadow = json.loads(shadow_state_path.read_text())
+    champion = json.loads(champion_state_path.read_text()) if champion_state_path.exists() else {}
+
+    sh_days = len(shadow.get("daily_pnl_history", []))
+    ch_days = len(champion.get("daily_pnl_history", []))
+
+    sh_ret = shadow.get("total_value", 1e6) / 1e6 - 1
+    ch_ret = champion.get("total_value", 1e6) / 1e6 - 1
+    excess = sh_ret - ch_ret
+
+    if sh_days < 20:
+        return "⏳", f"观察{sh_days}/20天 shadow{sh_ret:+.2%} vs champion{ch_ret:+.2%} excess{excess:+.2%}"
+
+    # 20+ days: check if shadow beats champion
+    if excess > 0:
+        return "🟢", f"可晋升！{sh_days}天 shadow{sh_ret:+.2%} > champion{ch_ret:+.2%} excess{excess:+.2%}"
+    else:
+        return "🔴", f"{sh_days}天 shadow{sh_ret:+.2%} < champion{ch_ret:+.2%} excess{excess:+.2%}"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"))
@@ -206,6 +235,10 @@ def main():
         logger.info(f"  {line}")
         if status != "✅":
             has_issue = True
+
+    # 8. Shadow promotion eligibility
+    status, detail = check_promotion_eligibility()
+    checks.append(("Shadow晋升", status, detail))
 
     if has_issue:
         msg_lines.append("\n⚠️ 有异常项需要关注")
