@@ -111,10 +111,24 @@ class ModelRegistry:
     def list_models(self) -> list[dict]:
         return list(self._data["models"].values())
 
+    def set_execution_config(self, model_id: str, execution: dict):
+        """Set execution strategy config for a model (optimizer params, etc.)."""
+        if model_id in self._data["models"]:
+            self._data["models"][model_id]["execution"] = execution
+            self._save()
+
     def status(self) -> dict:
+        champion = self._data.get("champion")
+        shadow = self._data.get("shadow")
+        ch_info = self._data["models"].get(champion, {}) if champion else {}
+        sh_info = self._data["models"].get(shadow, {}) if shadow else {}
         return {
-            "champion": self._data.get("champion"),
-            "shadow": self._data.get("shadow"),
+            "champion": champion,
+            "champion_execution": ch_info.get("execution", {}),
+            "champion_metrics": ch_info.get("metrics", {}),
+            "shadow": shadow,
+            "shadow_execution": sh_info.get("execution", {}),
+            "shadow_metrics": sh_info.get("metrics", {}),
             "n_models": len(self._data["models"]),
             "updated_at": self._data.get("updated_at"),
         }

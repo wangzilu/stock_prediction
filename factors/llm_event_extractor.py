@@ -306,29 +306,26 @@ class LLMEventExtractor:
             except Exception as e:
                 return ("fail", None)
 
-        n_workers = 16  # 16 concurrent API calls
-        with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            futures = {executor.submit(_process_one, t): i for i, t in enumerate(tasks)}
-            done_count = 0
-            for future in as_completed(futures):
-                done_count += 1
-                status, record = future.result()
-                if status == "ok" and record:
-                    all_records.append(record)
-                    total_extracted += 1
-                else:
-                    total_failed += 1
-                if done_count % 50 == 0:
-                    logger.info(
-                        f"  Progress: {done_count}/{len(tasks)} items, "
-                        f"{total_extracted} extracted, {total_failed} failed"
-                    )
-
-        # Write all records to file (sorted by stock code for consistency)
-        all_records.sort(key=lambda r: r.get("stock_code", ""))
+        # Stream results to file as they complete (survives timeout/kill)
+        n_workers = 16
         with open(output_path, "w", encoding="utf-8") as f:
-            for record in all_records:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                futures = {executor.submit(_process_one, t): i for i, t in enumerate(tasks)}
+                done_count = 0
+                for future in as_completed(futures):
+                    done_count += 1
+                    status, record = future.result()
+                    if status == "ok" and record:
+                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                        f.flush()  # ensure written to disk immediately
+                        total_extracted += 1
+                    else:
+                        total_failed += 1
+                    if done_count % 50 == 0:
+                        logger.info(
+                            f"  Progress: {done_count}/{len(tasks)} items, "
+                            f"{total_extracted} extracted, {total_failed} failed"
+                        )
 
         logger.info(
             f"Extraction complete: {total_extracted} events extracted, "
