@@ -245,11 +245,15 @@ def collect_daily_news(
 
     output_path = NEWS_DIR / f"{target_date}.jsonl"
 
-    # Skip if already collected today
+    # Skip if already collected today with sufficient data
     if output_path.exists():
         n_existing = sum(1 for _ in open(output_path))
-        logger.info(f"News already collected for {target_date} ({n_existing} items), skipping")
-        return output_path
+        if n_existing >= 100:  # minimum viable: at least 100 news items
+            logger.info(f"News already collected for {target_date} ({n_existing} items), skipping")
+            return output_path
+        else:
+            logger.warning(f"Previous collection only got {n_existing} items, re-collecting")
+            os.remove(str(output_path))
 
     # Get target stocks
     if use_portfolio:

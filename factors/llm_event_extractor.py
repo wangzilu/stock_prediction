@@ -10,6 +10,7 @@ Usage:
 """
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime
@@ -228,11 +229,15 @@ class LLMEventExtractor:
 
         output_path = EVENTS_DIR / f"{target_date}.jsonl"
 
-        # Skip if already processed
+        # Skip if already processed with sufficient data
         if output_path.exists():
             n_existing = sum(1 for _ in open(output_path))
-            logger.info(f"Events already extracted for {target_date} ({n_existing} items), skipping")
-            return output_path
+            if n_existing >= 50:  # minimum: at least 50 events
+                logger.info(f"Events already extracted for {target_date} ({n_existing} items), skipping")
+                return output_path
+            else:
+                logger.warning(f"Previous extraction only got {n_existing} events, re-extracting")
+                os.remove(str(output_path))
 
         # Load news grouped by stock
         stock_news: dict[str, list[dict]] = {}
