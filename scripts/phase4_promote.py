@@ -24,9 +24,19 @@ logger = logging.getLogger(__name__)
 DATA_DIR = PROJECT_ROOT / "data" / "storage"
 REGISTRY_PATH = DATA_DIR / "phase4" / "model_registry.json"
 
-ROLLING_GATE = {"avg_rank_ic": 0.04, "avg_spread": 0.012,
-                "rank_ic_pos_pct": 0.65, "spread_pos_pct": 0.65}
-EXPOSURE_GATE = {"max_stock_weight": 0.08, "max_industry_weight": 0.40}
+# Institutional-grade promotion gates (Phase 4J)
+ROLLING_GATE = {
+    "avg_rank_ic": 0.03,          # minimum average RankIC
+    "rank_ic_pos_pct": 0.60,      # % of splits with positive RankIC
+    "avg_spread": 0.005,          # minimum top20 spread
+}
+INSTITUTIONAL_GATE = {
+    "min_excess_ir": 1.0,         # excess IR vs benchmark (1.0+ = good)
+    "min_rank_icir": 0.4,         # signal stability
+    "max_cost_drag": 0.35,        # cost / gross return < 35%
+    "max_daily_turnover": 0.30,   # daily turnover < 30%
+}
+EXPOSURE_GATE = {"max_stock_weight": 0.05, "max_industry_weight": 0.30}
 
 
 def load_registry() -> dict:

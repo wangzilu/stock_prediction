@@ -1294,6 +1294,15 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Iterable[str] | None = None) -> int:
+    # Global timeout: 45 minutes to prevent baostock infinite loops
+    try:
+        def _global_timeout(signum, frame):
+            raise TimeoutError("Data update exceeded 45-minute global timeout")
+        old = signal.signal(signal.SIGALRM, _global_timeout)
+        signal.alarm(2700)  # 45 minutes
+    except Exception:
+        pass  # SIGALRM not available on Windows
+
     args = parse_args(argv)
     mode = "repair-only" if args.repair_only else "full" if args.full else "incremental"
     full_start_date = (

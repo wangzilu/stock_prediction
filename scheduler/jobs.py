@@ -1666,18 +1666,33 @@ class DailyPipeline:
         for prediction in morning_market_records:
             self.verifier.record_market_prediction(prediction)
 
-        # Generate LLM-powered professional report
+        # Generate LLM-powered professional report (with fallback on timeout)
         logger.info("Generating LLM analyst report...")
-        report = self.llm_analyst.generate_report(
-            headlines=self._headlines or [],
-            market_judgment=market_judgment,
-            recommendations=top_recs,
-            geo_factors=geo,
-            crypto_data=crypto_data,
-            gold_data=gold_data,
-            global_indices_text=global_indices,
-            horizon_recommendations_text=horizon_block,
-        )
+        try:
+            report = self.llm_analyst.generate_report(
+                headlines=self._headlines or [],
+                market_judgment=market_judgment,
+                recommendations=top_recs,
+                geo_factors=geo,
+                crypto_data=crypto_data,
+                gold_data=gold_data,
+                global_indices_text=global_indices,
+                horizon_recommendations_text=horizon_block,
+            )
+        except Exception as e:
+            logger.warning(f"LLM report failed: {e}")
+            report = ""
+
+        # Fallback: if LLM failed, generate plain text report from candidates
+        if not report or len(report.strip()) < 50:
+            logger.warning("LLM report empty — using fallback plain text")
+            lines = ["📋 AI分析报告生成失败，以下为模型直选结果：\n"]
+            for i, rec in enumerate(top_recs[:20]):
+                code = getattr(rec, "code", str(rec)) if not isinstance(rec, dict) else rec.get("code", "?")
+                name = getattr(rec, "name", "") if not isinstance(rec, dict) else rec.get("name", "")
+                score = getattr(rec, "score", 0) if not isinstance(rec, dict) else rec.get("score", 0)
+                lines.append(f"  {i+1}. {code} {name} (score={score:.3f})")
+            report = "\n".join(lines)
         model_quality = self._load_model_quality_line()
         status_block = self._model_status_text()
         if model_quality:
