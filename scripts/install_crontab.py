@@ -48,13 +48,13 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("risk_check", "35 9-15 * * 1-5", [py, main_py, "--risk-check"], "cron_risk_check.log"),
         CronJob(
             "llm_event_pipeline",
-            "30 16 * * 1-5",  # 16:30 — after market close, news published after 15:00
+            "30 15 * * 1-5",  # 15:30 — right after market close, needs ~100min for full A
             [py, str(scripts / "run_llm_event_pipeline.py")],
             "llm_event_pipeline.log",
         ),
         CronJob("guba_popularity", "35 16 * * 1-5", [py, str(scripts / "collect_guba_sentiment.py")], "guba_popularity.log"),
         # LLM retry: if 16:30 run got insufficient data, this will re-run; otherwise skips
-        CronJob("llm_event_retry", "0 17 * * 1-5", [py, str(scripts / "run_llm_event_pipeline.py")], "llm_event_retry.log"),
+        CronJob("llm_event_retry", "30 17 * * 1-5", [py, str(scripts / "run_llm_event_pipeline.py")], "llm_event_retry.log"),
         CronJob("spot_cache_warmup", "5 17 * * 1-5", [py, main_py, "--warm-spot-cache"], "cron_spot_cache_warmup.log"),
         CronJob(
             "qlib_data_update",
