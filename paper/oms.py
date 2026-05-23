@@ -54,7 +54,12 @@ class Position:
 
 
 class PaperOMS:
-    """Paper trading order management system."""
+    """Unified paper trading OMS — supports both buffered_partial and optimizer_v2.
+
+    Args:
+        execution_mode: "buffered_partial" or "optimizer_v2"
+        state_dir: directory for state/trades files (allows champion/shadow separation)
+    """
 
     def __init__(self,
                  initial_capital: float = 1_000_000,
@@ -65,7 +70,12 @@ class PaperOMS:
                  max_daily_turnover: float = 0.15,
                  commission_rate: float = 0.0003,
                  stamp_tax_rate: float = 0.0005,
-                 slippage_rate: float = 0.001):
+                 slippage_rate: float = 0.001,
+                 execution_mode: str = "buffered_partial",
+                 max_turnover: float = 0.10,
+                 max_single_weight: float = 0.05,
+                 weight_method: str = "alpha_proportional",
+                 state_dir: str = None):
 
         self.initial_capital = initial_capital
         self.top_k = top_k
@@ -76,6 +86,17 @@ class PaperOMS:
         self.commission_rate = commission_rate
         self.stamp_tax_rate = stamp_tax_rate
         self.slippage_rate = slippage_rate
+        self.execution_mode = execution_mode
+        self.max_turnover = max_turnover
+        self.max_single_weight = max_single_weight
+        self.weight_method = weight_method
+
+        # State directory (separate for champion vs shadow)
+        if state_dir:
+            self._state_dir = Path(state_dir)
+        else:
+            self._state_dir = PAPER_DIR
+        self._state_dir.mkdir(parents=True, exist_ok=True)
 
         PAPER_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -83,7 +104,7 @@ class PaperOMS:
         self.state = self._load_state()
 
     def _state_path(self):
-        return PAPER_DIR / "oms_state.json"
+        return self._state_dir / "oms_state.json"
 
     def _load_state(self) -> dict:
         path = self._state_path()
@@ -125,12 +146,54 @@ class PaperOMS:
         return positions
 
     def generate_target(self, predictions: dict) -> list:
-        """Generate target portfolio using buffered_partial logic.
+        """Generate target portfolio.
 
-        Returns list of stock codes to hold.
+        For buffered_partial: returns (target_list, sells, buys)
+        For optimizer_v2: returns (target_list, sells, buys) derived from weight changes
         """
         if not predictions:
-            return list(self.state.get("positions", {}).keys())
+            return list(self.state.get("positions", {}).keys()), [], []
+
+        if self.execution_mode == "optimizer_v2":
+            return self._generate_target_optimizer(predictions)
+
+        return self._generate_target_buffered(predictions)
+
+    def _generate_target_optimizer(self, predictions: dict):
+        """Generate target via optimizer_v2 (alpha-proportional + turnover constraint)."""
+        import pandas as pd
+        from backtest.optimizer_v2 import TurnoverConstrainedOptimizer
+        from backtest.constraints import PortfolioConstraints
+
+        scores = pd.Series(predictions).sort_values(ascending=False)
+        optimizer = TurnoverConstrainedOptimizer(
+            top_k=self.top_k, max_turnover=self.max_turnover,
+            max_single_weight=self.max_single_weight,
+            weight_method=self.weight_method,
+        )
+        prev_weights = self.state.get("prev_weights", {})
+        holding_days = {code: pos.get("holding_days", 0)
+                        for code, pos in self.state.get("positions", {}).items()}
+        constraints = PortfolioConstraints(min_hold_days=self.min_hold_days)
+
+        target_weights = optimizer.optimize(
+            alpha_scores=scores, prev_weights=prev_weights,
+            constraints=constraints, holding_days=holding_days,
+        )
+
+        # Store weights for next day
+        self.state["prev_weights"] = target_weights
+
+        # Derive sells/buys from weight changes
+        current = set(self.state.get("positions", {}).keys())
+        target = set(target_weights.keys())
+        sells = list(current - target)
+        buys = list(target - current)
+
+        return list(target), sells, buys
+
+    def _generate_target_buffered(self, predictions: dict):
+        """Original buffered_partial logic."""
 
         # Rank all stocks
         sorted_preds = sorted(predictions.items(), key=lambda x: -x[1])
@@ -365,7 +428,7 @@ class PaperOMS:
 
         # Write trade log
         if trades:
-            trades_path = PAPER_DIR / "trades.jsonl"
+            trades_path = self._state_dir / "trades.jsonl"
             with open(str(trades_path), "a") as f:
                 for t in trades:
                     f.write(json.dumps(t, ensure_ascii=False) + "\n")
