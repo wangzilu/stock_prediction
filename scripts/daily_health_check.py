@@ -240,6 +240,19 @@ def main():
     status, detail = check_promotion_eligibility()
     checks.append(("Shadow晋升", status, detail))
 
+    # 9. Registry status
+    try:
+        from models.registry import ModelRegistry
+        reg = ModelRegistry()
+        rs = reg.status()
+        ch = rs.get("champion", "?")
+        sh = rs.get("shadow", "?")
+        ch_exec = rs.get("champion_execution", {}).get("mode", "?")
+        sh_exec = rs.get("shadow_execution", {}).get("mode", "?")
+        checks.append(("Registry", "✅", f"champion={ch}({ch_exec}) shadow={sh}({sh_exec})"))
+    except Exception:
+        checks.append(("Registry", "⚠️", "无法读取"))
+
     if has_issue:
         msg_lines.append("\n⚠️ 有异常项需要关注")
     else:
