@@ -81,7 +81,8 @@ def parse_publish_date(publish_time_str: str) -> str | None:
     """Parse publish_time string to YYYY-MM-DD date."""
     if not publish_time_str:
         return None
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S"):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+                "%Y/%m/%d %H:%M:%S", "%Y%m%d", "%Y%m%d%H%M%S"):
         try:
             return datetime.strptime(publish_time_str.strip(), fmt).strftime("%Y-%m-%d")
         except ValueError:

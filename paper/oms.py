@@ -271,7 +271,12 @@ class PaperOMS:
         return prices
 
     def execute_orders(self, sells: list, buys: list, date: str):
-        """Simulate order execution with costs. Uses real closing prices."""
+        """Simulate order execution with costs.
+
+        ASSUMPTION: Uses today's closing price as execution price.
+        This is optimistic — real execution would be at T+1 open/VWAP.
+        TODO: Record signal today, fill at T+1 open price tomorrow.
+        """
         cash = self.state["cash"]
         positions = self.state["positions"]
         trades = []
@@ -302,14 +307,23 @@ class PaperOMS:
             })
             self.state["trade_count"] += 1
 
-        # Execute buys (equal weight among all target stocks)
+        # Execute buys — use target weights if optimizer mode, else equal weight
         if buys:
-            n_positions = len(positions) + len(buys)
-            per_stock_value = cash * 0.95 / max(n_positions, 1)  # keep 5% cash buffer
+            target_weights = self.state.get("prev_weights", {})
+            total_portfolio_value = cash
+            for code, pos in positions.items():
+                total_portfolio_value += pos["shares"] * prices.get(code, pos["avg_price"])
 
             for code in buys:
-                if per_stock_value < 1000:  # minimum trade value
-                    break
+                # Determine target value: use optimizer weight or equal weight
+                if self.execution_mode == "optimizer_v2" and code in target_weights:
+                    per_stock_value = total_portfolio_value * target_weights[code]
+                else:
+                    n_target = len(positions) + len(buys)
+                    per_stock_value = cash * 0.95 / max(n_target, 1)
+
+                if per_stock_value < 1000:
+                    continue
                 buy_price = prices.get(code, 0)
                 if buy_price <= 0:
                     logger.warning(f"  No price for {code}, skip buy")

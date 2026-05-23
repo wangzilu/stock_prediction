@@ -1,14 +1,18 @@
-"""Tradable Universe Filter — institutional-grade stock filtering.
+"""Tradable Universe Filter — stock filtering for training and inference.
 
-Standard A-share quant universe filter, applied to both training and inference.
+Training-time filter (get_tradable_mask):
+  1. ST / *ST / 退市整理 — from st_stock_list.json
+  2. IPO < 60 trading days — cumulative day count
+  3. Suspended (volume=0) — from turn_raw in cache
+  4. 一字板 (zero range) — from KLEN in cache
+  5. Low liquidity (amount < 5M) — from amount_raw in cache
+  6. BSE stocks — instrument prefix "bj"
 
-Filters:
-  1. ST / *ST / 退市整理期 — abnormal limit rules, delisting risk
-  2. IPO < 60 trading days — no stable price history
-  3. Daily avg turnover < 5M RMB — illiquid
-  4. Suspended stocks — cannot trade
-  5. Limit-up/down — cannot buy at limit-up, cannot sell at limit-down
-  6. Total market cap < 500M RMB — shell company / manipulation risk
+Inference-time filter (filter_predictions):
+  - ST stocks (from cached list) — lightweight, no market data needed
+  - BSE stocks
+  NOTE: ADV, suspended, limit-up/down are NOT checked at inference time
+  because real-time market data is not available when predictions are generated.
 
 Usage:
     from models.universe_filter import UniverseFilter
