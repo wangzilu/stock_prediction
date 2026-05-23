@@ -42,8 +42,39 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False):
     logger.info(f"=== LLM Event Pipeline START for {target_date} ===")
     start_time = datetime.now()
 
+    # Step 0: Collect announcements (higher coverage than news)
+    logger.info("[Step 0/3] Collecting announcements...")
+    try:
+        from scripts.collect_announcements import collect_for_date
+        ann_path = collect_for_date(target_date)
+        n_ann = sum(1 for _ in open(ann_path)) if ann_path.exists() else 0
+        logger.info(f"  Announcements: {n_ann}")
+
+        # Merge announcements into news format for LLM extraction
+        if ann_path.exists() and n_ann > 0:
+            import json as _json
+            ann_items = []
+            with open(ann_path) as f:
+                for line in f:
+                    a = _json.loads(line)
+                    ann_items.append({
+                        "stock_code": a.get("stock_code", ""),
+                        "stock_name": a.get("stock_name", ""),
+                        "title": a.get("title", ""),
+                        "content_snippet": a.get("title", ""),  # announcements: title IS the content
+                        "source": "交易所公告",
+                        "publish_time": a.get("notice_date", a.get("publish_time", "")),
+                        "qlib_code": a.get("qlib_code", ""),
+                        "collect_date": target_date,
+                    })
+            # Will be appended to news file after news collection
+            logger.info(f"  {len(ann_items)} announcement items ready for merge")
+    except Exception as e:
+        logger.warning(f"  Announcement collection failed: {e}")
+        ann_items = []
+
     # Step 1: Collect news
-    logger.info("[Step 1/3] Collecting daily news from AKShare...")
+    logger.info("[Step 1/3] Collecting daily news...")
     try:
         from scripts.collect_daily_news import collect_daily_news
 
@@ -53,6 +84,26 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False):
             top_n=5000,  # full A-share coverage
         )
         logger.info(f"  News collected -> {news_path}")
+
+        # Merge announcements into news file (append, dedup by stock+title)
+        if ann_items and news_path.exists():
+            import json as _json2
+            existing_keys = set()
+            with open(news_path) as f:
+                for line in f:
+                    item = _json2.loads(line)
+                    existing_keys.add(f"{item.get('stock_code','')}_{item.get('title','')[:30]}")
+
+            n_merged = 0
+            with open(news_path, "a") as f:
+                for item in ann_items:
+                    key = f"{item.get('stock_code','')}_{item.get('title','')[:30]}"
+                    if key not in existing_keys:
+                        f.write(_json2.dumps(item, ensure_ascii=False) + "\n")
+                        existing_keys.add(key)
+                        n_merged += 1
+            logger.info(f"  Merged {n_merged} announcements into news file")
+
     except Exception as e:
         logger.error(f"  News collection failed: {e}")
         logger.debug(traceback.format_exc())
