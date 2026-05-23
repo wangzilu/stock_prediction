@@ -186,6 +186,67 @@ SOURCES = {
         "per_stock": False,
         "kwargs": lambda: {"index_code": "000905.SH"},
     },
+    # === 新增高价值数据 ===
+    "etf_share_size": {
+        "desc": "ETF份额变化(被动资金流)",
+        "method": "etf_share_size",
+        "per_stock": True,
+        "kwargs": lambda code: {"ts_code": code, "start_date": "20240101", "end_date": "20261231"},
+    },
+    "disclosure_date": {
+        "desc": "财报披露日期(PIT关键)",
+        "method": "disclosure_date",
+        "per_stock": True,
+        "kwargs": lambda code: {"ts_code": code, "end_date": "20261231"},
+    },
+    "irm_qa_sh": {
+        "desc": "互动易问答-上交所",
+        "method": "irm_qa_sh",
+        "per_stock": True,
+        "kwargs": lambda code: {"ts_code": code},
+    },
+    "irm_qa_sz": {
+        "desc": "互动易问答-深交所",
+        "method": "irm_qa_sz",
+        "per_stock": True,
+        "kwargs": lambda code: {"ts_code": code},
+    },
+    "cyq_chips": {
+        "desc": "筹码分布详细",
+        "method": "cyq_chips",
+        "per_stock": True,
+        "kwargs": lambda code: {"ts_code": code, "start_date": "20240101", "end_date": "20261231"},
+    },
+    "stk_auction": {
+        "desc": "集合竞价数据",
+        "method": "stk_auction",
+        "per_stock": True,
+        "kwargs": lambda code: {"ts_code": code, "start_date": "20260101", "end_date": "20261231"},
+    },
+    "cn_pmi": {
+        "desc": "PMI指数(宏观regime)",
+        "method": "cn_pmi",
+        "per_stock": False,
+        "kwargs": lambda: {"start_date": "20210101", "end_date": "20261231"},
+    },
+    "cn_cpi": {
+        "desc": "CPI指数(宏观regime)",
+        "method": "cn_cpi",
+        "per_stock": False,
+        "kwargs": lambda: {"start_date": "20210101", "end_date": "20261231"},
+    },
+    "cn_m": {
+        "desc": "货币供应M1/M2(宏观regime)",
+        "method": "cn_m",
+        "per_stock": False,
+        "kwargs": lambda: {"start_date": "20210101", "end_date": "20261231"},
+    },
+    "shibor": {
+        "desc": "银行间利率(流动性regime)",
+        "method": "shibor",
+        "per_stock": False,
+        "kwargs": lambda: {"start_date": "20210101", "end_date": "20261231"},
+    },
 }
 
 
