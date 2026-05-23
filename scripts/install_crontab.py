@@ -53,6 +53,8 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
             "llm_event_pipeline.log",
         ),
         CronJob("guba_popularity", "35 16 * * 1-5", [py, str(scripts / "collect_guba_sentiment.py")], "guba_popularity.log"),
+        # LLM retry: if 16:30 run got insufficient data, this will re-run; otherwise skips
+        CronJob("llm_event_retry", "0 17 * * 1-5", [py, str(scripts / "run_llm_event_pipeline.py")], "llm_event_retry.log"),
         CronJob("spot_cache_warmup", "5 17 * * 1-5", [py, main_py, "--warm-spot-cache"], "cron_spot_cache_warmup.log"),
         CronJob(
             "qlib_data_update",
