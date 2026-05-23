@@ -80,7 +80,7 @@ def pull_alpha101(jq):
         try:
             df = jq.get_all_alpha_101(date=day)
             if not df.empty:
-                df["date"] = day
+                df = df.copy(); df["date"] = day
                 frames.append(df)
         except Exception as e:
             logger.warning(f"  Day {day}: {e}")
@@ -118,7 +118,7 @@ def pull_alpha191(jq):
         try:
             df = jq.get_all_alpha_191(date=day)
             if not df.empty:
-                df["date"] = day
+                df = df.copy(); df["date"] = day
                 frames.append(df)
         except Exception as e:
             logger.warning(f"  Day {day}: {e}")
