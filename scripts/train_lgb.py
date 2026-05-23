@@ -353,6 +353,20 @@ def main():
     _save_artifacts_atomically(model, dataset)
     print(f"Model saved to {MODEL_PATH}")
 
+    # Update registry — keep production artifact path in sync with research
+    try:
+        from models.registry import ModelRegistry
+        reg = ModelRegistry()
+        reg.register("xgb_174", role="champion", feature_set="FS-174",
+                      model_path=MODEL_PATH, n_features=n_features,
+                      train_start=train_start, train_end=train_end,
+                      metrics={"rank_ic": train_report.get("rank_ic"),
+                               "prediction_count": stats.get("latest_finite_prediction_count", 0),
+                               "train_date": datetime.now().strftime("%Y-%m-%d")})
+        print("Registry updated: champion=xgb_174")
+    except Exception as e:
+        print(f"Registry update failed (non-fatal): {e}")
+
     print(f"\nPredictions shape: {pred.shape}")
     print(f"Last 5 predictions:")
     print(pred.tail(5))

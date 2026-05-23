@@ -105,6 +105,41 @@ def check_exposure(model_id: str) -> tuple[dict, bool]:
     return {"source": "exposure_report.json", "checks": checks}, all(c["pass"] for c in checks.values())
 
 
+def check_institutional(model_id: str) -> tuple[dict, bool]:
+    """Check institutional-grade metrics from Phase 4J gate."""
+    path = DATA_DIR / "phase4" / "institutional_gate_xgb_174.json"
+    if not path.exists():
+        return {"error": "No institutional gate results. Run phase4j_institutional_gate.py"}, False
+
+    data = json.loads(path.read_text())
+    summary = data.get("aggregate", data.get("signal_aggregate", {}))
+
+    # Extract metrics (handle different output formats)
+    rank_icir = summary.get("rank_icir", summary.get("RICIR", 0))
+    excess_ir = data.get("portfolio", {}).get("information_ratio",
+                data.get("portfolio_aggregate", {}).get("information_ratio", 0))
+    cost_drag = data.get("portfolio", {}).get("cost_drag_annual",
+                data.get("portfolio_aggregate", {}).get("cost_drag", 0))
+    turnover = data.get("portfolio", {}).get("daily_turnover",
+              data.get("portfolio_aggregate", {}).get("daily_turnover", 0))
+
+    checks = {}
+    for gate_name, (value, threshold, higher_better) in {
+        "rank_icir": (rank_icir, INSTITUTIONAL_GATE["min_rank_icir"], True),
+        "excess_ir": (excess_ir, INSTITUTIONAL_GATE["min_excess_ir"], True),
+        "cost_drag": (cost_drag, INSTITUTIONAL_GATE["max_cost_drag"], False),
+        "daily_turnover": (turnover, INSTITUTIONAL_GATE["max_daily_turnover"], False),
+    }.items():
+        if higher_better:
+            passed = value >= threshold
+        else:
+            passed = value <= threshold if value > 0 else True  # 0 = not computed
+        checks[gate_name] = {"value": round(float(value), 4), "threshold": threshold, "pass": passed}
+
+    all_pass = all(c["pass"] for c in checks.values())
+    return {"source": path.name, "checks": checks}, all_pass
+
+
 def main():
     parser = argparse.ArgumentParser()
     group = parser.add_mutually_exclusive_group(required=True)
@@ -128,13 +163,21 @@ def main():
 
         r_report, r_pass = check_rolling(args.model)
         e_report, e_pass = check_exposure(args.model)
+        i_report, i_pass = check_institutional(args.model)
 
-        logger.info("Track A (Rolling):")
+        logger.info("Track A (Rolling Signal):")
         if "checks" in r_report:
             for k, v in r_report["checks"].items():
                 logger.info(f"  {k}: {v['value']:.4f} (>= {v['threshold']}) {'✅' if v['pass'] else '❌'}")
         else:
             logger.info(f"  {r_report.get('error')}")
+
+        logger.info("\nTrack B (Institutional Metrics):")
+        if "checks" in i_report:
+            for k, v in i_report["checks"].items():
+                logger.info(f"  {k}: {v['value']:.4f} (threshold: {v['threshold']}) {'✅' if v['pass'] else '❌'}")
+        else:
+            logger.info(f"  {i_report.get('error')}")
 
         logger.info("\nTrack C (Exposure):")
         if "checks" in e_report:
@@ -143,7 +186,7 @@ def main():
         else:
             logger.info(f"  {e_report.get('error')}")
 
-        all_pass = r_pass and e_pass
+        all_pass = r_pass and e_pass and i_pass
         logger.info(f"\nOverall: {'✅ ELIGIBLE' if all_pass else '❌ NOT ELIGIBLE'}")
 
         reg.setdefault("models", {})[args.model] = {

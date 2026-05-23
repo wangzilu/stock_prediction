@@ -139,7 +139,7 @@ def main():
         logger.warning("Factor decay check failed (non-blocking)")
 
     # Step 8: Model promotion gate (non-blocking)
-    if not run_step("Model Promotion Check", "promote_model.py", "--check", timeout=60):
+    if not run_step("Model Promotion Check", "phase4_promote.py", "--check", timeout=60):
         logger.warning("Model promotion check failed (non-blocking)")
 
     status = "completed" if data_updated else "completed (with stale data warning)"
