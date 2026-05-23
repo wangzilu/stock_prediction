@@ -232,7 +232,7 @@ class LLMEventExtractor:
         # Skip if already processed with sufficient data
         if output_path.exists():
             n_existing = sum(1 for _ in open(output_path))
-            if n_existing >= 50:  # minimum: at least 50 events
+            if n_existing >= 500:  # minimum: 500 events for full-A coverage
                 logger.info(f"Events already extracted for {target_date} ({n_existing} items), skipping")
                 return output_path
             else:

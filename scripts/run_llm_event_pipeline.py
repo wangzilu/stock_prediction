@@ -76,7 +76,7 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False):
             extractor = LLMEventExtractor()
             events_path = extractor.extract_from_news_file(
                 news_path=news_path,
-                max_news_per_stock=1,  # 1 per stock for 1000 stocks within timeout
+                max_news_per_stock=1,  # 1 per stock for 5000 stocks (full A)
                 target_date=target_date,
             )
             logger.info(f"  Events extracted -> {events_path}")

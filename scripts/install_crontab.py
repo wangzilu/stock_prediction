@@ -48,7 +48,7 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("risk_check", "35 9-15 * * 1-5", [py, main_py, "--risk-check"], "cron_risk_check.log"),
         CronJob(
             "llm_event_pipeline",
-            "30 15 * * 1-5",  # 15:30 — right after market close, needs ~100min for full A
+            "30 16 * * 1-5",  # 16:30 — after post-market news published
             [py, str(scripts / "run_llm_event_pipeline.py")],
             "llm_event_pipeline.log",
         ),

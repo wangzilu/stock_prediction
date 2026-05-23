@@ -248,7 +248,7 @@ def collect_daily_news(
     # Skip if already collected today with sufficient data
     if output_path.exists():
         n_existing = sum(1 for _ in open(output_path))
-        if n_existing >= 100:  # minimum viable: at least 100 news items
+        if n_existing >= 1000:  # minimum viable for full-A coverage
             logger.info(f"News already collected for {target_date} ({n_existing} items), skipping")
             return output_path
         else:
