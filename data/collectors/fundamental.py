@@ -81,14 +81,11 @@ class FundamentalCollector:
 
         # Clean
         for col in ["pe_ttm", "pb", "ep", "bp", "log_mv", "log_circ_mv"]:
-                result[col] = pd.to_numeric(result[col], errors="coerce")
+            result[col] = pd.to_numeric(result[col], errors="coerce")
 
-            result["date"] = datetime.now().strftime("%Y-%m-%d")
-            logger.info(f"Fetched valuation for {len(result)} stocks")
-            return result
-        except Exception as e:
-            logger.error(f"Valuation fetch failed: {e}")
-            return pd.DataFrame()
+        result["date"] = datetime.now().strftime("%Y-%m-%d")
+        logger.info(f"Fetched valuation for {len(result)} stocks")
+        return result
 
     def fetch_financial_quality(self, code: str) -> dict:
         """Fetch ROE/ROA/margins for one stock."""

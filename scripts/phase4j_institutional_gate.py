@@ -199,15 +199,18 @@ def compute_portfolio_metrics(pred_series, pnl_series, bm_series):
 
     port_ret = pd.Series(daily_port_ret).sort_index()
 
-    # Align benchmark
+    # Align benchmark — only use dates where both portfolio and benchmark have data
     common_dates = port_ret.index.intersection(bm_series.index)
     if len(common_dates) == 0:
-        logger.warning("No overlapping dates with benchmark")
+        logger.warning("No overlapping dates with benchmark — excess IR will be unreliable")
+        excess = port_ret  # fallback: treat as absolute return (flag in output)
         bm_aligned = pd.Series(0.0, index=port_ret.index)
     else:
-        bm_aligned = bm_series.reindex(port_ret.index).fillna(0.0)
-
-    excess = port_ret - bm_aligned
+        port_ret = port_ret.loc[common_dates]
+        bm_aligned = bm_series.loc[common_dates]
+        excess = port_ret - bm_aligned
+        if len(common_dates) < len(port_ret) * 0.8:
+            logger.warning(f"Benchmark only covers {len(common_dates)}/{len(port_ret)} portfolio dates")
 
     # Annualized metrics
     ann_excess = float(excess.mean() * 252)

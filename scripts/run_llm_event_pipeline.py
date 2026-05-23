@@ -58,7 +58,7 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False):
         logger.debug(traceback.format_exc())
         return False
 
-    # Step 2: Extract events via LLM (with 15-min total timeout)
+    # Step 2: Extract events via LLM (120-min timeout for full-A 5000 stocks)
     logger.info("[Step 2/3] Extracting events via MiniMax LLM...")
     try:
         import signal as _signal
@@ -68,7 +68,7 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False):
             pass
 
         def _handler(signum, frame):
-            raise _Timeout("LLM extraction exceeded 15-minute timeout")
+            raise _Timeout("LLM extraction exceeded 120-minute timeout")
 
         old_handler = _signal.signal(_signal.SIGALRM, _handler)
         _signal.alarm(7200)  # 120 minutes (5000 stocks full A coverage)

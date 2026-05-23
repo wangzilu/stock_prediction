@@ -198,9 +198,14 @@ def main():
     )
     checks.append(("早盘推荐", status, detail))
 
-    # 2. Model training
-    status, detail = check_training(date)
-    checks.append(("模型训练", status, detail))
+    # 2. Model training (only Wed + Sat)
+    from datetime import datetime as _dt
+    day_of_week = _dt.strptime(date, "%Y-%m-%d").weekday()
+    if day_of_week in (2, 5):  # Wed=2, Sat=5
+        status, detail = check_training(date)
+        checks.append(("模型训练", status, detail))
+    else:
+        checks.append(("模型训练", "⏭️", f"今天不训练(周{day_of_week+1})"))
 
     # 3. Paper trading (champion)
     status, detail = check_paper_trading(date)

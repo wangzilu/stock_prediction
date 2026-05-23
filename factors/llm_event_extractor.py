@@ -263,8 +263,8 @@ class LLMEventExtractor:
                 title = news_item.get("title", "").strip()
                 if not title:
                     continue
-                # Title dedup: skip if we've seen very similar title
-                title_key = title[:30]  # first 30 chars as dedup key
+                # Title dedup: per-stock, not global (different stocks can have similar announcements)
+                title_key = f"{code}_{title[:30]}"
                 if title_key in seen_titles:
                     continue
                 seen_titles.add(title_key)
