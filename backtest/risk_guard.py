@@ -23,6 +23,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +52,12 @@ class RiskGuard:
                  vol_stop_multiplier: float = 4.0,
                  vol_stop_min: float = -0.12,
                  vol_stop_max: float = -0.25,
-                 cooldown_price_days: int = 10,
-                 cooldown_event_days: int = 30,
-                 cooldown_st_until_clear: bool = True):
+                 # CX: cooldown by trigger reason
+                 cooldown_price_days: int = 10,          # 普通价格止损
+                 cooldown_event_days: int = 30,           # 连续跌停/监管/负面事件
+                 cooldown_st_until_clear: bool = True,    # ST: 直到摘帽
+                 # CX: drawdown recovery needs 5 consecutive days
+                 drawdown_recovery_days: int = 5):
         self.hard_stop_pct = hard_stop_pct
         self.vol_stop_multiplier = vol_stop_multiplier
         self.vol_stop_min = vol_stop_min
@@ -61,6 +65,7 @@ class RiskGuard:
         self.cooldown_price_days = cooldown_price_days
         self.cooldown_event_days = cooldown_event_days
         self.cooldown_st_until_clear = cooldown_st_until_clear
+        self.drawdown_recovery_days = drawdown_recovery_days
 
         # Persistent state
         self._state_path = DATA_DIR / "risk_guard_state.json"
@@ -84,7 +89,8 @@ class RiskGuard:
         # === L1: Stock-level checks ===
         self._check_st_stocks(positions, constraints, date)
         self._check_hard_stop(positions, prices, constraints, date, xgb_ranks)
-        self._check_profit_giveback(positions, prices, constraints, date, xgb_ranks, events)
+        # CX: trailing stop / profit giveback 暂缓，第一版不启用
+        # self._check_profit_giveback(positions, prices, constraints, date, xgb_ranks, events)
         self._check_limit_down(positions, prices, constraints)
         self._check_pending_exits(constraints, date)
         self._apply_cooldowns(constraints, date)
@@ -119,8 +125,30 @@ class RiskGuard:
         except Exception:
             pass
 
+    def _get_dynamic_stop(self, code: str) -> float:
+        """CX: ATR/vol dynamic threshold with clip(0.12, 0.25).
+
+        Uses vol20 from feature cache if available, else hard_stop_pct.
+        """
+        try:
+            cache = pd.read_parquet(
+                DATA_DIR / "feature_cache_174_holder_regime_ma.parquet",
+                columns=["STD20"],
+            )
+            dates = cache.index.get_level_values(0)
+            latest = dates.max()
+            code_lower = code.lower()
+            if (latest, code_lower) in cache.index:
+                vol20 = float(cache.loc[(latest, code_lower), "STD20"])
+                if np.isfinite(vol20) and vol20 > 0:
+                    # CX formula: -clip(4 * vol20, 0.12, 0.25)
+                    return -max(0.12, min(0.25, self.vol_stop_multiplier * vol20))
+        except Exception:
+            pass
+        return self.hard_stop_pct  # fallback: -0.20
+
     def _check_hard_stop(self, positions, prices, constraints, date, xgb_ranks):
-        """Check individual stock hard stop loss."""
+        """Check individual stock hard stop loss with dynamic threshold."""
         for code, pos in positions.items():
             if code in constraints.force_sell:
                 continue
@@ -134,23 +162,29 @@ class RiskGuard:
                 continue
 
             pnl_pct = (current_price - avg_price) / avg_price
-
-            # Dynamic threshold: -clip(4 * vol20, 0.12, 0.25)
-            # For now use hard stop since we don't have per-stock vol in OMS
-            threshold = self.hard_stop_pct  # -0.20
+            threshold = self._get_dynamic_stop(code)
 
             if pnl_pct < threshold:
-                # CX: don't force sell if XGB still ranks high
                 xgb_rank = (xgb_ranks or {}).get(code, 9999)
                 if xgb_rank <= 50:
-                    # XGB still top 50 — soft exit (pending, not forced)
+                    # CX: XGB still top 50 → soft exit only
                     constraints.pending_exit.append(code)
-                    constraints.risk_reasons[code] = f"浮亏{pnl_pct:.1%}但XGB排名{xgb_rank}仍高，标记观察"
+                    constraints.risk_reasons[code] = (
+                        f"浮亏{pnl_pct:.1%}(阈值{threshold:.1%})但XGB排名{xgb_rank}仍高，标记观察"
+                    )
+                elif xgb_rank <= 200:
+                    # CX: soft_exit = 浮亏大 + XGB跌出Top200 + 无正面事件
+                    constraints.pending_exit.append(code)
+                    constraints.risk_reasons[code] = (
+                        f"浮亏{pnl_pct:.1%}+XGB排名{xgb_rank}，软退出"
+                    )
                 else:
-                    # XGB also weak — force sell
+                    # XGB very weak → force sell
                     constraints.force_sell.append(code)
-                    constraints.risk_reasons[code] = f"浮亏{pnl_pct:.1%}+XGB排名{xgb_rank}，强制退出"
-                    # Cooldown
+                    constraints.risk_reasons[code] = (
+                        f"浮亏{pnl_pct:.1%}+XGB排名{xgb_rank}，强制退出"
+                    )
+                    # CX: cooldown by reason — price stop = 10 days
                     cooldown_end = (datetime.strptime(date, "%Y-%m-%d") +
                                     timedelta(days=self.cooldown_price_days)).strftime("%Y-%m-%d")
                     self._state.setdefault("cooldowns", {})[code] = cooldown_end
@@ -283,41 +317,65 @@ class RiskGuard:
     # ---- L2: Portfolio drawdown state machine ----
 
     def _check_drawdown(self, constraints, date):
-        """Portfolio drawdown state machine.
+        """Portfolio drawdown state machine with recovery conditions.
 
         States: normal → watch → derisk → emergency
-        Transitions based on drawdown from peak.
+        Downgrade: immediate on threshold breach
+        Upgrade: requires N consecutive days above threshold (CX: 5 days)
         """
         dd = self._state.get("drawdown_pct", 0.0)
         prev_state = self._state.get("drawdown_state", "normal")
-        recovery_days = self._state.get("recovery_days", 0)
+        recovery_count = self._state.get("recovery_count", 0)
 
-        # State transitions
+        STATE_ORDER = {"normal": 0, "watch": 1, "derisk": 2, "emergency": 3}
+        STATE_CONFIG = {
+            "emergency": {"threshold": -0.18, "max_pos": 0.3},
+            "derisk":    {"threshold": -0.12, "max_pos": 0.6},
+            "watch":     {"threshold": -0.08, "max_pos": 0.85},
+            "normal":    {"threshold": 0.0,   "max_pos": 1.0},
+        }
+
+        # Determine raw state from current drawdown
         if dd < -0.18:
-            new_state = "emergency"
-            constraints.max_gross_position = 0.3
+            raw_state = "emergency"
         elif dd < -0.12:
-            new_state = "derisk"
-            constraints.max_gross_position = 0.6
+            raw_state = "derisk"
         elif dd < -0.08:
-            new_state = "watch"
-            constraints.max_gross_position = 0.85
+            raw_state = "watch"
         else:
-            new_state = "normal"
-            constraints.max_gross_position = 1.0
+            raw_state = "normal"
 
-        # Recovery: need 5 consecutive days above threshold to upgrade
-        if new_state < prev_state:  # string comparison: derisk < emergency < normal < watch
-            # Actually need proper ordering
-            pass
+        # Downgrade: immediate
+        if STATE_ORDER.get(raw_state, 0) > STATE_ORDER.get(prev_state, 0):
+            new_state = raw_state
+            recovery_count = 0
+        # Upgrade: requires consecutive recovery days
+        elif STATE_ORDER.get(raw_state, 0) < STATE_ORDER.get(prev_state, 0):
+            recovery_count += 1
+            if recovery_count >= self.drawdown_recovery_days:
+                # CX: upgrade one level at a time, not jump to normal
+                state_list = ["emergency", "derisk", "watch", "normal"]
+                prev_idx = state_list.index(prev_state) if prev_state in state_list else 0
+                new_state = state_list[min(prev_idx + 1, 3)]
+                recovery_count = 0
+            else:
+                new_state = prev_state  # stay in current state until recovery confirmed
+        else:
+            new_state = prev_state
+            recovery_count = 0
 
+        constraints.max_gross_position = STATE_CONFIG[new_state]["max_pos"]
         constraints.drawdown_state = new_state
         constraints.drawdown_pct = dd
+
         self._state["drawdown_state"] = new_state
+        self._state["recovery_count"] = recovery_count
 
         if new_state != "normal":
-            logger.warning(f"RiskGuard: drawdown_state={new_state}, dd={dd:.1%}, "
-                           f"max_position={constraints.max_gross_position:.0%}")
+            logger.warning(
+                f"RiskGuard: state={new_state} (was {prev_state}), dd={dd:.1%}, "
+                f"max_pos={constraints.max_gross_position:.0%}, recovery={recovery_count}/{self.drawdown_recovery_days}"
+            )
 
     def update_portfolio_value(self, current_value: float, date: str):
         """Update portfolio peak and drawdown tracking."""
