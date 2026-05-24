@@ -992,8 +992,15 @@ class FeatureMerger:
             for c in factor_cols:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
 
+            mf_daily = df[["qlib_code", "date"] + factor_cols].copy()
+
+            # PIT safety: moneyflow data is published after market close on day T,
+            # so it should only be available for predictions on T+1.
+            mf_daily["date"] = pd.to_datetime(mf_daily["date"])
+            mf_daily["date"] = mf_daily["date"] + pd.tseries.offsets.BDay(1)
+
             result = self._asof_merge_timeseries(
-                df[["qlib_code", "date"] + factor_cols], index, "date", factor_cols)
+                mf_daily, index, "date", factor_cols)
             if result is not None:
                 logger.info(f"ST moneyflow (PIT-safe): {len(factor_cols)} factors")
             return result
