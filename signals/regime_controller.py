@@ -52,17 +52,21 @@ class RegimeController:
             "external_shock_score": self._external_shock(date),
             "policy_support_score": self._policy_support(date),
             "theme_breadth_score": self._theme_breadth(date),
+            "inflation_score": self._inflation(date),
+            "northbound_score": self._northbound(date),
         }
 
         # Composite risk_on_score: weighted average
         weights = {
-            "liquidity_score": 0.20,
-            "credit_stress_score": 0.15,
-            "leverage_unwind_score": 0.20,
-            "microcap_crash_risk": 0.15,
-            "external_shock_score": 0.15,
-            "policy_support_score": 0.10,
+            "liquidity_score": 0.18,
+            "credit_stress_score": 0.12,
+            "leverage_unwind_score": 0.18,
+            "microcap_crash_risk": 0.12,
+            "external_shock_score": 0.12,
+            "policy_support_score": 0.08,
             "theme_breadth_score": 0.05,
+            "inflation_score": 0.08,
+            "northbound_score": 0.07,
         }
         risk_on = sum(scores[k] * w for k, w in weights.items())
         scores["risk_on_score"] = round(risk_on, 3)
@@ -275,6 +279,47 @@ class RegimeController:
             return round(max(-1, min(1, (n_hot - 50) / 50)), 3)
         except Exception:
             return 0.0
+
+    def _inflation(self, date: str) -> float:
+        """CPI → inflation pressure [-1, +1]. High inflation = negative."""
+        try:
+            cpi = pd.read_parquet(DATA_DIR / "st_cn_cpi.parquet")
+            # CPI data has various columns, find YoY
+            for col in cpi.columns:
+                vals = pd.to_numeric(cpi[col], errors="coerce").dropna()
+                if len(vals) > 10 and vals.mean() > 0 and vals.mean() < 20:
+                    # Looks like a % column
+                    latest = vals.iloc[-1]
+                    return round(max(-1, min(1, -(latest - 2) / 2)), 3)
+        except Exception:
+            pass
+        return 0.0
+
+    def _northbound(self, date: str) -> float:
+        """Northbound (北向) capital flow → foreign sentiment [-1, +1]."""
+        try:
+            hsgt = pd.read_parquet(DATA_DIR / "st_moneyflow_hsgt.parquet")
+            if "trade_date" not in hsgt.columns:
+                return 0.0
+            hsgt["trade_date"] = pd.to_datetime(hsgt["trade_date"], format="%Y%m%d", errors="coerce")
+            hsgt = hsgt.dropna(subset=["trade_date"])
+            hsgt = hsgt[hsgt["trade_date"] <= pd.Timestamp(date)].sort_values("trade_date")
+
+            # Find net buy column
+            for col in ["north_money", "ggt_ss", "hgt"]:
+                if col in hsgt.columns:
+                    hsgt[col] = pd.to_numeric(hsgt[col], errors="coerce")
+                    vals = hsgt[col].dropna()
+                    if len(vals) >= 5:
+                        recent = vals.iloc[-5:].mean()
+                        hist_std = vals.std()
+                        if hist_std > 0:
+                            z = recent / hist_std
+                            return round(max(-1, min(1, z / 2)), 3)
+                    break
+        except Exception:
+            pass
+        return 0.0
 
     def _suggest_adjustments(self, scores: dict) -> dict:
         """Suggest trading parameter changes based on regime."""

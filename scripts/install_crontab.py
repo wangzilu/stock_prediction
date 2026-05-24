@@ -87,6 +87,8 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
             [py, str(scripts / "fetch_fundamental_valuation.py"), "--days", "10", "--incremental"],
             "valuation_update.log",
         ),
+        # Daily regime data: margin, limit-down, northbound (day-frequency risk signals)
+        CronJob("regime_daily_update", "5 18 * * 1-5", [py, str(scripts / "update_regime_daily.py")], "regime_daily.log"),
         # Training: Wed 18:15 (mid-week) + Sat 04:00 (full retrain). NOT daily.
         CronJob("midweek_train", "15 18 * * 3", [py, str(scripts / "train_lgb.py")], "lgb_after_close_train.log"),
         # Smoke test (inference only): daily — uses existing model + new data
