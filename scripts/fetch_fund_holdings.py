@@ -193,10 +193,10 @@ def fetch_regime_data(st):
     logger.info("=== Fetching regime data ===")
 
     datasets = {
-        "cn_cpi": {"method": "cn_cpi", "kwargs": {"start_date": "20210101", "end_date": "20261231"}},
-        "cn_ppi": {"method": "cn_ppi", "kwargs": {"start_date": "20210101", "end_date": "20261231"}},
+        "cn_cpi": {"method": "cn_cpi", "kwargs": {"start_m": "202101", "end_m": "202612"}},
+        "cn_ppi": {"method": "cn_ppi", "kwargs": {"start_m": "202101", "end_m": "202612"}},
         "fx_daily": {"method": "fx_daily", "kwargs": {"ts_code": "USDCNH.FXCM", "start_date": "20210101", "end_date": "20261231"}},
-        "us_tycr": {"method": "us_tycr", "kwargs": {"start_date": "20210101", "end_date": "20261231"}},
+        "us_tycr": {"method": "us_tycr", "kwargs": {}},
     }
 
     for name, cfg in datasets.items():
@@ -236,8 +236,11 @@ def fetch_regime_data(st):
             logger.error(f"  {name}: ERROR {e}")
         time.sleep(0.5)
 
-    # IC/IM futures basis — use fut_daily for IF/IC/IM
-    for fut_code, fut_name in [("IF.CFX", "IF沪深300期货"), ("IC.CFX", "IC中证500期货"), ("IM.CFX", "IM中证1000期货")]:
+    # IC/IM futures — try current month contracts
+    from datetime import datetime
+    ym = datetime.now().strftime("%y%m")  # e.g. "2606"
+    for fut_prefix, fut_name in [("IF", "IF沪深300期货"), ("IC", "IC中证500期货"), ("IM", "IM中证1000期货")]:
+        fut_code = f"{fut_prefix}{ym}.CFX"
         out_name = f"fut_{fut_code.split('.')[0].lower()}"
         out_path = DATA_DIR / f"st_{out_name}.parquet"
         if out_path.exists():
