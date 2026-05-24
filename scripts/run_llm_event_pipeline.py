@@ -24,6 +24,51 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 logger = logging.getLogger(__name__)
 
 
+def _write_to_unified_store(events_path: Path, target_date: str) -> None:
+    """Write extracted events to the unified EventStore (Phase 4T).
+
+    Reads the legacy JSONL file produced by the extractor, converts each
+    record to the unified schema, and calls EventStore.add_events().
+    Errors are logged but never raised so the main pipeline is not affected.
+    """
+    try:
+        import json as _json
+        from factors.event_store import EventStore, _convert_legacy_event
+
+        if not events_path.exists():
+            logger.warning("Unified store: events file not found at %s", events_path)
+            return
+
+        # Read legacy records
+        records: list[dict] = []
+        with open(events_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(_json.loads(line))
+                except _json.JSONDecodeError:
+                    continue
+
+        if not records:
+            logger.info("Unified store: no events to write for %s", target_date)
+            return
+
+        # Convert using the same logic as migrate_legacy_events
+        converted = [_convert_legacy_event(r, target_date) for r in records]
+
+        store = EventStore()
+        n_stored = store.add_events(converted)
+        logger.info(
+            "Unified store: wrote %d/%d events for %s (dir=%s)",
+            n_stored, len(converted), target_date, store.store_dir,
+        )
+    except Exception as e:
+        logger.warning("Unified store write failed (non-fatal): %s", e)
+        logger.debug(traceback.format_exc())
+
+
 def run_pipeline(target_date: str = None, use_portfolio: bool = False):
     """Execute the full LLM event pipeline.
 
@@ -123,6 +168,7 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False):
 
         old_handler = _signal.signal(_signal.SIGALRM, _handler)
         _signal.alarm(7200)  # 120 minutes (5000 stocks full A coverage)
+        events_path = None
         try:
             extractor = LLMEventExtractor()
             events_path = extractor.extract_from_news_file(
@@ -133,9 +179,17 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False):
             logger.info(f"  Events extracted -> {events_path}")
         except _Timeout:
             logger.warning("  LLM extraction timed out at 15 min — partial results saved")
+            # Extractor streams to disk, so partial file may exist
+            from factors.llm_event_extractor import EVENTS_DIR
+            events_path = EVENTS_DIR / f"{target_date}.jsonl"
         finally:
             _signal.alarm(0)
             _signal.signal(_signal.SIGALRM, old_handler)
+
+        # Write to unified EventStore (non-fatal on failure)
+        if events_path is not None:
+            _write_to_unified_store(events_path, target_date)
+
     except Exception as e:
         logger.error(f"  Event extraction failed: {e}")
         logger.debug(traceback.format_exc())
