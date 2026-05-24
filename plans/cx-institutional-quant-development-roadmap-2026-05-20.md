@@ -2057,7 +2057,14 @@ LLM 链:            拆成 collect(domestic/global) + extract(看 LLM API) + bui
 
 ## 28. Phase 4X：网络分层 + 数据拉取稳定性（CX 详细设计）
 
-**目标**：拉数据万无一失。国内链不碰 VPN，全球链自动确保 ssproxy，混合任务拆开。
+**目标**：拉数据万无一失。国内链不碰 VPN，全球链自动确保 ssproxy，混合任务拆开。任何联网环节都有硬超时、网络 profile、失败降级、下游熔断。
+
+**硬规则**（不可违反）：
+1. 任何数据任务都不允许无限等待
+2. 任何 global/proxy 任务失败，不能拖死 domestic 主链
+3. 任何 domestic/no_proxy 任务不能继承代理环境
+4. 任何混合任务必须拆开
+5. 任何下游任务必须检查上游 data_health
 
 ### 28.1 实施计划（10 步）
 
@@ -2146,3 +2153,146 @@ DOMESTIC_CHECK_URLS = [
 5. ssproxy 启动失败，不影响 qlib_data_update
 6. daily_health_check 区分国内/全球/LLM 链路状态
 7. 连跑 5 个交易日，国内数据更新成功率不下降
+
+### 28.6 逐环节防卡死要求
+
+**国内核心链**（baostock / ST_CLIENT / AKShare / 东财）：
+- network=domestic，强制 unset proxy
+- 每个 requests timeout ≤ 15s
+- 整个 job global timeout 30-45min
+- 失败写 data_health
+- **核心行情失败 → 禁止训练/推荐**
+
+**全球链**（GDELT / RSS / 海外产业链）：
+- network=global，先检测 ssproxy
+- 检测失败最多启动一次 ssproxy，启动后最多等 10-15s
+- 仍失败：**fail fast**，不进入业务拉取
+- 业务请求 timeout ≤ 15s，整个 job timeout ≤ 10min
+- **失败只关闭 global overlay，不影响国内主链**
+
+**LLM 链**（MiniMax / future OpenAI）：
+- network=llm，按配置走 domestic 或 global
+- 单次 LLM timeout ≤ 15-30s，每条新闻最多 retry 1-2 次
+- 整个 extraction job timeout ≤ 60-120min
+- 超时保留 partial file，标记 `partial=true`
+- **factor build 只使用 complete 或 quality≥threshold 的事件**
+
+**通知链**（pushplus / WeChat）：
+- timeout ≤ 10s
+- **失败只写日志，绝不影响数据 job 成败**
+
+### 28.7 run_network_job.py 防卡死逻辑
+
+```python
+if network == "domestic":
+    unset_proxy_env()
+    run(command, timeout=job_timeout)
+
+elif network == "global":
+    set_proxy_env()
+    if not proxy_health_ok(timeout=5):
+        start_ssproxy(timeout=15)
+        sleep_retry(max_wait=10)
+    if not proxy_health_ok(timeout=5):
+        fail_fast("proxy unavailable")  # 15 秒内退出
+    run(command, timeout=job_timeout)
+
+elif network == "none":
+    unset_proxy_env()
+    run(command, timeout=job_timeout)
+```
+
+### 28.8 CronJob 扩展字段
+
+```python
+@dataclass(frozen=True)
+class CronJob:
+    job_id: str
+    schedule: str
+    target: list[str]
+    log_name: str
+    network: str = "none"           # domestic/global/none/llm/push
+    timeout_sec: int = 0            # 0 = no limit
+    critical: bool = False          # True = 失败阻断下游
+```
+
+推荐配置：
+```text
+qlib_data_update:       domestic, timeout=3600, critical=true
+fund_flow_update:       domestic, timeout=1800, critical=false
+global_news_update:     global,   timeout=600,  critical=false
+llm_event_extract:      llm,      timeout=7200, critical=false
+smoke_lgb_predict:      none,     timeout=900,  critical=true
+daily_health_check:     none,     timeout=300,  critical=false
+push jobs:              push,     timeout=60,   critical=false
+```
+
+### 28.9 Job Lock 防重复启动
+
+```text
+data/storage/locks/{job_id}.lock
+
+规则：
+- job 启动先拿 lock（写入 pid + 启动时间）
+- 拿不到 → 检查 pid 是否活着
+  - 活着：本轮 skip
+  - 死了：清理 stale lock，重新拿
+- job 结束释放 lock
+```
+
+防止：global proxy 卡住导致 global job 堆积、LLM extraction 超时导致 retry 重复启动、baostock 更新没结束下一个训练就开始。
+
+### 28.10 Data Health 文件
+
+每个数据 job 完成后写：`data/storage/data_health/YYYY-MM-DD/{source_name}.json`
+
+```json
+{
+  "source": "qlib_data_update",
+  "network_profile": "domestic",
+  "started_at": "...",
+  "finished_at": "...",
+  "success": true,
+  "rows_fetched": 5200,
+  "symbols_covered": 5173,
+  "latest_date": "2026-05-24",
+  "proxy_used": false,
+  "error": null
+}
+```
+
+### 28.11 依赖熔断规则
+
+```text
+training 前：
+  qlib_data_update.success == true
+  latest_date == today
+  instrument_count >= 4500
+  否则：不训练
+
+event overlay 前：
+  event_factor_build.success == true
+  event_count >= threshold
+  partial == false
+  否则：关闭 event overlay
+
+global overlay 前：
+  global_news_update.success == true
+  否则：关闭 global overlay
+
+paper trading 前：
+  smoke_lgb_predict.success == true
+  prediction_count >= threshold
+  否则：使用昨日预测 + 标记 stale
+```
+
+### 28.12 防卡死验收清单（8 条）
+
+1. 关闭 ssproxy → 跑 global job → **15 秒内失败退出**，不挂住
+2. 开全局代理 → 跑 domestic job → 日志 `proxy_env_cleared=true`
+3. 国内 API 超时 → job 在 timeout_sec 内退出
+4. LLM 卡住 → 到 7200 秒自动 kill，标记 partial
+5. 上一轮 job 未结束 → 下一轮 cron 不重复启动（lock）
+6. global job 失败后 → qlib_data_update 仍正常运行
+7. qlib_data_update 失败后 → train_lgb 不训练或标记 data stale
+8. pushplus 失败 → 不影响任何数据 job
