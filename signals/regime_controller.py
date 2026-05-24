@@ -82,12 +82,15 @@ class RegimeController:
 
         return scores
 
-    def _liquidity(self, date: str) -> float:
-        """M2 growth + Shibor level → liquidity score [-1, +1].
+    def _as_of(self, df: pd.DataFrame, date: str, date_col: str) -> pd.DataFrame:
+        """Filter DataFrame to rows on or before date (point-in-time safe)."""
+        df[date_col] = pd.to_datetime(df[date_col], format="%Y%m%d", errors="coerce")
+        df = df.dropna(subset=[date_col])
+        target = pd.Timestamp(date)
+        return df[df[date_col] <= target].sort_values(date_col)
 
-        M2 YoY > 10% = loose, < 8% = tight.
-        Shibor ON > 2.5% = tight, < 1.5% = loose.
-        """
+    def _liquidity(self, date: str) -> float:
+        """M2 growth + Shibor level → liquidity score [-1, +1]."""
         score = 0.0
         n = 0
 
@@ -95,100 +98,88 @@ class RegimeController:
         try:
             m2 = pd.read_parquet(DATA_DIR / "st_cn_m.parquet")
             m2["m2_yoy"] = pd.to_numeric(m2["m2_yoy"], errors="coerce")
-            latest = m2.dropna(subset=["m2_yoy"]).iloc[-1]
-            m2_yoy = latest["m2_yoy"]
-            # Normalize: 8% → -0.5, 9% → 0, 10% → +0.5, 12% → +1
-            score += max(-1, min(1, (m2_yoy - 9) / 3))
-            n += 1
+            m2["month"] = pd.to_datetime(m2["month"], format="%Y%m", errors="coerce")
+            m2 = m2.dropna(subset=["m2_yoy", "month"])
+            m2 = m2[m2["month"] <= pd.Timestamp(date)].sort_values("month")
+            if not m2.empty:
+                m2_yoy = m2.iloc[-1]["m2_yoy"]
+                score += max(-1, min(1, (m2_yoy - 9) / 3))
+                n += 1
         except Exception:
             pass
 
         # Shibor overnight
         try:
-            shibor = pd.read_parquet(DATA_DIR / "st_shibor.parquet")
+            shibor = self._as_of(
+                pd.read_parquet(DATA_DIR / "st_shibor.parquet"), date, "date")
             shibor["on"] = pd.to_numeric(shibor["on"], errors="coerce")
-            latest = shibor.dropna(subset=["on"]).iloc[-1]
-            on_rate = latest["on"]
-            # Normalize: 1.0% → +1 (loose), 2.0% → 0, 3.0% → -1 (tight)
-            score += max(-1, min(1, -(on_rate - 2.0)))
-            n += 1
+            shibor = shibor.dropna(subset=["on"])
+            if not shibor.empty:
+                on_rate = shibor.iloc[-1]["on"]
+                score += max(-1, min(1, -(on_rate - 2.0)))
+                n += 1
         except Exception:
             pass
 
         return round(score / max(n, 1), 3)
 
     def _credit_stress(self, date: str) -> float:
-        """Shibor term spread + level → credit stress [-1, +1].
-
-        Wide spread (3M - ON) or high absolute rates = stress.
-        """
+        """Shibor term spread + level → credit stress [-1, +1]."""
         try:
-            shibor = pd.read_parquet(DATA_DIR / "st_shibor.parquet")
-            for col in ["on", "3m", "1y"]:
+            shibor = self._as_of(
+                pd.read_parquet(DATA_DIR / "st_shibor.parquet"), date, "date")
+            for col in ["on", "3m"]:
                 shibor[col] = pd.to_numeric(shibor[col], errors="coerce")
-            latest = shibor.dropna(subset=["on", "3m"]).iloc[-1]
-
+            shibor = shibor.dropna(subset=["on", "3m"])
+            if shibor.empty:
+                return 0.0
+            latest = shibor.iloc[-1]
             spread = latest["3m"] - latest["on"]
-            # Wide spread = stress: 0.5% → 0, 1.0% → -0.5, 1.5% → -1
             spread_score = max(-1, min(1, -(spread - 0.5) / 1.0))
-
-            # High absolute rate = stress
             level_score = max(-1, min(1, -(latest["3m"] - 2.0) / 2.0))
-
             return round((spread_score + level_score) / 2, 3)
         except Exception:
             return 0.0
 
     def _leverage(self, date: str) -> float:
-        """Margin balance change → leverage unwind risk [-1, +1].
-
-        Margin balance dropping fast = unwind risk.
-        CX fix: filter days with < 3000 stocks (incomplete data),
-        use 20-day EWMA instead of raw 5-day mean.
-        """
+        """Margin balance change → leverage unwind risk [-1, +1]."""
         try:
             md = pd.read_parquet(DATA_DIR / "st_margin_detail.parquet")
             md["trade_date"] = pd.to_datetime(md["trade_date"], format="%Y%m%d", errors="coerce")
             md["rzye"] = pd.to_numeric(md["rzye"], errors="coerce")
+            md = md.dropna(subset=["trade_date", "rzye"])
+            md = md[md["trade_date"] <= pd.Timestamp(date)]
 
-            # Per-day: count stocks and sum balance
             daily_stats = md.groupby("trade_date").agg(
                 total_rzye=("rzye", "sum"),
                 n_stocks=("rzye", "count"),
             ).sort_index()
 
-            # CX: discard days with < 3000 stocks (incomplete data)
             daily_stats = daily_stats[daily_stats["n_stocks"] >= 3000]
             if len(daily_stats) < 20:
                 return 0.0
 
-            # CX: use 20-day EWMA, not raw 5-day mean
             ewma = daily_stats["total_rzye"].ewm(span=20).mean()
-            if len(ewma) < 2:
+            if len(ewma) < 20:
                 return 0.0
 
-            # Change rate: latest EWMA vs 20 days ago
             change_rate = (ewma.iloc[-1] - ewma.iloc[-20]) / ewma.iloc[-20]
-            # -5% → -0.5, +5% → +0.5, clamp to [-1, 1]
             return round(max(-1, min(1, change_rate / 0.10)), 3)
         except Exception:
             pass
         return 0.0
 
     def _microcap_crash(self, date: str) -> float:
-        """Limit-down count + small-cap weakness → crash risk [-1, +1].
-
-        Many limit-downs + small stocks weak = crash risk.
-        """
+        """Limit-down count → crash risk [-1, +1]."""
         try:
             ld = pd.read_parquet(DATA_DIR / "st_limit_list_d.parquet")
             ld["trade_date"] = pd.to_datetime(ld["trade_date"], format="%Y%m%d", errors="coerce")
+            ld = ld.dropna(subset=["trade_date"])
+            ld = ld[ld["trade_date"] <= pd.Timestamp(date)]
 
-            # Count limit-down stocks per day (limit type = D for down)
             if "limit" in ld.columns:
-                down = ld[ld["limit"].str.upper() == "D"]
+                down = ld[ld["limit"].astype(str).str.upper() == "D"]
             else:
-                # If no limit column, count by negative pct_chg
                 ld["pct_chg"] = pd.to_numeric(ld.get("pct_chg", pd.Series()), errors="coerce")
                 down = ld[ld["pct_chg"] < -9]
 
@@ -197,7 +188,6 @@ class RegimeController:
                 return 0.0
 
             recent_avg = daily_count.iloc[-5:].mean()
-            # 0-10 limit-downs → normal, 20+ → warning, 50+ → critical
             score = max(-1, min(0, -(recent_avg - 10) / 40))
             return round(score, 3)
         except Exception:
@@ -211,32 +201,38 @@ class RegimeController:
         # US treasury yield change
         try:
             us = pd.read_parquet(DATA_DIR / "st_us_tycr.parquet")
-            # Find 10Y column
+            # Try to find date column and filter
+            for dcol in ["date", "trade_date"]:
+                if dcol in us.columns:
+                    us[dcol] = pd.to_datetime(us[dcol], format="%Y%m%d", errors="coerce")
+                    us = us.dropna(subset=[dcol])
+                    us = us[us[dcol] <= pd.Timestamp(date)].sort_values(dcol)
+                    break
             for col in us.columns:
                 if "10" in str(col) or "y10" in str(col).lower():
                     us[col] = pd.to_numeric(us[col], errors="coerce")
                     vals = us[col].dropna()
                     if len(vals) >= 2:
                         change = vals.iloc[-1] - vals.iloc[-2]
-                        # +0.1% daily jump → shock
                         score += max(-1, min(0, -change / 0.15))
                         n += 1
                     break
         except Exception:
             pass
 
-        # Cross-market: use cache if available
+        # Cross-market: nasdaq from cache
         try:
             cache = pd.read_parquet(DATA_DIR / "feature_cache_174_holder_regime_ma.parquet",
                                     columns=["nasdaq_ret1d"])
-            dates = cache.index.get_level_values(0)
-            latest_date = dates.max()
-            latest = cache.loc[latest_date, "nasdaq_ret1d"]
-            nasdaq_ret = latest.mean()
-            if np.isfinite(nasdaq_ret):
-                # Nasdaq -3% → shock
-                score += max(-1, min(0, nasdaq_ret / 0.03)) if nasdaq_ret < 0 else 0
-                n += 1
+            cache_dates = cache.index.get_level_values(0)
+            target = pd.Timestamp(date)
+            avail = cache_dates[cache_dates <= target]
+            if len(avail) > 0:
+                use_date = avail.max()
+                nasdaq_ret = cache.loc[use_date, "nasdaq_ret1d"].mean()
+                if np.isfinite(nasdaq_ret):
+                    score += max(-1, min(0, nasdaq_ret / 0.03)) if nasdaq_ret < 0 else 0
+                    n += 1
         except Exception:
             pass
 
