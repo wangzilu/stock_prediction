@@ -286,6 +286,42 @@ def pull_valuation(jq):
         logger.info(f"  ✅ Valuation: {result.shape} -> {output}")
 
 
+def pull_baidu_factor(jq):
+    """Pull Baidu search index factor — alternative attention data."""
+    output = JQ_DIR / "baidu_factor.parquet"
+    if output.exists():
+        logger.info(f"  baidu_factor already exists, skipping")
+        return
+
+    days = get_trade_days(jq)
+    # Sample stocks (top liquid)
+    stocks = jq.get_all_securities(types=["stock"], date=days[-1])
+    stock_list = list(stocks.index[:500])  # top 500 for speed
+    logger.info(f"  Pulling Baidu factor for {len(stock_list)} stocks...")
+
+    frames = []
+    for i, code in enumerate(stock_list):
+        try:
+            df = jq.get_baidu_factor(stock=code, day=days[-1], duration="30")
+            if df is not None and not df.empty:
+                df["code"] = code
+                frames.append(df)
+        except Exception as e:
+            pass
+
+        if (i + 1) % 100 == 0:
+            count = jq.get_query_count()
+            logger.info(f"  Progress: {i+1}/{len(stock_list)}, "
+                        f"queries remaining: {count['spare']}")
+
+    if frames:
+        result = pd.concat(frames, ignore_index=True)
+        result.to_parquet(str(output))
+        logger.info(f"  ✅ Baidu factor: {result.shape} -> {output}")
+    else:
+        logger.warning("  No Baidu factor data")
+
+
 SOURCES = {
     "alpha101": ("Alpha101 因子 (101个)", pull_alpha101),
     "alpha191": ("Alpha191 因子 (191个)", pull_alpha191),
@@ -293,6 +329,7 @@ SOURCES = {
     "industry": ("申万行业分类", pull_industry),
     "concepts": ("概念板块映射", pull_concepts),
     "valuation": ("每日估值数据", pull_valuation),
+    "baidu": ("百度搜索指数 (另类数据)", pull_baidu_factor),
 }
 
 
