@@ -231,21 +231,27 @@ def main():
     )
     checks.append(("数据更新", status, detail))
 
-    # Print
-    msg_lines = [f"📊 系统健康检查 {date}"]
-    has_issue = False
-    for name, status, detail in checks:
-        line = f"{status} {name}: {detail}"
-        msg_lines.append(line)
-        logger.info(f"  {line}")
-        if status != "✅":
-            has_issue = True
-
     # 8. Shadow promotion eligibility
     status, detail = check_promotion_eligibility()
     checks.append(("Shadow晋升", status, detail))
 
-    # 9. Registry status
+    # 9. Regime controller
+    try:
+        from signals.regime_controller import RegimeController
+        rc = RegimeController()
+        regime = rc.compute()
+        alert = regime["alert_level"]
+        risk_on = regime["risk_on_score"]
+        adj = regime.get("suggested_adjustments", {})
+        reason = adj.get("reason", "")
+        icon = {"normal": "🟢", "watch": "🟡", "warning": "🟠", "critical": "🔴"}.get(alert, "?")
+        checks.append(("Regime", icon, f"{alert} risk={risk_on:+.2f} {reason}"))
+        if alert in ("warning", "critical"):
+            has_issue = True
+    except Exception as e:
+        checks.append(("Regime", "⚠️", f"计算失败: {e}"))
+
+    # 10. Registry status
     try:
         from models.registry import ModelRegistry
         reg = ModelRegistry()
@@ -257,6 +263,16 @@ def main():
         checks.append(("Registry", "✅", f"champion={ch}({ch_exec}) shadow={sh}({sh_exec})"))
     except Exception:
         checks.append(("Registry", "⚠️", "无法读取"))
+
+    # Print all checks
+    msg_lines = [f"📊 系统健康检查 {date}"]
+    has_issue = False
+    for name, status, detail in checks:
+        line = f"{status} {name}: {detail}"
+        msg_lines.append(line)
+        logger.info(f"  {line}")
+        if status not in ("✅", "🟢", "⏭️", "⏳"):
+            has_issue = True
 
     if has_issue:
         msg_lines.append("\n⚠️ 有异常项需要关注")
