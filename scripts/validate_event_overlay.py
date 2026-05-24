@@ -9,16 +9,15 @@ Design notes
 * Factor value = gated_event_score per (date, instrument).
   - For each date with events in llm_events/ or events/, load events and
     compute the gated impact per stock (noise filtered, unstable dampened).
-  - Stocks *without* events on a given date receive factor value 0.
-    This is intentional: the cross-sectional rank correlation will
-    capture whether stocks WITH events rank higher/lower in returns.
-* Forward returns = same-day __pnl_return_1d from the feature cache.
-  - This is the *current-date* close-to-close return, NOT a future
-    prediction. Using same-date events × same-date returns measures the
-    same-day cross-sectional correlation, which is the standard way to
-    evaluate whether an event factor carries contemporaneous alpha.
+  - Stocks *without* events on a given date receive NaN (not 0), so that
+    coverage reflects actual event coverage, not artificially inflated to 100%.
+* Forward returns = NEXT-DAY return (shifted by 1 trading day).
+  - Events on day T are known at T close → can only trade at T+1 open →
+    forward alpha is measured against T+1 close-to-close return.
+  - This is the correct as-of / tradable evaluation.
 * Coverage is expected to be low (~10-20%) because events only cover a
-  subset of the stock universe on any given day.
+  subset of the stock universe on any given day. The gate uses event_coverage
+  (fraction of non-NaN values) which correctly reflects sparse event data.
 
 Usage:
     python scripts/validate_event_overlay.py
@@ -60,11 +59,7 @@ UNSTABLE_WEIGHT = 0.2
 # ---- helpers ---------------------------------------------------------------
 
 def _load_gated_scores_llm(date_str: str) -> dict[str, float]:
-    """Load gated event scores from llm_events for one date.
-
-    Mirrors build_event_overlay.load_events_for_date exactly.
-    Returns {stock_code_6digit: gated_impact}.
-    """
+    """Load gated event scores from llm_events for one date."""
     path = LLM_EVENTS_DIR / f"{date_str}.jsonl"
     if not path.exists():
         return {}
@@ -80,25 +75,17 @@ def _load_gated_scores_llm(date_str: str) -> dict[str, float]:
         code = e.get("stock_code", "")
         if not code:
             continue
-
-        # Gate 1: noise types -> skip
         if etype in NOISE_TYPES:
             continue
-        # Gate 2: unstable types -> dampen
         if etype in UNSTABLE_TYPES:
             impact *= UNSTABLE_WEIGHT
-
         stock_impacts[code].append(impact)
 
     return {code: float(np.mean(vals)) for code, vals in stock_impacts.items() if vals}
 
 
 def _load_gated_scores_unified(date_str: str) -> dict[str, float]:
-    """Load gated event scores from unified events/ store for one date.
-
-    Uses direction * confidence * magnitude, with same noise/unstable gates.
-    Returns {stock_code_6digit: gated_score}.
-    """
+    """Load gated event scores from unified events/ store for one date."""
     path = EVENTS_DIR / f"{date_str}.jsonl"
     if not path.exists():
         return {}
@@ -113,8 +100,6 @@ def _load_gated_scores_unified(date_str: str) -> dict[str, float]:
         code = e.get("stock_code", "")
         if not code:
             continue
-
-        # Gate 1: noise
         if etype in NOISE_TYPES:
             continue
 
@@ -123,7 +108,6 @@ def _load_gated_scores_unified(date_str: str) -> dict[str, float]:
         magnitude = float(e.get("magnitude", 0.5))
         impact = direction * confidence * magnitude
 
-        # Gate 2: unstable
         if etype in UNSTABLE_TYPES:
             impact *= UNSTABLE_WEIGHT
 
@@ -148,12 +132,12 @@ def build_event_overlay_factor() -> pd.Series:
     Returns a Series with (datetime, instrument) MultiIndex where:
       - datetime = pd.Timestamp of the trading date
       - instrument = qlib code like 'sh600519'
-      - value = gated_event_score (0 for stocks without events)
+      - value = gated_event_score (NaN for stocks without events)
 
-    The full stock universe is taken from the feature cache so that
-    the coverage metric reflects the true fraction of stocks with events.
+    Stocks WITHOUT events get NaN (not 0) so that coverage correctly
+    reflects the fraction of stocks that actually have event data.
     """
-    logger.info("Loading feature cache for universe + returns...")
+    logger.info("Loading feature cache for universe...")
     cache = pd.read_parquet(FEATURE_CACHE, columns=["__pnl_return_1d"])
 
     # Collect all available event dates from both stores
@@ -164,30 +148,27 @@ def build_event_overlay_factor() -> pd.Series:
         event_dates.add(d.stem)
 
     # Only keep dates that exist in the feature cache
-    cache_dates = set(
-        d.strftime("%Y-%m-%d")
-        for d in cache.index.get_level_values("datetime").unique()
-    )
-    valid_dates = sorted(event_dates & cache_dates)
+    cache_dates = sorted(cache.index.get_level_values("datetime").unique())
+    cache_date_strs = {d.strftime("%Y-%m-%d"): d for d in cache_dates}
+    valid_dates = sorted(event_dates & set(cache_date_strs.keys()))
     logger.info(
         f"Event dates: {len(event_dates)}, "
-        f"Cache dates: {len(cache_dates)}, "
+        f"Cache dates: {len(cache_date_strs)}, "
         f"Overlap: {len(valid_dates)}"
     )
 
     if not valid_dates:
         raise RuntimeError("No overlapping dates between events and feature cache")
 
-    # Build factor values
+    # Build factor values — NaN for no-event stocks
     records: list[tuple] = []  # (datetime, instrument, score)
 
     for date_str in valid_dates:
-        ts = pd.Timestamp(date_str)
+        ts = cache_date_strs[date_str]
 
         # Merge scores from both stores (llm_events takes priority)
         scores_unified = _load_gated_scores_unified(date_str)
         scores_llm = _load_gated_scores_llm(date_str)
-        # Merge: LLM scores override unified for same stock
         merged = {**scores_unified, **scores_llm}
 
         # Get the full instrument universe for this date from the cache
@@ -199,15 +180,15 @@ def build_event_overlay_factor() -> pd.Series:
         n_events = 0
         for instr in day_instruments:
             code6 = instr[2:] if len(instr) > 2 else instr
-            score = merged.get(code6, 0.0)
-            records.append((ts, instr, score))
-            if score != 0:
+            if code6 in merged:
+                records.append((ts, instr, merged[code6]))
                 n_events += 1
+            else:
+                records.append((ts, instr, np.nan))
 
         if n_events > 0:
             logger.info(f"  {date_str}: {n_events}/{len(day_instruments)} stocks with events")
 
-    # Build Series
     if not records:
         raise RuntimeError("No factor records built")
 
@@ -222,9 +203,10 @@ def build_event_overlay_factor() -> pd.Series:
         dtype=float,
     )
 
+    n_with_events = factor.notna().sum()
     logger.info(
         f"Factor built: {len(factor)} obs, "
-        f"{(factor != 0).sum()} non-zero ({(factor != 0).mean():.1%} coverage)"
+        f"{n_with_events} with events ({n_with_events / len(factor):.1%} coverage)"
     )
     return factor
 
@@ -237,81 +219,94 @@ def main():
     # 1. Build the factor
     factor = build_event_overlay_factor()
 
-    # 2. Load forward returns from the same feature cache
-    logger.info("Loading forward returns...")
+    # 2. Load FORWARD returns (T+1) — events at T close, tradable at T+1
+    logger.info("Loading forward returns (shifted by 1 trading day)...")
     cache = pd.read_parquet(FEATURE_CACHE, columns=["__pnl_return_1d"])
-    returns = cache["__pnl_return_1d"]
-    # Restrict returns to the same dates as our factor
-    factor_dates = factor.index.get_level_values("datetime").unique()
-    returns = returns.loc[returns.index.get_level_values("datetime").isin(factor_dates)]
+    returns_raw = cache["__pnl_return_1d"]
 
-    # 3. Register with AlphaFactory and run tearsheet
-    #    Use relaxed gate thresholds for event factors:
-    #    - coverage will be low (~10-20%) which is expected
-    #    - rank_ic_mean threshold stays the same
-    event_gate = {
-        "rank_ic_mean": 0.005,
-        "coverage": 0.01,           # very low bar — events are sparse by nature
-        "negative_control_ic": 0.01,
-        "rank_ic_pos_ratio": 0.50,
-    }
-    factory = AlphaFactory(gate_thresholds=event_gate)
+    # Shift returns: for each instrument, shift return back by 1 day
+    # so that factor[T] is compared with return[T+1]
+    factor_dates = sorted(factor.index.get_level_values("datetime").unique())
+
+    # Build date mapping: T → T+1
+    all_dates = sorted(returns_raw.index.get_level_values("datetime").unique())
+    date_to_next = {}
+    for i, d in enumerate(all_dates):
+        if i + 1 < len(all_dates):
+            date_to_next[d] = all_dates[i + 1]
+
+    # Build forward return series aligned to factor dates
+    forward_records = []
+    for date in factor_dates:
+        next_date = date_to_next.get(date)
+        if next_date is None:
+            continue
+        try:
+            next_day_returns = returns_raw.loc[next_date]
+        except KeyError:
+            continue
+        for instr, ret in next_day_returns.items():
+            forward_records.append((date, instr, ret))
+
+    if not forward_records:
+        logger.error("No forward returns built")
+        return
+
+    fwd_idx = pd.MultiIndex.from_tuples(
+        [(r[0], r[1]) for r in forward_records],
+        names=["datetime", "instrument"],
+    )
+    forward_returns = pd.Series(
+        [r[2] for r in forward_records],
+        index=fwd_idx,
+        name="forward_return_1d",
+        dtype=float,
+    )
+
+    logger.info(f"Forward returns: {len(forward_returns)} obs")
+
+    # 3. Register with AlphaFactory
+    #    Event factors are sparse — use event_coverage (non-NaN %) as true coverage
+    factory = AlphaFactory()
     factory.register(
         name="event_overlay_bpc",
         description=(
             "B'+C' gated event overlay: LLM impact_1d with noise filter "
             "and unstable-bucket dampening (0.2x weight). "
-            "Same-day events x same-day returns (cross-sectional, not future)."
+            "Forward T+1 returns for tradable alpha evaluation. "
+            "NaN for stocks without events (true sparse coverage)."
         ),
         build_func=build_event_overlay_factor,
     )
 
-    # 4. Run tearsheet
-    logger.info("Running tearsheet...")
-    metrics = factory.run_tearsheet("event_overlay_bpc", returns=returns)
+    # 4. Run tearsheet with forward returns
+    logger.info("Running tearsheet with forward returns...")
+    metrics = factory.run_tearsheet("event_overlay_bpc", returns=forward_returns)
 
-    # Add event-specific coverage: fraction of stocks with non-zero event score
-    event_coverage = float((factor != 0).sum() / len(factor))
-    metrics["event_coverage"] = event_coverage
+    # Coverage from tearsheet is now the TRUE event coverage (non-NaN fraction)
+    logger.info(f"  Event coverage (non-NaN): {metrics.get('coverage', 0):.1%}")
 
     # 5. Gate check
     gate_result = factory.check_gate("event_overlay_bpc")
 
     # 6. Print results
     print("\n" + "=" * 60)
-    print("Event overlay factor (B'+C') tearsheet")
+    print("Event Overlay Factor Validation (FORWARD returns, true coverage)")
     print("=" * 60)
-    for key in [
-        "rank_ic_mean", "rank_ic_std", "rank_icir",
-        "rank_ic_pos_ratio",
-        "ic_mean", "ic_std", "icir",
-        "spread_q1_q5",
-        "coverage",
-        "event_coverage",
-        "negative_control_ic",
-        "autocorr_1d", "autocorr_5d",
-        "n_days", "n_obs",
-    ]:
-        val = metrics.get(key)
-        if val is None:
-            print(f"  {key}: N/A")
-        elif isinstance(val, float):
-            print(f"  {key}: {val:.4f}")
+    for k, v in metrics.items():
+        if isinstance(v, float):
+            print(f"  {k}: {v:.4f}")
         else:
-            print(f"  {key}: {val}")
+            print(f"  {k}: {v}")
 
-    print(f"\nGate: {'PASS' if gate_result['pass'] else 'FAIL'}")
-    if gate_result["failures"]:
-        print("Failures:")
+    print(f"\n  Gate: {'PASS' if gate_result.get('pass') else 'FAIL'}")
+    if gate_result.get("failures"):
         for f in gate_result["failures"]:
-            print(f"  - {f}")
-
-    # 7. Save artifacts
-    out_dir = DATA_DIR / "candidate_factors" / "event_overlay_bpc"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\nArtifacts saved to: {out_dir}")
-
-    return gate_result
+            print(f"    FAIL: {f}")
+    if gate_result.get("warnings"):
+        for w in gate_result["warnings"]:
+            print(f"    WARN: {w}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
