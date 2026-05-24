@@ -49,13 +49,14 @@
 
 | Phase | 名称 | 目标 | 状态 |
 |---|---|---|---|
-| 4J | Institutional Metric Gate | 从信号指标升级到机构产品指标 | 最高优先级 |
-| 4K | Portfolio & Capacity Engine | 从 TopK 策略升级到约束组合 | 最高优先级 |
+| 4J | Institutional Metric Gate | 从信号指标升级到机构产品指标 | ✅ 已完成 |
+| 4K | Portfolio & Capacity Engine | 从 TopK 策略升级到约束组合 | ✅ 已完成 (opt_top100_to10, Sharpe 4.5+) |
 | 4L | Weak Factor Factory v2 | 把失败因子做正交化/事件化/残差化 | 高优先级 |
 | 4M | Alpha360 & Model Diversity | 表格 + 深度模型分层验证 | 中高优先级 |
-| 4N | LLM Event Alpha | 新闻/公告/舆情结构化为 PIT 事件因子 | 中优先级 |
-| 5A | Research Governance | 数据/实验/模型/报告治理 | 与 4J 并行 |
-| 5B | Deep Sequence Models | HIST/ALSTM/Transformer 类模型研究 | 4J/4K 后 |
+| 4N | LLM Event Alpha | 新闻/公告/舆情结构化为 PIT 事件因子 | 中优先级 (B'+C' overlay 已做) |
+| **4S** | **实验治理 + 组合风险 + Alpha Factory** | **统一产物契约、ShrinkCov、Barra报告、regime-weighted sampler** | **当前最高优先级** |
+| 5A | Research Governance | 数据/实验/模型/报告治理 | 合并入 4S |
+| 5B | Deep Sequence Models | HIST/ALSTM/Transformer 类模型研究 | 4S 后 |
 | 5C | RL Portfolio Controller | RL 只做仓位/换手/风险预算控制 | 组合引擎稳定后 |
 | 6 | Execution/Paper OMS | 订单、成交、风控、paper ledger | 最后推进 |
 
@@ -899,4 +900,133 @@ scripts/
 
 ## 14. 一句话路线
 
-先用 Phase 4J/4K 把 `xgb_174` 的真实机构级产品能力量出来；然后用 Phase 4L/4M 找低相关增量；再用 Phase 5A 固化研究治理；最后才让 LLM、深度模型和 RL 进入 shadow。这样走，项目会从“能选几只强票”变成“能解释、能复现、能约束、能扩容的量化系统”。
+先用 Phase 4J/4K 把 `xgb_174` 的真实机构级产品能力量出来；然后用 Phase 4L/4M 找低相关增量；再用 Phase 5A 固化研究治理；最后才让 LLM、深度模型和 RL 进入 shadow。这样走，项目会从”能选几只强票”变成”能解释、能复现、能约束、能扩容的量化系统”。
+
+---
+
+## 15. Phase 4S：实验治理 + 组合风险 + Alpha Factory Lite（2026-05-24 新增）
+
+**来源**: CX 审阅 Qlib/RD-Agent 调研后拍板。核心判断：当前缺的不是更多高级模块，而是研究闭环的纪律。
+
+### 15.1 总体优先级（CX 终版）
+
+| 优先级 | 任务 | 阶段 |
+|--------|------|------|
+| P0 | 统一实验产物契约 + promotion gate | Mac Studio 第一阶段 |
+| P1 | Recorder/SignalRecord 补主训练链 | Mac Studio 第一阶段 |
+| P1 | ShrinkCov 作为组合风险报告和 rerank penalty（不做 MVO） | Mac Studio 第一阶段 |
+| P1/P2 | StructuredCov 接 barra_simple，接入组合报告 | Mac Studio 第一阶段 |
+| P2 | RollingGen 统一 rolling split | Mac Studio 第一阶段 |
+| P2 | 简化版 DDG-DA：regime-weighted training sampler | Mac Studio 第一阶段 |
+| P2 | Alpha Factory Lite：候选因子自动生成→验证→晋级 | Mac Studio 第一阶段 |
+| P3 | RD-Agent / ADARNN / HIST / Qlib Online | 未来云/Linux |
+
+### 15.2 P0：统一实验产物契约
+
+**问题**：每个脚本各自 dump JSON，格式不统一。新因子/模型的验收全靠人肉看 log。
+
+**目标**：所有训练/回测必须输出同结构结果。
+
+统一产物：
+
+```text
+{experiment_id}/
+  config.json        # 超参数、数据窗口、因子集、预处理方式
+  pred.pkl           # 预测值 (datetime × instrument)
+  label.pkl          # 实际标签
+  metrics.json       # IC/RankIC/ICIR/RankICIR/spread/cost_adjusted
+  backtest.json      # Sharpe/annual_return/max_dd/turnover/cost_drag
+  factor_health.json # coverage/freshness/autocorr/persistence
+  exposure.json      # 行业/风格/市值暴露
+```
+
+Promotion gate 检查清单：
+- PIT audit 通过
+- 24 split metrics.json 全部生成
+- RankIC > 0.005（残差 IC 对 champion）
+- 12+ split delta RankIC 为正
+- 换手和行业偏离不显著恶化
+- negative control 通过（shuffle 后 IC ≈ 0）
+
+**新增文件**：
+
+```text
+tracker/
+  artifact_contract.py   # 定义统一产物 schema + 写入/验证
+  promotion_gate.py      # 自动检查 gate 条件
+```
+
+### 15.3 P1：ShrinkCov 组合风险（不改 optimizer）
+
+**原则**：optimizer_v2 (Sharpe 4.5+) 不动。ShrinkCov 只做三件事：
+
+1. **组合预测波动率**：每日输出 portfolio predicted volatility，作为 RiskGuard L2 的补充信号。
+2. **高相关持仓惩罚**：如果两只持仓股相关性 > 0.8，在 reranker 中加 diversification penalty。
+3. **风险预算监控**：组合中每只股票的边际风险贡献（MCTR），识别尾部集中风险。
+
+**新增文件**：
+
+```text
+backtest/
+  risk_model.py     # ShrinkCov + 组合波动率 + MCTR
+```
+
+### 15.4 P1/P2：StructuredCov 接 Barra
+
+**前置**：`backtest/barra_simple.py` 已有 5 style + 33 industry 因子暴露。
+
+**目标**：
+- 把 exposure 接入 `risk_model.py`，用 `B * F * B' + D` 结构估计协方差。
+- 每日输出 exposure report（行业主动偏离、风格偏离）。
+- 暴露超限时在 daily_health_check 中报警。
+
+### 15.5 P2：regime-weighted training sampler
+
+**替代直接上 DDG-DA**。思路：
+
+1. 用 `regime_controller.compute(date)` 计算每个历史交易日的 regime 向量（12 维）。
+2. 计算当前日期和每个历史日期的 regime 相似度（余弦距离）。
+3. 训练样本权重 = f(相似度)，越像当前市场的历史数据权重越高。
+4. 传给 XGB 的 `sample_weight` 参数。
+
+**验收**：24 split 中 regime-weighted vs uniform 的 RankIC 对比。
+
+### 15.6 P2：Alpha Factory Lite
+
+**替代直接上 RD-Agent**。本地自动化：
+
+```text
+candidate_factors/
+  {factor_name}/
+    build.py          # 因子构建脚本
+    config.json       # 参数
+    tearsheet.json    # IC/RankIC/spread/coverage/negative_control
+    verdict: pass/fail/pending
+```
+
+流程：
+1. 手动或脚本生成候选因子 → 写入 `candidate_factors/`。
+2. 自动跑 tearsheet pipeline（IC、RankIC、spread、coverage、negative control）。
+3. 通过 gate → 进入 `model_registry` 状态 `research_only`。
+4. 跑满 20 paper days → 可升 shadow。
+
+### 15.7 不做的事
+
+| 功能 | 理由 |
+|------|------|
+| 迁移到 Qlib Backtest Engine | 自建引擎已满足需求 |
+| Online Serving 替换 crontab | 当前手动管理足够 |
+| RD-Agent 租 Linux 服务器 | 先把本机研究闭环做硬 |
+| DDG-DA 完整 meta 框架 | 先做简化版 regime-weighted sampler |
+| 均值-方差优化替代 optimizer_v2 | Sharpe 4.5+ 不需要动 |
+
+### 15.8 与 Regime Controller P0 的关系
+
+2026-05-24 同日完成的 regime_controller.py P0 改动：
+- ✅ 修 inflation_score CPI 列（nt_yoy）
+- ✅ 修 fx_risk_score 百倍报价
+- ✅ 加 hard_break / soft_break 击穿逻辑
+- ✅ futures_basis_score 改真基差（IC 期货 / CSI500 现货）
+- ✅ policy_support / theme_breadth PIT 过滤
+
+这些改动服务于 P0 实验治理中的 regime 相关 gate 检查。
