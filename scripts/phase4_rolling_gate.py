@@ -42,7 +42,11 @@ QLIB_DATA = str(DATA_DIR / "qlib_data" / "cn_data")
 LABEL_EXPR = f"Ref($close, -{PREDICTION_HORIZON_DAYS}) / Ref($close, -1) - 1"
 SEED = 42
 
-# Promotion gate thresholds (from CX plan, CC adjusted)
+# Legacy gate thresholds — kept for artifact generation and backward compatibility.
+# IMPORTANT: This script only produces metrics artifacts. Actual promotion
+# decisions should use tracker/promotion_gate.py which has the unified,
+# CX-approved gate logic (split failure enforcement, delta vs champion, etc.).
+# Do NOT use gate_pass from this script for promotion decisions.
 GATE = {
     "avg_rank_ic": 0.04,       # >= 0.04 (CC: tighter than CX's 0.035)
     "avg_spread": 0.012,       # >= 1.2%

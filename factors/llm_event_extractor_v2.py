@@ -155,14 +155,31 @@ class LLMEventExtractorV2:
     def _parse_response(self, text: str) -> dict | None:
         if not text:
             return None
-        # Extract JSON from response
-        match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
-        if not match:
+
+        clean = text.strip()
+        # Strip markdown code fences if present
+        if clean.startswith("```"):
+            lines = clean.split("\n")
+            clean = "\n".join(
+                lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
+            )
+
+        # Robust JSON extraction: first { to last } (handles nested braces)
+        start = clean.find("{")
+        end = clean.rfind("}") + 1
+        if start < 0 or end <= start:
             return None
         try:
-            data = json.loads(match.group())
+            data = json.loads(clean[start:end])
         except json.JSONDecodeError:
-            return None
+            # Fallback: try simple non-nested regex (original V2 approach)
+            match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+            if not match:
+                return None
+            try:
+                data = json.loads(match.group())
+            except json.JSONDecodeError:
+                return None
 
         # Validate required fields
         event_type = data.get("event_type", "other")

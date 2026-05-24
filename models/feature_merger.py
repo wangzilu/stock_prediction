@@ -877,17 +877,33 @@ class FeatureMerger:
         )
 
     def _effective_date_from_frame(self, df: pd.DataFrame) -> pd.Series | None:
-        """Return the first usable PIT date for a stock-level factor frame."""
-        direct_cols = [
-            "effective_date", "publish_date", "ann_date", "f_ann_date",
-            "disclosure_date", "pub_date", "trade_date", "date", "collected_at",
-        ]
-        for col in direct_cols:
+        """Return the first usable PIT date for a stock-level factor frame.
+
+        Priority:
+        1. ann_date / f_ann_date / publish_date: actual announcement date + 1 BDay
+           (data becomes available the trading day after announcement)
+        2. effective_date / trade_date / date: already represents availability
+        3. report period end_date: conservative statutory delay fallback
+        """
+        # Tier 1: announcement dates — add 1 BDay for availability lag
+        announce_cols = ["ann_date", "f_ann_date", "publish_date", "disclosure_date"]
+        for col in announce_cols:
+            if col in df.columns:
+                parsed = _parse_date_series(df[col])
+                if parsed.notna().any():
+                    # Available next trading day after announcement
+                    return parsed + pd.tseries.offsets.BDay(1)
+
+        # Tier 2: already-available dates (no lag needed)
+        avail_cols = ["effective_date", "pub_date", "trade_date", "date", "collected_at"]
+        for col in avail_cols:
             if col in df.columns:
                 parsed = _parse_date_series(df[col])
                 if parsed.notna().any():
                     return parsed
 
+        # Tier 3: report period fallback — conservative statutory deadlines
+        # Only used when no announcement date exists at all
         report_cols = ["stat_date", "period", "report_period", "end_date"]
         for col in report_cols:
             if col in df.columns:
@@ -1085,12 +1101,20 @@ def _parse_date_series(values: pd.Series) -> pd.Series:
 
 
 def _report_effective_date(report_dates: pd.Series) -> pd.Series:
-    """Conservative availability date for quarterly reports without ann_date."""
+    """Conservative statutory deadline for quarterly reports WITHOUT ann_date.
+
+    Only used as fallback when no actual announcement date is available.
+    Deadlines are based on CSRC disclosure rules (upper bound, not average):
+      Q1 (0331): must disclose by Apr 30 → +45 days (was +30, too optimistic)
+      H1 (0630): must disclose by Aug 31 → +75 days (was +60)
+      Q3 (0930): must disclose by Oct 31 → +45 days (was +30)
+      FY (1231): must disclose by Apr 30 → +120 days (unchanged)
+    """
     result = report_dates.copy()
     month_day = result.dt.strftime("%m%d")
-    delays = pd.Series(90, index=result.index)
-    delays = delays.mask(month_day == "0331", 30)
-    delays = delays.mask(month_day == "0630", 60)
-    delays = delays.mask(month_day == "0930", 30)
+    delays = pd.Series(90, index=result.index)  # default fallback
+    delays = delays.mask(month_day == "0331", 45)
+    delays = delays.mask(month_day == "0630", 75)
+    delays = delays.mask(month_day == "0930", 45)
     delays = delays.mask(month_day == "1231", 120)
     return result + pd.to_timedelta(delays, unit="D")

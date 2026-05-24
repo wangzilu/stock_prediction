@@ -148,7 +148,22 @@ def apply_overlay(xgb_predictions: dict, event_alphas: dict,
 
 
 def backtest_overlay():
-    """Backtest overlay on historical data."""
+    """Backtest overlay on historical data.
+
+    WARNING: This is NOT a valid PIT backtest. It uses a single set of latest
+    model predictions (lgb_latest_predictions.json) across all historical event
+    dates. The XGB scores contain future training information relative to earlier
+    dates. Results should be interpreted as "current model × historical events"
+    exploratory analysis, NOT as realistic historical overlay performance.
+
+    For a valid historical backtest, each date must use as-of predictions from
+    the rolling training pipeline (per-date prediction artifacts via
+    tracker/artifact_contract.py). This requires running the full rolling
+    train → predict → overlay pipeline.
+
+    TODO: Once artifact_contract stores per-split pred.pkl, refactor this to
+    load date-appropriate predictions for each backtest day.
+    """
     from config.qlib_runtime import init_qlib
     from qlib.data import D
     from scipy import stats
@@ -158,8 +173,9 @@ def backtest_overlay():
     events_dir = DATA_DIR / "llm_events"
     dates = sorted(f.stem for f in events_dir.glob("*.jsonl"))
     logger.info(f"Backtesting overlay on {len(dates)} dates")
+    logger.warning("  NOTE: Using single latest predictions for ALL dates (not PIT-safe)")
 
-    # Load XGB predictions (use as-is for all dates — same model)
+    # Load XGB predictions — SAME model for all dates (exploratory only)
     xgb_preds = json.loads(open(DATA_DIR / "lgb_latest_predictions.json").read())["predictions"]
 
     # Load returns
