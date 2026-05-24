@@ -29,7 +29,8 @@ from config.settings import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
-EVENTS_DIR = DATA_DIR / "llm_events"
+EVENTS_DIR_V1 = DATA_DIR / "llm_events"
+EVENTS_DIR_V2 = DATA_DIR / "llm_events_v2"
 OUTPUT_PATH = DATA_DIR / "llm_event_factors.parquet"
 
 
@@ -52,7 +53,10 @@ def load_events(lookback_days: int = 30, as_of: str = None) -> pd.DataFrame:
     all_records = []
     for day_offset in range(lookback_days + 1):
         date = (start_dt + timedelta(days=day_offset)).strftime("%Y-%m-%d")
-        event_file = EVENTS_DIR / f"{date}.jsonl"
+        # Prefer V2 events; fall back to V1 for historical data
+        event_file = EVENTS_DIR_V2 / f"{date}.jsonl"
+        if not event_file.exists():
+            event_file = EVENTS_DIR_V1 / f"{date}.jsonl"
         if not event_file.exists():
             continue
 
@@ -64,6 +68,19 @@ def load_events(lookback_days: int = 30, as_of: str = None) -> pd.DataFrame:
                 try:
                     record = json.loads(line)
                     record["file_date"] = date
+                    # Normalize V2 records to have impact_1d/impact_5d columns
+                    # V2 has direction + is_price_sensitive instead of LLM-predicted impacts
+                    if "extractor_version" in record and record.get("extractor_version") == "v2":
+                        direction = float(record.get("direction", 0))
+                        is_price_sensitive = record.get("is_price_sensitive", False)
+                        # Synthesize impact from direction + sensitivity
+                        # Price-sensitive events get larger magnitude
+                        magnitude = 0.05 if is_price_sensitive else 0.02
+                        record.setdefault("impact_1d", direction * magnitude)
+                        record.setdefault("impact_5d", direction * magnitude * 0.6)
+                        # V2 doesn't have relevance/novelty — use confidence + flags
+                        record.setdefault("relevance", 1.0 if record.get("is_official_disclosure") else 0.7)
+                        record.setdefault("novelty", 0.9 if record.get("is_new_information", True) else 0.2)
                     all_records.append(record)
                 except json.JSONDecodeError:
                     continue

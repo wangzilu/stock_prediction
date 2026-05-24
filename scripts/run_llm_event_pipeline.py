@@ -3,8 +3,12 @@
 Orchestrates the full pipeline: collect news -> extract events -> build factors.
 Designed for crontab execution before the evening outlook.
 
+Uses LLMEventExtractorV2 by default (fact extraction, no LLM impact prediction).
+Pass --legacy to fall back to the deprecated V1 extractor.
+
 Usage:
     python -m scripts.run_llm_event_pipeline [--date 2024-01-15] [--portfolio]
+    python -m scripts.run_llm_event_pipeline --legacy   # deprecated V1
 
 Crontab example (run at 16:30 after market close):
     30 16 * * 1-5 cd /path/to/stockPrediction && python -m scripts.run_llm_event_pipeline
@@ -14,6 +18,7 @@ import logging
 import os
 import sys
 import traceback
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -76,17 +81,19 @@ def _write_to_unified_store(events_path: Path, target_date: str) -> None:
         logger.debug(traceback.format_exc())
 
 
-def run_pipeline(target_date: str = None, use_portfolio: bool = False):
+def run_pipeline(target_date: str = None, use_portfolio: bool = False,
+                  use_legacy_v1: bool = False):
     """Execute the full LLM event pipeline.
 
     Steps:
         1. Collect daily news from AKShare
-        2. Extract structured events via MiniMax LLM
+        2. Extract structured events via MiniMax LLM (V2 default, V1 legacy)
         3. Build quantitative factors from extracted events
 
     Args:
         target_date: YYYY-MM-DD (default: today)
         use_portfolio: use portfolio stocks instead of top liquid
+        use_legacy_v1: use deprecated V1 extractor (LLM predicts impact)
     """
     if target_date is None:
         target_date = datetime.now().strftime("%Y-%m-%d")
@@ -165,7 +172,6 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False):
     logger.info("[Step 2/3] Extracting events via MiniMax LLM...")
     try:
         import signal as _signal
-        from factors.llm_event_extractor import LLMEventExtractor
 
         class _Timeout(Exception):
             pass
@@ -173,11 +179,29 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False):
         def _handler(signum, frame):
             raise _Timeout("LLM extraction exceeded 120-minute timeout")
 
+        # Select extractor version
+        if use_legacy_v1:
+            warnings.warn(
+                "LLMEventExtractor V1 is deprecated and will be removed in a "
+                "future release. Migrate to V2 (the default) which extracts "
+                "structured facts instead of LLM-predicted impacts.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            logger.warning("Using DEPRECATED V1 extractor (--legacy flag)")
+            from factors.llm_event_extractor import LLMEventExtractor
+            from factors.llm_event_extractor import EVENTS_DIR as _EVENTS_DIR
+            extractor = LLMEventExtractor()
+        else:
+            logger.info("  Using V2 extractor (fact extraction, no LLM impact prediction)")
+            from factors.llm_event_extractor_v2 import LLMEventExtractorV2
+            from factors.llm_event_extractor_v2 import EVENTS_DIR as _EVENTS_DIR
+            extractor = LLMEventExtractorV2()
+
         old_handler = _signal.signal(_signal.SIGALRM, _handler)
         _signal.alarm(7200)  # 120 minutes (5000 stocks full A coverage)
         events_path = None
         try:
-            extractor = LLMEventExtractor()
             events_path = extractor.extract_from_news_file(
                 news_path=news_path,
                 max_news_per_stock=1,  # 1 per stock for 5000 stocks (full A)
@@ -185,10 +209,9 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False):
             )
             logger.info(f"  Events extracted -> {events_path}")
         except _Timeout:
-            logger.warning("  LLM extraction timed out at 15 min — partial results saved")
+            logger.warning("  LLM extraction timed out at 120 min — partial results saved")
             # Extractor streams to disk, so partial file may exist
-            from factors.llm_event_extractor import EVENTS_DIR
-            events_path = EVENTS_DIR / f"{target_date}.jsonl"
+            events_path = _EVENTS_DIR / f"{target_date}.jsonl"
         finally:
             _signal.alarm(0)
             _signal.signal(_signal.SIGALRM, old_handler)
@@ -239,9 +262,12 @@ def main():
     parser = argparse.ArgumentParser(description="Run full LLM Event Factor pipeline")
     parser.add_argument("--date", type=str, default=None, help="Target date YYYY-MM-DD (default: today)")
     parser.add_argument("--portfolio", action="store_true", help="Use portfolio stocks instead of top liquid")
+    parser.add_argument("--legacy", action="store_true",
+                        help="[DEPRECATED] Use V1 extractor (LLM-predicted impacts)")
     args = parser.parse_args()
 
-    success = run_pipeline(target_date=args.date, use_portfolio=args.portfolio)
+    success = run_pipeline(target_date=args.date, use_portfolio=args.portfolio,
+                           use_legacy_v1=args.legacy)
     sys.exit(0 if success else 1)
 
 

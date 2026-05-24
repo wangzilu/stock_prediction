@@ -46,14 +46,14 @@ def main():
     import json
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from scripts.collect_daily_news import collect_news_for_stock, get_liquid_stocks
-    from factors.llm_event_extractor import LLMEventExtractor
+    from factors.llm_event_extractor_v2 import LLMEventExtractorV2 as LLMEventExtractor
     from scripts.build_llm_event_factors import build_factors
 
     dates = get_trade_days(args.days)
     logger.info(f"Backfilling {len(dates)} trading days: {dates[0]} ~ {dates[-1]}")
 
     NEWS_DIR = DATA_DIR / "daily_news"
-    EVENTS_DIR = DATA_DIR / "llm_events"
+    EVENTS_DIR = DATA_DIR / "llm_events_v2"
     NEWS_DIR.mkdir(parents=True, exist_ok=True)
     EVENTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -165,7 +165,7 @@ def main():
 
     # Show coverage
     news_dir = DATA_DIR / "daily_news"
-    events_dir = DATA_DIR / "llm_events"
+    events_dir = DATA_DIR / "llm_events_v2"
     n_news_files = len(list(news_dir.glob("*.jsonl")))
     n_event_files = len(list(events_dir.glob("*.jsonl")))
     logger.info(f"  News files: {n_news_files}")

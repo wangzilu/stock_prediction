@@ -1,11 +1,18 @@
 """LLM-based structured event extraction from news.
 
+.. deprecated::
+    This module (V1) is deprecated. Use ``factors.llm_event_extractor_v2.LLMEventExtractorV2``
+    instead. V1 asks the LLM to predict stock-price impacts (impact_1d/impact_5d), which is
+    unreliable. V2 extracts structured facts only; impact estimation is done via historical
+    calibration. This file is kept for backward compatibility and will be removed in a future
+    release.
+
 Uses MiniMax API to analyze stock news and extract structured event data
 including event type, impact estimates, confidence, relevance, and novelty.
 
-Usage:
-    from factors.llm_event_extractor import LLMEventExtractor
-    extractor = LLMEventExtractor()
+Usage (DEPRECATED — prefer V2):
+    from factors.llm_event_extractor_v2 import LLMEventExtractorV2
+    extractor = LLMEventExtractorV2()
     events = extractor.extract_from_news_file("data/storage/daily_news/2024-01-15.jsonl")
 """
 import json

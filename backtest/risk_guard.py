@@ -73,7 +73,8 @@ class RiskGuard:
 
     def check(self, positions: dict, prices: dict, date: str,
               xgb_ranks: dict = None, regime: dict = None,
-              events: dict = None) -> RiskConstraints:
+              events: dict = None,
+              prev_closes: dict = None) -> RiskConstraints:
         """Run all risk checks and return constraints.
 
         Args:
@@ -83,6 +84,7 @@ class RiskGuard:
             xgb_ranks: {code: rank_in_universe} — for soft exit logic
             regime: regime controller output dict
             events: {code: impact} — LLM event alphas for today
+            prev_closes: {code: prev_close_price} — for limit-down check
         """
         constraints = RiskConstraints()
 
@@ -91,7 +93,7 @@ class RiskGuard:
         self._check_hard_stop(positions, prices, constraints, date, xgb_ranks)
         # CX: trailing stop / profit giveback 暂缓，第一版不启用
         # self._check_profit_giveback(positions, prices, constraints, date, xgb_ranks, events)
-        self._check_limit_down(positions, prices, constraints)
+        self._check_limit_down(positions, prices, constraints, prev_closes)
         self._check_pending_exits(constraints, date)
         self._apply_cooldowns(constraints, date)
 
@@ -263,21 +265,91 @@ class RiskGuard:
             else:
                 self._state[f"giveback_{code}"] = date
 
-    def _check_limit_down(self, positions, prices, constraints):
-        """Mark limit-down stocks as cannot_sell."""
-        # In real implementation: check if stock hit limit-down today
-        # For now: if price dropped > 9.5% (main board) or > 19.5% (创业板/科创板)
+    @staticmethod
+    def _limit_pct_for_code(code: str) -> float:
+        """Return the limit-down percentage for a given stock code.
+
+        A-share rules:
+          - 创业板 (30xxxx): 20%
+          - 科创板 (688xxx): 20%
+          - ST stocks (name-based, but code heuristic via caller): 5%
+          - Normal main board: 10%
+        """
+        # Normalise: accept sh600000 / SH600000 / 600000.SH etc.
+        c = code.lower().replace(".", "")
+        # Extract the 6-digit numeric portion
+        digits = ""
+        for ch in c:
+            if ch.isdigit():
+                digits += ch
+        if len(digits) < 6:
+            return 0.10  # fallback
+        d6 = digits[:6]
+        if d6.startswith("30"):
+            return 0.20  # 创业板
+        if d6.startswith("688"):
+            return 0.20  # 科创板
+        return 0.10      # 主板 default
+
+    def _check_limit_down(self, positions, prices, constraints,
+                          prev_closes: dict = None):
+        """Mark limit-down stocks as cannot_sell.
+
+        A stock is at limit-down when:
+            current_price <= prev_close * (1 - limit_pct) + tolerance
+
+        Args:
+            positions: {code: pos_dict}
+            prices: {code: current_price}
+            constraints: RiskConstraints to mutate
+            prev_closes: {code: previous_close_price}
+                         If not supplied, fall back to pos["prev_close"]
+                         or pos["avg_price"] as rough proxy.
+        """
+        TOLERANCE = 0.001  # 0.1% tolerance for floating-point / tick rounding
+
+        # Also detect ST via the st_stock_list
+        st_set: set = set()
+        try:
+            st_path = DATA_DIR / "st_stock_list.json"
+            if st_path.exists():
+                st_set = set(json.loads(st_path.read_text()))
+        except Exception:
+            pass
+
         for code, pos in positions.items():
             current_price = prices.get(code)
-            if not current_price:
+            if not current_price or current_price <= 0:
                 continue
-            avg_price = pos.get("avg_price", current_price)
-            if avg_price <= 0:
+
+            # Determine previous close
+            prev_close = None
+            if prev_closes:
+                prev_close = prev_closes.get(code)
+            if prev_close is None:
+                prev_close = pos.get("prev_close")
+            if prev_close is None:
+                # Last-resort fallback: use avg_price (rough proxy)
+                prev_close = pos.get("avg_price")
+            if not prev_close or prev_close <= 0:
                 continue
-            daily_change = (current_price - avg_price) / avg_price
-            # This is a rough proxy — real check needs previous close
-            # For now just mark as info
-            pass
+
+            # Determine limit percentage
+            code_lower = code.lower()
+            if code_lower in st_set:
+                limit_pct = 0.05  # ST stocks: 5%
+            else:
+                limit_pct = self._limit_pct_for_code(code)
+
+            limit_down_price = prev_close * (1.0 - limit_pct)
+
+            if current_price <= limit_down_price * (1.0 + TOLERANCE):
+                constraints.cannot_sell.add(code)
+                constraints.risk_reasons.setdefault(
+                    code,
+                    f"跌停(现价{current_price:.2f}≤跌停价{limit_down_price:.2f}, "
+                    f"限制{limit_pct:.0%})"
+                )
 
     def _check_pending_exits(self, constraints, date):
         """Process pending exits from previous days."""
