@@ -61,7 +61,7 @@ class SignalScorer:
         weight_short: float = 0.4,
         weight_mid: float = 0.3,
         weight_sentiment: float = 0.2,
-        weight_macro: float = 0.1,
+        weight_macro: float = 0.0,  # Demoted: LLM geo 33% accuracy, worse than random
     ):
         self.weight_short = weight_short
         self.weight_mid = weight_mid
@@ -113,9 +113,8 @@ class SignalScorer:
         if has_divergence:
             final_score *= 0.6
 
-        # Macro risk override: if macro is strongly negative, suppress bullish
-        if macro < -0.5 and final_score > 0:
-            final_score *= 0.5
+        # Macro risk override: DISABLED — LLM geo accuracy too low (33%)
+        # Was: if macro < -0.5 and final_score > 0: final_score *= 0.5
 
         final_score = max(-1.0, min(1.0, final_score))
 

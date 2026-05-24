@@ -20,7 +20,7 @@ class RiskMonitor:
         self,
         sentiment_heat_threshold: float = 0.8,
         sentiment_negative_threshold: float = -0.5,
-        geo_risk_threshold: float = -0.6,
+        geo_risk_threshold: float = -0.85,  # Raised from -0.6: too many false alarms
         policy_shock_threshold: float = 0.7,
     ):
         self.sentiment_heat_threshold = sentiment_heat_threshold
