@@ -1645,8 +1645,11 @@ class DailyPipeline:
         horizon_block = self._format_horizon_recommendations(horizon_groups)
         top_recs = self._flatten_horizon_recommendations(horizon_groups)
 
-        if not top_recs:
-            top_recs = []  # LLM report will mention no signals
+        if not top_recs and recommendations:
+            # Fallback: if horizon classification filtered everything,
+            # use top 5 by final_score directly
+            logger.warning(f"Horizon classification produced 0 recs from {len(recommendations)} candidates — using top 5 by score")
+            top_recs = sorted(recommendations, key=lambda r: r.final_score, reverse=True)[:5]
 
         # Fetch global market data for report
         crypto_data = {}
