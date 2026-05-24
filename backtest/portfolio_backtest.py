@@ -66,6 +66,10 @@ class PortfolioResult:
     suspended_days: int = 0  # stock-days where held stock was suspended (frozen valuation)
     ipo_filtered_count: int = 0  # total stock-day removals due to IPO filter
 
+    # Time semantics: signal formation vs return realisation dates
+    signal_dates: list = field(default_factory=list)   # dates when portfolio was formed
+    return_dates: list = field(default_factory=list)   # dates when returns were realised (signal + 1 td)
+
     # Time series
     daily_pnl: pd.Series = field(default_factory=pd.Series)
     daily_turnover: pd.Series = field(default_factory=pd.Series)
@@ -259,6 +263,8 @@ class PortfolioBacktest:
         daily_costs = []
         daily_turnovers = []
         daily_holdings_count = []
+        signal_dates_list = []     # formation dates (when portfolio is decided)
+        return_dates_list = []     # realisation dates (signal + 1 trading day)
         prev_portfolio = set()
         prev_weights = {}  # {stock: weight} for optimizer_v2 mode
         days_since_rebal = 0
@@ -482,6 +488,10 @@ class PortfolioBacktest:
             daily_turnovers.append(turnover)
             daily_holdings_count.append(len(target_portfolio))
 
+            # Track time semantics
+            signal_dates_list.append(date)
+            return_dates_list.append(dates[i + 1] if i + 1 < len(dates) else None)
+
             # Track recent PnL for vol estimation (buffered_partial mode)
             recent_pnl.append(raw_ret)
             if len(recent_pnl) > self.vol_window:
@@ -570,6 +580,8 @@ class PortfolioBacktest:
             avg_holdings=float(np.mean(daily_holdings_count)),
             suspended_days=total_suspended_days,
             ipo_filtered_count=total_ipo_filtered,
+            signal_dates=signal_dates_list,
+            return_dates=return_dates_list,
             daily_pnl=pd.Series(pnl_net, index=dates[:n_days]),
             daily_turnover=pd.Series(turnovers, index=dates[:n_days]),
             daily_cost=pd.Series(costs, index=dates[:n_days]),
