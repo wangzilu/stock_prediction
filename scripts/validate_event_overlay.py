@@ -7,17 +7,21 @@ the same validation as any other candidate factor.
 Design notes
 ------------
 * Factor value = gated_event_score per (date, instrument).
-  - For each date with events in llm_events/ or events/, load events and
+  - For each date with events in the unified EventStore, load events and
     compute the gated impact per stock (noise filtered, unstable dampened).
   - Stocks *without* events on a given date receive NaN (not 0), so that
     coverage reflects actual event coverage, not artificially inflated to 100%.
 * Forward returns = NEXT-DAY return (shifted by 1 trading day).
-  - Events on day T are known at T close → can only trade at T+1 open →
+  - Events on day T are known at T close -> can only trade at T+1 open ->
     forward alpha is measured against T+1 close-to-close return.
   - This is the correct as-of / tradable evaluation.
 * Coverage is expected to be low (~10-20%) because events only cover a
   subset of the stock universe on any given day. The gate uses event_coverage
   (fraction of non-NaN values) which correctly reflects sparse event data.
+
+NOTE (2026-05-24): Legacy llm_events/ dual-track merge has been removed.
+  All event data is now read exclusively from the unified EventStore.
+  Run ``migrate_legacy_events()`` if legacy data has not been migrated yet.
 
 Usage:
     python scripts/validate_event_overlay.py
@@ -26,6 +30,7 @@ import json
 import logging
 import os
 import sys
+import warnings
 from collections import defaultdict
 from pathlib import Path
 
@@ -44,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = PROJECT_ROOT / "data" / "storage"
 FEATURE_CACHE = DATA_DIR / "feature_cache_174_holder_regime_ma.parquet"
-LLM_EVENTS_DIR = DATA_DIR / "llm_events"
+LLM_EVENTS_DIR = DATA_DIR / "llm_events"  # kept for deprecation check only
 EVENTS_DIR = DATA_DIR / "events"
 
 # Re-use gating rules from build_event_overlay
@@ -59,43 +64,42 @@ UNSTABLE_WEIGHT = 0.2
 # ---- helpers ---------------------------------------------------------------
 
 def _load_gated_scores_llm(date_str: str) -> dict[str, float]:
-    """Load gated event scores from llm_events for one date."""
-    path = LLM_EVENTS_DIR / f"{date_str}.jsonl"
-    if not path.exists():
-        return {}
+    """DEPRECATED — legacy llm_events/ loader.
 
-    stock_impacts: dict[str, list[float]] = defaultdict(list)
-    for line in open(path, encoding="utf-8"):
-        line = line.strip()
-        if not line:
-            continue
-        e = json.loads(line)
-        etype = e.get("event_type", "other")
-        impact = float(e.get("impact_1d", 0))
-        code = e.get("stock_code", "")
-        if not code:
-            continue
-        if etype in NOISE_TYPES:
-            continue
-        if etype in UNSTABLE_TYPES:
-            impact *= UNSTABLE_WEIGHT
-        stock_impacts[code].append(impact)
-
-    return {code: float(np.mean(vals)) for code, vals in stock_impacts.items() if vals}
+    Kept only for backward compatibility. Always returns empty dict now.
+    Callers should use _load_gated_scores_unified() instead.
+    """
+    if LLM_EVENTS_DIR.exists() and any(LLM_EVENTS_DIR.glob("*.jsonl")):
+        warnings.warn(
+            "llm_events/ is deprecated. Run migrate_legacy_events() to move "
+            "data into the unified EventStore, then delete llm_events/.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    return {}
 
 
 def _load_gated_scores_unified(date_str: str) -> dict[str, float]:
-    """Load gated event scores from unified events/ store for one date."""
-    path = EVENTS_DIR / f"{date_str}.jsonl"
-    if not path.exists():
+    """Load gated event scores from unified events/ store for one date.
+
+    Uses the signal_date field when available to correctly attribute events
+    to their actionable trading day.
+    """
+    from factors.event_store import EventStore
+
+    store = EventStore()
+
+    # Prefer query_by_signal_date if events have signal_date populated
+    df = store.query_by_signal_date(date_str)
+    if df.empty:
+        # Fallback: plain date query for pre-migration data
+        df = store.query(date_str, date_str)
+
+    if df.empty:
         return {}
 
     stock_impacts: dict[str, list[float]] = defaultdict(list)
-    for line in open(path, encoding="utf-8"):
-        line = line.strip()
-        if not line:
-            continue
-        e = json.loads(line)
+    for _, e in df.iterrows():
         etype = e.get("event_type", "other")
         code = e.get("stock_code", "")
         if not code:
@@ -140,10 +144,15 @@ def build_event_overlay_factor() -> pd.Series:
     logger.info("Loading feature cache for universe...")
     cache = pd.read_parquet(FEATURE_CACHE, columns=["__pnl_return_1d"])
 
-    # Collect all available event dates from both stores
+    # Collect available event dates from unified store only
     event_dates: set[str] = set()
-    for d in LLM_EVENTS_DIR.glob("*.jsonl"):
-        event_dates.add(d.stem)
+    if LLM_EVENTS_DIR.exists() and any(LLM_EVENTS_DIR.glob("*.jsonl")):
+        warnings.warn(
+            "llm_events/ directory still exists. Run migrate_legacy_events() "
+            "to move data into the unified EventStore, then delete llm_events/.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     for d in EVENTS_DIR.glob("*.jsonl"):
         event_dates.add(d.stem)
 
@@ -166,10 +175,8 @@ def build_event_overlay_factor() -> pd.Series:
     for date_str in valid_dates:
         ts = cache_date_strs[date_str]
 
-        # Merge scores from both stores (llm_events takes priority)
-        scores_unified = _load_gated_scores_unified(date_str)
-        scores_llm = _load_gated_scores_llm(date_str)
-        merged = {**scores_unified, **scores_llm}
+        # Load scores from unified store only (legacy llm_events/ deprecated)
+        merged = _load_gated_scores_unified(date_str)
 
         # Get the full instrument universe for this date from the cache
         try:

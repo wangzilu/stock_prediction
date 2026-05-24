@@ -3,16 +3,25 @@
 All LLM extractors, news collectors, and policy monitors feed into a single
 event store with a unified schema, PIT-safe dating, and deduplication.
 
+5 explicit time fields (added 2026-05-24):
+    event_time      — when the event actually happened
+    publish_time    — when it was published / disclosed
+    available_time  — when the system first ingested it (optional)
+    signal_date     — which trading day it can enter signals
+    execution_date  — which trading day it can be traded (T+1 open)
+
 Usage:
     from factors.event_store import EventStore, migrate_legacy_events
     store = EventStore()
     store.add_event({...})
     df = store.query("2026-05-01", "2026-05-22")
+    df = store.query_by_signal_date("2026-05-22")
 """
 
 import hashlib
 import json
 import logging
+import warnings
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -20,6 +29,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from pandas.tseries.offsets import BDay
 
 from config.settings import DATA_DIR
 
@@ -57,10 +67,27 @@ METADATA_FIELDS = {
     "source_quality": float,
 }
 
+# ---------------------------------------------------------------------------
+# 5 explicit time fields (canonical temporal semantics)
+# ---------------------------------------------------------------------------
+TIME_FIELDS = {
+    "event_time": "required",      # when the event actually happened
+    "publish_time": "required",    # when it was published/disclosed
+    "available_time": "optional",  # when system first sees it
+    "signal_date": "required",     # which trading day it can enter signals
+    "execution_date": "required",  # which trading day it can be traded
+}
+
 EVENT_SCHEMA = {
     "required": REQUIRED_FIELDS,
     "optional": OPTIONAL_FIELDS,
     "metadata": METADATA_FIELDS,
+    # Explicit time fields — see TIME_FIELDS
+    "event_time": "required",
+    "publish_time": "required",
+    "available_time": "optional",
+    "signal_date": "required",
+    "execution_date": "required",
 }
 
 # Recognized event types (superset of v1 and v2)
@@ -156,6 +183,52 @@ def _pit_available_date(publish_time_str: str, fallback_date: str) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
+def _compute_signal_date(publish_time_str: str, fallback_date: str) -> str:
+    """Compute the first trading day an event can enter signals.
+
+    Rules:
+    - If publish_time is after 15:00 on a trading day -> next business day
+    - If publish_time is on a weekend/holiday -> next business day
+    - Otherwise -> same business day
+
+    Uses pandas BDay (business day) for calendar logic.
+    """
+    if not publish_time_str:
+        # Fallback: treat fallback_date as the publish date at market open
+        try:
+            ts = pd.Timestamp(fallback_date)
+        except (ValueError, TypeError):
+            return fallback_date
+        # If weekend, roll forward
+        if ts.dayofweek >= 5:  # Saturday=5, Sunday=6
+            ts = ts + BDay(1)
+        return ts.strftime("%Y-%m-%d")
+
+    try:
+        dt = datetime.strptime(publish_time_str[:19], "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        try:
+            dt = datetime.strptime(publish_time_str[:10], "%Y-%m-%d")
+        except (ValueError, TypeError):
+            return fallback_date
+        # Date-only: treat as market open on that day
+        ts = pd.Timestamp(dt)
+        if ts.dayofweek >= 5:
+            ts = ts + BDay(1)
+        return ts.strftime("%Y-%m-%d")
+
+    ts = pd.Timestamp(dt)
+    # After market close (15:00) or on weekend -> next business day
+    if ts.dayofweek >= 5 or dt.hour >= 15:
+        ts = ts + BDay(1)
+    elif ts.dayofweek < 5:
+        # Weekday before 15:00 — same day, but ensure it's a business day
+        # (BDay(0) normalises to the same day if already a business day)
+        pass
+
+    return ts.normalize().strftime("%Y-%m-%d")
+
+
 def _validate_event(event: dict) -> tuple[dict, list[str]]:
     """Validate and normalise an event dict.
 
@@ -198,6 +271,34 @@ def _validate_event(event: dict) -> tuple[dict, list[str]]:
             val = event.get(field)
             if val is not None:
                 out[field] = val  # keep as-is for flexibility
+
+    # ---- 5 explicit time fields ----
+    # event_time: when the event actually happened
+    out["event_time"] = event.get("event_time") or event.get("publish_time") or out.get("date", "")
+
+    # publish_time: when it was published/disclosed (already in OPTIONAL_FIELDS)
+    if "publish_time" not in out:
+        out["publish_time"] = event.get("publish_time", "")
+
+    # available_time: when the system first ingested it (optional)
+    out["available_time"] = (
+        event.get("available_time")
+        or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    )
+
+    # signal_date & execution_date: auto-computed from publish_time
+    pub = out.get("publish_time", "") or ""
+    fallback = out.get("date", "")
+    if event.get("signal_date"):
+        out["signal_date"] = event["signal_date"]
+    else:
+        out["signal_date"] = _compute_signal_date(pub, fallback)
+
+    if event.get("execution_date"):
+        out["execution_date"] = event["execution_date"]
+    else:
+        # execution_date = signal_date (T+1 open execution assumed)
+        out["execution_date"] = out["signal_date"]
 
     # Dedup hash
     out["_hash"] = _event_hash(out)
@@ -329,6 +430,50 @@ class EventStore:
 
         return df.reset_index(drop=True)
 
+    def query_by_signal_date(
+        self,
+        signal_date: str,
+        stock_code: str | None = None,
+        event_type: str | None = None,
+        source: str | None = None,
+    ) -> pd.DataFrame:
+        """Return events whose signal_date matches the given date.
+
+        This is the preferred query method for factors and overlays — it
+        returns exactly those events that are actionable on *signal_date*.
+        Files are scanned over a 5-day window ending on signal_date to
+        catch events filed on the date itself and those that rolled forward
+        from earlier calendar days (weekends / after-hours).
+        """
+        sd = datetime.strptime(signal_date, "%Y-%m-%d")
+        all_records: list[dict] = []
+        # Scan a window: events may be stored under a calendar date that
+        # differs from their computed signal_date (e.g. Friday after-hours
+        # event stored under Friday, signal_date = Monday).
+        for offset in range(6):  # 0..5 days back
+            ds = (sd - timedelta(days=offset)).strftime("%Y-%m-%d")
+            all_records.extend(self._read_file(self._file_for_date(ds)))
+
+        if not all_records:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(all_records)
+        # Filter to matching signal_date
+        if "signal_date" in df.columns:
+            df = df[df["signal_date"] == signal_date]
+        else:
+            # Fallback: file has no signal_date yet (pre-migration data)
+            df = df[df.get("date", pd.Series(dtype=str)) == signal_date]
+
+        if stock_code is not None and "stock_code" in df.columns:
+            df = df[df["stock_code"] == stock_code]
+        if event_type is not None and "event_type" in df.columns:
+            df = df[df["event_type"] == event_type]
+        if source is not None and "source" in df.columns:
+            df = df[df["source"] == source]
+
+        return df.drop_duplicates(subset=["_hash"], keep="first").reset_index(drop=True) if "_hash" in df.columns else df.reset_index(drop=True)
+
     def query_stock(self, stock_code: str, lookback_days: int = 20) -> pd.DataFrame:
         """Recent events for one stock."""
         end = datetime.now()
@@ -449,6 +594,9 @@ def _convert_legacy_event(raw: dict, file_date: str) -> dict:
     if "magnitude" in raw:
         magnitude = float(raw["magnitude"])
 
+    # Compute the 5 explicit time fields for migrated events
+    signal_date = _compute_signal_date(publish_time, available_date)
+
     unified = {
         "date": available_date,
         "stock_code": raw.get("stock_code", ""),
@@ -460,6 +608,11 @@ def _convert_legacy_event(raw: dict, file_date: str) -> dict:
         # Optional
         "publish_time": publish_time,
         "topic": raw.get("topic", ""),
+        # 5 explicit time fields
+        "event_time": publish_time or file_date,   # best guess for legacy
+        "available_time": raw.get("extract_date", file_date),
+        "signal_date": signal_date,
+        "execution_date": signal_date,  # T+1 open execution assumed
         # Metadata
         "llm_model": raw.get("model_version", ""),
         "prompt_version": raw.get("prompt_version", ""),

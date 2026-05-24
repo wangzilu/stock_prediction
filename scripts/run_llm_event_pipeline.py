@@ -27,8 +27,13 @@ logger = logging.getLogger(__name__)
 def _write_to_unified_store(events_path: Path, target_date: str) -> None:
     """Write extracted events to the unified EventStore (Phase 4T).
 
+    This is the PRIMARY write path.  The legacy llm_events/ JSONL file is
+    still produced by the extractor for backward compatibility but is
+    deprecated and will be removed in a future release.
+
     Reads the legacy JSONL file produced by the extractor, converts each
-    record to the unified schema, and calls EventStore.add_events().
+    record to the unified schema (including the 5 explicit time fields),
+    and calls EventStore.add_events().
     Errors are logged but never raised so the main pipeline is not affected.
     """
     try:
@@ -56,12 +61,14 @@ def _write_to_unified_store(events_path: Path, target_date: str) -> None:
             return
 
         # Convert using the same logic as migrate_legacy_events
+        # (now populates all 5 time fields: event_time, publish_time,
+        #  available_time, signal_date, execution_date)
         converted = [_convert_legacy_event(r, target_date) for r in records]
 
         store = EventStore()
         n_stored = store.add_events(converted)
         logger.info(
-            "Unified store: wrote %d/%d events for %s (dir=%s)",
+            "Unified store (PRIMARY): wrote %d/%d events for %s (dir=%s)",
             n_stored, len(converted), target_date, store.store_dir,
         )
     except Exception as e:
@@ -186,8 +193,14 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False):
             _signal.alarm(0)
             _signal.signal(_signal.SIGALRM, old_handler)
 
-        # Write to unified EventStore (non-fatal on failure)
+        # Write to unified EventStore (PRIMARY path, non-fatal on failure)
         if events_path is not None:
+            logger.warning(
+                "DEPRECATION: Legacy llm_events/ file at %s is kept for "
+                "backward compatibility only. The unified EventStore is now "
+                "the primary store. Remove llm_events/ writes in a future release.",
+                events_path,
+            )
             _write_to_unified_store(events_path, target_date)
 
     except Exception as e:
