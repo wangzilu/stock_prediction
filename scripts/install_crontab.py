@@ -33,6 +33,9 @@ class CronJob:
     schedule: str
     target: list[str]
     log_name: str
+    network: str = "none"       # domestic/global/none/llm/push
+    timeout_sec: int = 0        # 0 = no limit
+    critical: bool = False      # True = downstream depends on this
 
 
 def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_ROOT) -> list[CronJob]:
@@ -41,71 +44,88 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
     main_py = str(project_root / "main.py")
     scripts = project_root / "scripts"
     return [
-        CronJob("morning_recommendation", "20 9 * * 1-5", [py, main_py, "--morning"], "cron_morning.log"),
-        CronJob("sell_check", "30 14 * * 1-5", [py, main_py, "--sell-check"], "cron_sell_check.log"),
-        CronJob("daily_summary", "30 15 * * 1-5", [py, main_py, "--daily-summary"], "cron_daily_summary.log"),
-        CronJob("evening_outlook", "0 22 * * 1-5", [py, main_py, "--evening-outlook"], "cron_evening_outlook.log"),
-        CronJob("risk_check", "35 9-15 * * 1-5", [py, main_py, "--risk-check"], "cron_risk_check.log"),
-        CronJob(
-            "llm_event_pipeline",
-            "30 16 * * 1-5",  # 16:30 — after post-market news published
-            [py, str(scripts / "run_llm_event_pipeline.py")],
-            "llm_event_pipeline.log",
-        ),
-        CronJob("guba_popularity", "35 16 * * 1-5", [py, str(scripts / "collect_guba_sentiment.py")], "guba_popularity.log"),
-        # LLM retry: if 16:30 run got insufficient data, this will re-run; otherwise skips
-        CronJob("llm_event_retry", "30 17 * * 1-5", [py, str(scripts / "run_llm_event_pipeline.py")], "llm_event_retry.log"),
-        CronJob("spot_cache_warmup", "5 17 * * 1-5", [py, main_py, "--warm-spot-cache"], "cron_spot_cache_warmup.log"),
-        CronJob(
-            "qlib_data_update",
-            "45 17 * * 1-5",  # 17:45 — baostock当天数据通常17:30后可用
-            [
-                py,
-                str(scripts / "update_qlib_data.py"),
-                "--universe",
-                "all",
-                "--universe-source",
-                "baostock",
-                "--refresh-universe",
-                "--min-health-instruments",
-                "4500",
-                "--min-lgb-data-instruments",
-                "4500",
-                "--check-today",  # 健康检查：验证最新日期是今天
-            ],
-            "data_update.log",
-        ),
-        CronJob(
-            "fund_flow_update",
-            "55 17 * * 1-5",  # 17:55 (after data update)
-            [py, str(scripts / "fetch_fund_flow_history.py"), "--incremental", "--workers", "1"],
-            "fund_flow_update.log",
-        ),
-        CronJob(
-            "valuation_update",
-            "0 18 * * 1-5",  # 18:00
-            [py, str(scripts / "fetch_fundamental_valuation.py"), "--days", "10", "--incremental"],
-            "valuation_update.log",
-        ),
-        # Daily regime data: margin, limit-down, northbound (day-frequency risk signals)
-        CronJob("regime_daily_update", "5 18 * * 1-5", [py, str(scripts / "update_regime_daily.py")], "regime_daily.log"),
-        # Training: Wed 18:15 (mid-week) + Sat 04:00 (full retrain). NOT daily.
-        CronJob("midweek_train", "15 18 * * 3", [py, str(scripts / "train_lgb.py")], "lgb_after_close_train.log"),
-        # Smoke test (inference only): daily — uses existing model + new data
-        CronJob("lgb_after_close_smoke", "35 18 * * 1-5", [py, str(scripts / "smoke_lgb_predict.py")], "lgb_after_close_smoke.log"),
-        CronJob("shadow_optimizer", "40 18 * * 1-5", [py, str(scripts / "run_shadow_optimizer.py")], "shadow_optimizer.log"),
-        CronJob("paper_trading", "42 18 * * 1-5", [py, str(scripts / "run_paper_trading.py")], "paper_trading.log"),
-        CronJob("factor_decay_monitor", "45 18 * * 1-5", [py, str(scripts / "monitor_factor_decay.py")], "factor_decay.log"),
-        CronJob("brinson_attribution", "50 18 * * 1-5", [py, str(scripts / "run_brinson_attribution.py")], "brinson_attribution.log"),
-        CronJob("daily_health_check", "55 18 * * 1-5", [py, str(scripts / "daily_health_check.py")], "health_check.log"),
-        # Weekly full retrain on Saturday (replaces daily 04:00 — 18:15 daily train is sufficient)
-        CronJob("weekly_full_retrain", "0 4 * * 6", [py, str(scripts / "nightly_train.py")], "weekly_retrain.log"),
-        # Weekly ST list refresh on Saturday before retrain
-        CronJob("weekly_st_refresh", "0 3 * * 6", [py, str(scripts / "fetch_st_list.py")], "st_refresh.log"),
-        # Weekly tradable mask rebuild after ST refresh
-        CronJob("weekly_mask_rebuild", "10 3 * * 6", [py, str(scripts / "build_tradable_mask.py")], "mask_rebuild.log"),
-        # Weekly regime data refresh (macro monthly + shibor/US treasury daily)
-        CronJob("weekly_regime_data", "20 3 * * 6", [py, str(scripts / "fetch_fund_holdings.py"), "--macro", "--regime"], "regime_data.log"),
+        # --- Market hours: domestic ---
+        CronJob("morning_recommendation", "20 9 * * 1-5", [py, main_py, "--morning"], "cron_morning.log",
+                network="domestic", timeout_sec=300),
+        CronJob("sell_check", "30 14 * * 1-5", [py, main_py, "--sell-check"], "cron_sell_check.log",
+                network="domestic", timeout_sec=300),
+        CronJob("daily_summary", "30 15 * * 1-5", [py, main_py, "--daily-summary"], "cron_daily_summary.log",
+                network="domestic", timeout_sec=300),
+        CronJob("risk_check", "35 9-15 * * 1-5", [py, main_py, "--risk-check"], "cron_risk_check.log",
+                network="domestic", timeout_sec=300),
+        CronJob("evening_outlook", "0 22 * * 1-5", [py, main_py, "--evening-outlook"], "cron_evening_outlook.log",
+                network="domestic", timeout_sec=300),
+        # --- Post-close: LLM / event collection ---
+        CronJob("llm_event_pipeline", "30 16 * * 1-5",
+                [py, str(scripts / "run_llm_event_pipeline.py")], "llm_event_pipeline.log",
+                network="llm", timeout_sec=7200),
+        CronJob("guba_popularity", "35 16 * * 1-5",
+                [py, str(scripts / "collect_guba_sentiment.py")], "guba_popularity.log",
+                network="domestic", timeout_sec=600),
+        CronJob("llm_event_retry", "30 17 * * 1-5",
+                [py, str(scripts / "run_llm_event_pipeline.py")], "llm_event_retry.log",
+                network="llm", timeout_sec=7200),
+        CronJob("spot_cache_warmup", "5 17 * * 1-5",
+                [py, main_py, "--warm-spot-cache"], "cron_spot_cache_warmup.log",
+                network="domestic", timeout_sec=600),
+        # --- Post-close: data update (domestic, critical) ---
+        CronJob("qlib_data_update", "45 17 * * 1-5",
+                [py, str(scripts / "update_qlib_data.py"),
+                 "--universe", "all", "--universe-source", "baostock",
+                 "--refresh-universe",
+                 "--min-health-instruments", "4500",
+                 "--min-lgb-data-instruments", "4500",
+                 "--check-today"],
+                "data_update.log",
+                network="domestic", timeout_sec=3600, critical=True),
+        CronJob("fund_flow_update", "55 17 * * 1-5",
+                [py, str(scripts / "fetch_fund_flow_history.py"), "--incremental", "--workers", "1"],
+                "fund_flow_update.log",
+                network="domestic", timeout_sec=1800),
+        CronJob("valuation_update", "0 18 * * 1-5",
+                [py, str(scripts / "fetch_fundamental_valuation.py"), "--days", "10", "--incremental"],
+                "valuation_update.log",
+                network="domestic", timeout_sec=1200),
+        CronJob("regime_daily_update", "5 18 * * 1-5",
+                [py, str(scripts / "update_regime_daily.py")], "regime_daily.log",
+                network="domestic", timeout_sec=1200),
+        # --- Training (none) ---
+        CronJob("midweek_train", "15 18 * * 3",
+                [py, str(scripts / "train_lgb.py")], "lgb_after_close_train.log",
+                network="none", timeout_sec=7200),
+        # --- Prediction + Paper (none, critical) ---
+        CronJob("lgb_after_close_smoke", "35 18 * * 1-5",
+                [py, str(scripts / "smoke_lgb_predict.py")], "lgb_after_close_smoke.log",
+                network="none", timeout_sec=900, critical=True),
+        CronJob("shadow_optimizer", "40 18 * * 1-5",
+                [py, str(scripts / "run_shadow_optimizer.py")], "shadow_optimizer.log",
+                network="none", timeout_sec=600),
+        CronJob("paper_trading", "42 18 * * 1-5",
+                [py, str(scripts / "run_paper_trading.py")], "paper_trading.log",
+                network="none", timeout_sec=600),
+        # --- Monitoring (none) ---
+        CronJob("factor_decay_monitor", "45 18 * * 1-5",
+                [py, str(scripts / "monitor_factor_decay.py")], "factor_decay.log",
+                network="none", timeout_sec=600),
+        CronJob("brinson_attribution", "50 18 * * 1-5",
+                [py, str(scripts / "run_brinson_attribution.py")], "brinson_attribution.log",
+                network="none", timeout_sec=600),
+        CronJob("daily_health_check", "55 18 * * 1-5",
+                [py, str(scripts / "daily_health_check.py")], "health_check.log",
+                network="none", timeout_sec=300),
+        # --- Weekly (Saturday) ---
+        CronJob("weekly_full_retrain", "0 4 * * 6",
+                [py, str(scripts / "nightly_train.py")], "weekly_retrain.log",
+                network="none", timeout_sec=14400),
+        CronJob("weekly_st_refresh", "0 3 * * 6",
+                [py, str(scripts / "fetch_st_list.py")], "st_refresh.log",
+                network="domestic", timeout_sec=600),
+        CronJob("weekly_mask_rebuild", "10 3 * * 6",
+                [py, str(scripts / "build_tradable_mask.py")], "mask_rebuild.log",
+                network="none", timeout_sec=600),
+        CronJob("weekly_regime_data", "20 3 * * 6",
+                [py, str(scripts / "fetch_fund_holdings.py"), "--macro", "--regime"], "regime_data.log",
+                network="domestic", timeout_sec=3600),
     ]
 
 
@@ -116,18 +136,32 @@ def _quote_arg(arg: str) -> str:
 
 
 def render_job(job: CronJob, python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_ROOT) -> str:
-    wrapper = project_root / "scripts" / "run_with_status.py"
+    status_wrapper = project_root / "scripts" / "run_with_status.py"
+    network_wrapper = project_root / "scripts" / "run_network_job.py"
     log_path = project_root / "logs" / job.log_name
+
+    # Build the innermost command (the actual job)
+    inner_cmd = list(job.target)
+
+    # Wrap with run_network_job.py (network profile + timeout)
+    network_cmd = [
+        python_bin,
+        str(network_wrapper),
+        "--network", job.network,
+    ]
+    if job.timeout_sec > 0:
+        network_cmd += ["--timeout", str(job.timeout_sec)]
+    network_cmd += ["--"] + inner_cmd
+
+    # Wrap with run_with_status.py (job status tracking)
     command = [
         python_bin,
-        str(wrapper),
-        "--job-id",
-        job.job_id,
-        "--cwd",
-        str(project_root),
+        str(status_wrapper),
+        "--job-id", job.job_id,
+        "--cwd", str(project_root),
         "--",
-        *job.target,
-    ]
+    ] + network_cmd
+
     return (
         f"{job.schedule} "
         f"{' '.join(_quote_arg(str(part)) for part in command)} "
