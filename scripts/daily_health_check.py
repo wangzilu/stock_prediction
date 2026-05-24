@@ -103,7 +103,7 @@ def check_paper_trading(date: str) -> tuple[str, str]:
         last = history[-1]
         last_date = last.get("date", "")
         ret = last.get("daily_return", 0)
-        return "✅", f"持仓{n_pos}只 市值{value:,.0f} 今日{ret:+.2%}"
+        return "✅", f"持仓{n_pos}只 市值{value:,.0f} {last_date}收益{ret:+.2%}"
     return "⚠️", f"持仓{n_pos}只 市值{value:,.0f} 无历史记录"
 
 
@@ -120,8 +120,9 @@ def check_shadow(date: str) -> tuple[str, str]:
 
     if history:
         last = history[-1]
+        last_date = last.get("date", "")
         ret = last.get("daily_return", 0)
-        return "✅", f"持仓{n_pos}只 市值{value:,.0f} 今日{ret:+.2%}"
+        return "✅", f"持仓{n_pos}只 市值{value:,.0f} {last_date}收益{ret:+.2%}"
     return "⚠️", f"持仓{n_pos}只 市值{value:,.0f}"
 
 
