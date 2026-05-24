@@ -55,9 +55,14 @@
 | 4M | Alpha360 & Model Diversity | 表格 + 深度模型分层验证 | 中高优先级 |
 | 4N | LLM Event Alpha | 新闻/公告/舆情结构化为 PIT 事件因子 | 中优先级 (B'+C' overlay 已做) |
 | **4S** | **实验治理 + 组合风险 + Alpha Factory** | **统一产物契约、ShrinkCov、Barra报告、regime-weighted sampler** | **当前最高优先级** |
+| 4T | LLM 结构化事件库 | 统一 JSON schema，PIT-safe 事件存储 | 4S 后 |
+| 4U | 事件研究校准 | 每类事件 1/3/5/10/20 日 CAR | 4T 事件库 60+ 天 |
+| 4V | 政策/情绪 overlay shadow | 不改 XGB，rerank 对照 30 天 | 4U 校准通过 |
 | 5A | Research Governance | 数据/实验/模型/报告治理 | 合并入 4S |
 | 5B | Deep Sequence Models | HIST/ALSTM/Transformer 类模型研究 | 4S 后 |
 | 5C | RL Portfolio Controller | RL 只做仓位/换手/风险预算控制 | 组合引擎稳定后 |
+| 5D | 行业政策暴露矩阵 | 政策主题 × 行业/概念映射 | 4V shadow 验证 |
+| 5E | Regime Policy Controller | 政策不确定性/支持/监管压力进风控 | 5D |
 | 6 | Execution/Paper OMS | 订单、成交、风控、paper ledger | 最后推进 |
 
 ---
@@ -1030,3 +1035,163 @@ candidate_factors/
 - ✅ policy_support / theme_breadth PIT 过滤
 
 这些改动服务于 P0 实验治理中的 regime 相关 gate 检查。
+
+---
+
+## 16. Phase 4T-4V + 5D-5E：政策/情绪因子体系（2026-05-24 CX 设计）
+
+**核心原则**：政策和情绪不是普通价量因子，必须拆成三层，不能一股脑塞进 XGB174。
+
+### 16.1 三层架构
+
+| 层级 | 用途 | 进模型方式 |
+|------|------|-----------|
+| **市场级 regime** | 决定仓位、风险、是否开新仓 | 进 regime_controller，不进 XGB |
+| **行业/主题级 rotation** | 决定哪些板块被政策或情绪推着走 | 进 reranker 行业加权 |
+| **个股级事件/舆情** | 只对有新闻/公告/讨论的股票做 overlay | 进 event overlay / rerank |
+
+### 16.2 8 类因子定义
+
+| 因子 | 层级 | 数学形式 | 用途 |
+|------|------|---------|------|
+| `policy_uncertainty_score` | 市场级 | 中文 EPU 文本频率 z-score，越高越负 | regime 降风险 |
+| `policy_support_score` | 市场/行业 | 政策支持事件强度 × 衰减 | risk-on / 行业加权 |
+| `regulatory_pressure_score` | 行业/个股 | 监管、处罚、反垄断、窗口指导文本强度 | 降低相关行业/个股 |
+| `sector_policy_momentum` | 行业级 | 近 N 日政策正向事件加权和 | 板块轮动 |
+| `retail_sentiment_score` | 个股级 | 股吧/雪球/东财情绪 z-score | rerank / overlay |
+| `attention_shock_score` | 个股级 | 新闻数/帖子数/搜索热度异常 z-score | 事件候选过滤 |
+| `sentiment_disagreement_score` | 个股级 | 正负观点分歧/评论方差 | 高波动/反转风险 |
+| `speculative_heat_score` | 市场/个股 | 涨停/连板/炸板/换手/讨论热度 | 防追高 |
+
+### 16.3 核心公式
+
+```text
+event_score_i,t =
+  sum_k impact(event_k) * confidence_k * exp(-age_k / half_life_k)
+
+policy_industry_score_j,t =
+  sum_topic policy_intensity_topic,t * exposure_industry_j,topic
+
+stock_policy_score_i,t =
+  sum_j industry_weight_i,j * policy_industry_score_j,t
+  + firm_specific_policy_event_i,t
+
+sentiment_score_i,t =
+  zscore_rolling(positive_prob_i,t - negative_prob_i,t)
+
+attention_shock_i,t =
+  (log(1 + news_count_i,t) - rolling_mean_60d) / rolling_std_60d
+```
+
+**生产用 rerank overlay（不改 XGB 主模型）**：
+
+```text
+final_rank_score =
+  rank(xgb_score) * 0.75
+  + rank(event_policy_score) * 0.10
+  + rank(sentiment_score) * 0.05
+  + rank(risk_penalty) * 0.10
+```
+
+### 16.4 LLM 输出 schema（统一事件表）
+
+LLM 只做结构化抽取，不做买卖判断。输出统一 JSON：
+
+```json
+{
+  "date": "2026-05-24",
+  "stock": "sh600000",
+  "source": "announcement/news/forum/policy",
+  "event_type": "policy_support",
+  "topic": "AI算力/低空经济/地产/券商/新能源",
+  "direction": 1,
+  "magnitude": 0.6,
+  "confidence": 0.82,
+  "affected_industries": ["计算机", "通信"],
+  "horizon_days": 5,
+  "is_policy": true,
+  "is_regulatory": false,
+  "is_rumor": false,
+  "summary": "..."
+}
+```
+
+收益影响必须由历史事件研究校准，不信 LLM 的 magnitude 分数。
+
+### 16.5 Phase 分解
+
+| Phase | 内容 | 目标 | 前置 |
+|-------|------|------|------|
+| **4T** | LLM 结构化抽取 | 新闻/公告/政策/股吧统一 JSON schema | 4S artifact contract |
+| **4U** | 事件研究校准 | 每类事件测 1/3/5/10/20 日 CAR | 4T 事件库 60+ 天 |
+| **4V** | sentiment/event overlay shadow | 不改 XGB，只做 rerank 对照 | 4U 校准通过 |
+| **5D** | 行业政策暴露矩阵 | 政策主题 × 行业/概念映射 | 4V shadow 验证 |
+| **5E** | regime policy controller | 政策不确定性/政策支持/监管压力进风控 | 5D |
+
+### 16.6 现有代码对接
+
+| CX 设计 | 现有代码 | 状态 |
+|---------|---------|------|
+| LLM 结构化事件 | `factors/llm_event_extractor_v2.py` | ✅ schema 基本匹配 |
+| 事件校准 | `scripts/build_event_calibration.py` | ⚠️ 14天数据太少，需 60+ 天 |
+| rerank overlay | `scripts/build_event_overlay.py` (B'+C') | ✅ 在 shadow 中 |
+| 政策支持 regime | `regime_controller._policy_support()` | ✅ 已有 |
+| 散户情绪 | guba 人气榜 | ⚠️ 只有 1 个文件，需持续拉 |
+| EPU 指数 | 无 | ❌ 可引入 CBADE 外部数据 |
+| 行业政策映射 | 无 | ❌ Phase 5D |
+
+### 16.7 数据源优先级
+
+| 数据 | 用途 | 可行性 |
+|------|------|--------|
+| 国务院/发改委/财政部/央行/证监会/交易所公告 | 政策/监管主数据 | 可通过东财公告 API |
+| 东方财富公告 API | 个股事件 | ✅ 已在用 |
+| 东方财富股吧 | 散户情绪 | ✅ AKShare 人气榜作弱代理 |
+| 财联社/证券时报/上证报/中证报 | 政策解释和市场叙事 | ⚠️ 需要 RSS 或 API |
+| 涨跌停/连板/炸板/成交额 | 情绪热度市场确认 | ✅ 已有 limit_list_d |
+| 北向/融资余额/ETF 份额 | 情绪转化为资金 | ✅ 已有 |
+| 雪球 | 散户情绪 | ❌ 短期不爬，法律风险 |
+
+### 16.8 验收指标（10 条）
+
+政策/情绪因子不能只看 IC（覆盖率低，IC 可能不好看，但 overlay 可能有效）。必须看：
+
+1. 单因子 RankIC
+2. Top20 / Bottom20 spread
+3. 事件后 CAR: 1d, 3d, 5d, 10d, 20d
+4. 覆盖率 coverage
+5. 命中股票的换手和滑点
+6. 分行业表现
+7. 牛市/熊市/震荡市分段表现
+8. negative control
+9. 24 split OOS 表现
+10. 加入 overlay 后组合收益、回撤、换手是否改善
+
+### 16.9 7 条防坑红线
+
+1. **PIT-safe**：新闻/公告/政策发布时间精确到日期/时间。晚上 10 点能用，下午 2:30 不一定能用。
+2. **不用未来解释文本**：事后媒体复盘不能作为当天因子。
+3. **coverage neutralization**：大票新闻多、小票少，必须做覆盖率中性化，防止变成隐性市值因子。
+4. **LLM 分数要校准**：LLM 只负责分类和摘要，收益影响必须由历史数据学习。
+5. **"新政策超预期" vs "旧政策反复表态"**：必须区分，否则持续利好信号会失效。
+6. **极端正面 ≠ 买入**：极端正面可能是拥挤和见顶信号。
+7. **市场级政策不当个股 alpha**：很多政策只适合控制仓位，不适合选股票。
+
+### 16.10 MVP 最小可行版本
+
+先做 4 个因子，shadow 30 个交易日 + 回放 2020-2026：
+
+1. `policy_support_market_score`（市场级）
+2. `regulatory_pressure_industry_score`（行业级）
+3. `stock_event_sentiment_score`（个股级）
+4. `retail_attention_shock_score`（个股级）
+
+通过后进入 reranker，不直接塞 XGB174。
+
+**学术参考**：
+- Baker/Bloom/Davis EPU + CBADE Mainland China EPU
+- Du/Huang/Wermers/Wu 中文金融情绪词典
+- FinBERT 中文金融 BERT
+- A-share sentiment and efficiency
+- Weibo mood and Chinese stock market
+- BERT sentiment + TVP-VAR
