@@ -1966,52 +1966,240 @@ factor_rows_generated
 
 ---
 
-## 26. Phase 4U：Global Supply Chain Event Overlay（CX 设计）
+## 26. Phase 4U：Global Supply Chain Event Overlay（CX 详细设计）
 
 **核心思路**：A 股很多公司是全球产业链的影子资产。全球产业新闻 → 供应链映射 → A 股受益/受损公司 → LLM 抽事实 → 校准成因子/overlay。第一阶段做轻量 edge-weight propagation，不上 GNN。
 
-### 26.1 四层架构
+### 26.0 第一版边界
+
+只做 5 条最有 A 股传导价值的链：
+1. **AI 算力链**：Nvidia / AMD / Microsoft / Meta / Amazon / Google / TSMC
+2. **苹果链**：Apple / Foxconn / Luxshare / AAC / Sunny Optical
+3. **特斯拉/机器人链**：Tesla / Optimus / humanoid robot / actuator
+4. **半导体设备/先进封装**：ASML / TSMC / Samsung / SK Hynix / Micron
+5. **新能源/锂电/光伏**：Tesla / CATL / BYD / lithium / solar / polysilicon
+
+不要第一版全产业覆盖。先验证有没有真实 alpha。
+
+### 26.1 供应链边表
 
 ```text
-Layer 1: 全球产业事件采集 (GDELT / Google RSS / 海外财报)
-Layer 2: 供应链实体映射 (200-500 条高置信边，半人工)
-Layer 3: LLM 抽事实 (V2 extractor 风格，不预测收益)
-Layer 4: 因子/overlay 验证
+data/config/supply_chain_edges.yaml    # 可编辑源
+data/storage/supply_chain_edges.parquet # 运行时
+
+字段：
+src_entity          海外实体 (Nvidia / Apple / Tesla / TSMC)
+src_type            customer / supplier / peer / commodity / policy
+dst_stock           A 股 qlib code (sz300308)
+dst_name            A 股公司名
+relation_type       customer_supplier / peer_readthrough / upstream / downstream / commodity_input
+topic               AI_server / Apple_chain / EV / robot / semiconductor / lithium
+product             PCB / optical_module / connector / motor / cooling / HBM
+direction           +1 src 好消息利好 dst / -1 成本冲击/竞争
+weight              0-1 关系强度
+confidence          0-1 人工/公告确认
+source              年报/公告/互动易/公开资料
+updated_at
+
+示例（200-500 条高置信边）：
+Nvidia -> 工业富联     AI_server, server_assembly, weight 0.8
+Nvidia -> 沪电股份     AI_server, PCB, weight 0.7
+Nvidia -> 中际旭创     AI_server, optical_module, weight 0.8
+Apple  -> 立讯精密     Apple_chain, assembly, weight 0.8
+Tesla  -> 三花智控     EV/robot, thermal, weight 0.7
+TSMC   -> 北方华创     semiconductor_equipment, capex, weight 0.5
+Lithium -> 天齐锂业    commodity_output, weight 0.8
+Lithium -> 电池/整车   commodity_input, direction -1
 ```
 
-### 26.2 供应链边表
+### 26.2 全球产业新闻采集
 
 ```text
-data/storage/supply_chain_edges.parquet
-
-示例：
-Nvidia  → 中际旭创/沪电股份/工业富联  (AI server / PCB / optical)
-Apple   → 立讯精密/歌尔股份/蓝思科技  (consumer electronics)
-Tesla   → 拓普集团/三花智控/旭升集团  (EV parts)
-TSMC    → 北方华创/中微公司/沪硅产业  (semiconductor equipment)
+scripts/collect_global_industry_news.py
+输出: data/storage/global_industry_news/YYYY-MM-DD.jsonl
+网络: global/proxy
 ```
 
-### 26.3 全球事件因子
+Query 配置：`data/config/global_industry_queries.yaml`
 
+```yaml
+ai_server:
+  keywords:
+    - Nvidia Blackwell shipment
+    - AI server supply chain
+    - HBM shortage
+    - optical module demand
+apple_chain:
+  keywords:
+    - Apple supplier order
+    - iPhone shipment forecast
+tesla_robot:
+  keywords:
+    - Tesla Optimus supplier
+    - humanoid robot actuator
+semiconductor:
+  keywords:
+    - TSMC capex guidance
+    - ASML order backlog
+ev_battery:
+  keywords:
+    - lithium price
+    - EV battery inventory
+```
+
+### 26.3 LLM 抽全球产业事件
+
+```text
+factors/global_supply_chain_extractor.py
+scripts/extract_global_supply_chain_events.py
+输出: data/storage/global_chain_events/YYYY-MM-DD.jsonl 或进 EventStore
+```
+
+LLM 只抽事实，不预测收益：
+
+```json
+{
+  "event_type": "capex_increase|order_cut|supply_shortage|export_control|...",
+  "source_entity": "Nvidia",
+  "topic": "AI_server",
+  "product": "Blackwell / HBM / optical module",
+  "direction": 1,
+  "magnitude_text": "orders increased",
+  "affected_stage": "upstream|midstream|downstream",
+  "is_official": false,
+  "is_new_information": true,
+  "confidence": 0.78,
+  "summary": "..."
+}
+```
+
+事件类型定义：
+```text
+global_order_increase / global_order_cut
+capex_increase / capex_cut
+supply_shortage / supply_glut
+export_control / tariff / sanction
+peer_guidance_up / peer_guidance_down
+commodity_price_up / commodity_price_down
+technology_breakthrough
+inventory_build / inventory_drawdown
+```
+
+### 26.4 事件传播到 A 股
+
+```text
+scripts/build_global_chain_factors.py
+
+stock_score =
+    event_direction
+  × event_confidence
+  × source_quality
+  × novelty
+  × event_type_weight
+  × decay
+  × edge_weight
+  × edge_confidence
+  × relation_direction
+```
+
+输出因子：
 ```text
 global_chain_alpha_1d/5d
-global_chain_event_count_5d
+global_chain_pos_score / neg_score
+global_chain_event_count_3d / 10d
+global_chain_topic_heat
 global_chain_customer_shock
-global_chain_supplier_shock
+global_chain_peer_readthrough
 global_chain_policy_risk
 global_chain_commodity_pressure
+global_chain_confidence
 ```
 
-### 26.4 验收
+### 26.5 接入方式
 
-不用全市场 IC。按 topic 分别看：AI 算力、苹果链、特斯拉链、锂电、光伏、半导体设备。
+第一版不进 XGB。用 overlay：
+```text
+final_score = zscore(xgb) + alpha*zscore(event) + beta*zscore(global_chain) - gamma*zscore(global_risk)
+```
 
-### 26.5 学术参考
+只对满足条件的股票应用：
+- edge_confidence ≥ 0.5
+- event_confidence ≥ 0.6
+- 事件 age ≤ 5 trading days
+- 股票在 Top1000 流动性池
 
-- Cohen & Frazzini: Economic Links and Predictable Returns
+负面事件 → 降低排名 / cannot_buy / reduce_weight。
+
+### 26.6 验证方案
+
+不用全市场 IC。按 topic 分别看：
+1. Event-covered stocks 的 T+1/T+5 industry-neutral return
+2. Positive vs negative global_chain_score spread
+3. XGB Top50 加 overlay 后收益是否提升
+4. 负面事件是否降低 drawdown
+5. 按 topic：AI_server / Apple_chain / Tesla_robot / semiconductor / EV_battery
+6. 按 source：official press / Reuters / Google RSS / low-quality
+
+通过门槛：
+- coverage ≥ 2% active universe 或 Top1000 中每日 ≥ 30 只
+- T+5 industry-neutral spread > 0
+- 24 split 中 ≥ 55% 为正
+- Top50 overlay spread ≥ +20bp
+- 负面事件组未来 5 日回撤显著更大
+
+### 26.7 Cron 编排
+
+```text
+16:35 collect_global_industry_news      global timeout=600
+16:50 extract_global_supply_chain       llm    timeout=3600
+17:10 build_global_chain_factors        none   timeout=600
+21:30 collect_global_industry_news      global timeout=600 (retry)
+22:10 extract_global_supply_chain       llm    timeout=3600 (retry)
+```
+
+全球链失败 → 推荐继续跑，global_chain_overlay=false，health check 提示。
+
+### 26.8 文件清单
+
+```text
+data/config/global_industry_queries.yaml
+data/config/supply_chain_edges.yaml
+scripts/collect_global_industry_news.py
+scripts/extract_global_supply_chain_events.py
+scripts/build_global_chain_factors.py
+scripts/validate_global_chain_overlay.py
+factors/global_supply_chain_extractor.py
+factors/supply_chain_mapper.py
+data/storage/global_industry_news/
+data/storage/global_chain_events/
+data/storage/global_chain_factors.parquet
+data/storage/supply_chain_edges.parquet
+```
+
+### 26.9 第一版不做
+
+- 全自动供应链边抽取
+- 复杂 GNN / GraphSAGE / KGTransformer
+- 全市场全产业覆盖
+- global_chain 直接塞进 XGB174
+- LLM 预测收益百分比
+
+### 26.10 MVP 5 天计划
+
+| Day | 内容 |
+|-----|------|
+| 1 | 人工建 100 条 AI/苹果/特斯拉链 supply_chain_edges |
+| 2 | 写 global_industry_news collector |
+| 3 | 写 LLM extractor，抽 global_chain_events |
+| 4 | 写 factor builder，生成 global_chain_factors |
+| 5 | 做 overlay validation |
+
+### 26.11 学术参考
+
+- Cohen & Frazzini: Economic Links and Predictable Returns (AQR)
 - Herskovic et al.: Firm Volatility in Granular Networks
-- FinDKG: LLM + Dynamic Knowledge Graph
-- Temporal Relational Ranking for Stock Prediction
+- FinDKG: LLM + Dynamic Knowledge Graph (ICKG model)
+- Temporal Relational Ranking for Stock Prediction (RSR)
 
 ---
 
