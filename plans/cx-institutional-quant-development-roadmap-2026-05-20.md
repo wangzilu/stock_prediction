@@ -1961,3 +1961,92 @@ positive/negative/neutral ratio
 EventStore stored count
 factor_rows_generated
 ```
+
+---
+
+## 26. Phase 4U：Global Supply Chain Event Overlay（CX 设计）
+
+**核心思路**：A 股很多公司是全球产业链的影子资产。全球产业新闻 → 供应链映射 → A 股受益/受损公司 → LLM 抽事实 → 校准成因子/overlay。第一阶段做轻量 edge-weight propagation，不上 GNN。
+
+### 26.1 四层架构
+
+```text
+Layer 1: 全球产业事件采集 (GDELT / Google RSS / 海外财报)
+Layer 2: 供应链实体映射 (200-500 条高置信边，半人工)
+Layer 3: LLM 抽事实 (V2 extractor 风格，不预测收益)
+Layer 4: 因子/overlay 验证
+```
+
+### 26.2 供应链边表
+
+```text
+data/storage/supply_chain_edges.parquet
+
+示例：
+Nvidia  → 中际旭创/沪电股份/工业富联  (AI server / PCB / optical)
+Apple   → 立讯精密/歌尔股份/蓝思科技  (consumer electronics)
+Tesla   → 拓普集团/三花智控/旭升集团  (EV parts)
+TSMC    → 北方华创/中微公司/沪硅产业  (semiconductor equipment)
+```
+
+### 26.3 全球事件因子
+
+```text
+global_chain_alpha_1d/5d
+global_chain_event_count_5d
+global_chain_customer_shock
+global_chain_supplier_shock
+global_chain_policy_risk
+global_chain_commodity_pressure
+```
+
+### 26.4 验收
+
+不用全市场 IC。按 topic 分别看：AI 算力、苹果链、特斯拉链、锂电、光伏、半导体设备。
+
+### 26.5 学术参考
+
+- Cohen & Frazzini: Economic Links and Predictable Returns
+- Herskovic et al.: Firm Volatility in Granular Networks
+- FinDKG: LLM + Dynamic Knowledge Graph
+- Temporal Relational Ranking for Stock Prediction
+
+---
+
+## 27. 网络分层架构（CX 设计）
+
+**问题**：国内 API 走代理超时，全球 API 不走代理失败。现在每个脚本零散处理，不可靠。
+
+### 27.1 三档网络 profile
+
+```text
+domestic_no_proxy:  清空 http_proxy/https_proxy/ALL_PROXY
+                    用于 baostock/ST_CLIENT/东财/AKShare
+global_with_proxy:  检查代理端口 → 设置 proxy → 连通性检测
+                    用于 GDELT/Google RSS/BBC/海外 API
+none:               不联网，纯计算
+                    用于 factor build/merge/train/predict
+```
+
+### 27.2 统一 wrapper
+
+```text
+scripts/run_network_job.py --network domestic|global|none -- command...
+```
+
+### 27.3 cron 任务分类
+
+```text
+国内链 (domestic):  morning_rec / collect_news / qlib_update / regime / valuation
+全球链 (global):    gdelt / global_supply_chain / overnight_context
+计算链 (none):      event_store / factor_build / train / predict / paper_trading
+LLM 链:            拆成 collect(domestic/global) + extract(看 LLM API) + build(none)
+```
+
+### 27.4 代理健康检查
+
+```text
+1. 本地端口检测: connect 127.0.0.1:proxy_port
+2. 外网检测: curl https://www.google.com/generate_204
+3. 失败: 尝试 zsh -ic 'ssproxy' → 再测 → 仍失败则 job fail
+```
