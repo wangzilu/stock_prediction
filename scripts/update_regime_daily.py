@@ -131,19 +131,59 @@ def update_hsgt(st, date: str):
         logger.warning(f"    hsgt: {e}")
 
 
+def update_futures_akshare():
+    """Update IC/IM/IF futures via AKShare (no auth needed)."""
+    logger.info("  Updating futures (AKShare)...")
+    try:
+        import akshare as ak
+        import warnings; warnings.filterwarnings("ignore")
+        for symbol, name in [("IC0", "IC"), ("IM0", "IM"), ("IF0", "IF")]:
+            path = DATA_DIR / f"ak_futures_{symbol.lower()}.parquet"
+            try:
+                df = ak.futures_main_sina(symbol=symbol)
+                if df is not None and not df.empty:
+                    df.to_parquet(str(path), index=False)
+                    logger.info(f"    ✅ {name}: {len(df)} rows")
+            except Exception as e:
+                logger.warning(f"    {name}: {e}")
+    except Exception as e:
+        logger.warning(f"    AKShare import failed: {e}")
+
+
+def update_usdcny_akshare():
+    """Update USD/CNY via AKShare."""
+    logger.info("  Updating USD/CNY (AKShare)...")
+    try:
+        import akshare as ak
+        import warnings; warnings.filterwarnings("ignore")
+        path = DATA_DIR / "ak_usdcny.parquet"
+        df = ak.currency_boc_sina(symbol="美元", start_date="20210101", end_date="20261231")
+        if df is not None and not df.empty:
+            for col in df.columns:
+                if df[col].dtype == object:
+                    df[col] = df[col].astype(str)
+            df.to_parquet(str(path), index=False)
+            logger.info(f"    ✅ {len(df)} rows")
+    except Exception as e:
+        logger.warning(f"    USD/CNY: {e}")
+
+
 def main():
     today = datetime.now().strftime("%Y-%m-%d")
     logger.info(f"=== Daily Regime Data Update: {today} ===")
 
+    # ST_CLIENT data
     try:
         st = get_st_client()
+        update_margin(st, today)
+        update_limit_list(st, today)
+        update_hsgt(st, today)
     except Exception as e:
-        logger.error(f"ST_CLIENT init failed: {e}")
-        return
+        logger.error(f"ST_CLIENT failed: {e}")
 
-    update_margin(st, today)
-    update_limit_list(st, today)
-    update_hsgt(st, today)
+    # AKShare data (no auth)
+    update_futures_akshare()
+    update_usdcny_akshare()
 
     logger.info("Done!")
 

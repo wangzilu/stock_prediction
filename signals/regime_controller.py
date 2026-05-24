@@ -54,6 +54,8 @@ class RegimeController:
             "theme_breadth_score": self._theme_breadth(date),
             "inflation_score": self._inflation(date),
             "northbound_score": self._northbound(date),
+            "futures_basis_score": self._futures_basis(date),
+            "fx_risk_score": self._fx_risk(date),
         }
 
         # Composite risk_on_score: weighted average
@@ -65,8 +67,10 @@ class RegimeController:
             "external_shock_score": 0.12,
             "policy_support_score": 0.08,
             "theme_breadth_score": 0.05,
-            "inflation_score": 0.08,
-            "northbound_score": 0.07,
+            "inflation_score": 0.06,
+            "northbound_score": 0.06,
+            "futures_basis_score": 0.08,
+            "fx_risk_score": 0.06,
         }
         risk_on = sum(scores[k] * w for k, w in weights.items())
         scores["risk_on_score"] = round(risk_on, 3)
@@ -320,6 +324,78 @@ class RegimeController:
         except Exception:
             pass
         return 0.0
+
+    def _futures_basis(self, date: str) -> float:
+        """IC/IM futures basis → quant crowding risk [-1, +1].
+
+        Large discount (basis < 0) = quant short pressure / forced unwind.
+        """
+        try:
+            # IC main contract
+            ic = pd.read_parquet(DATA_DIR / "ak_futures_ic0.parquet")
+            ic["日期"] = pd.to_datetime(ic["日期"], errors="coerce")
+            ic = ic.dropna(subset=["日期"])
+            ic = ic[ic["日期"] <= pd.Timestamp(date)].sort_values("日期")
+
+            if len(ic) < 20:
+                return 0.0
+
+            # Basis proxy: 5-day change rate of close price
+            close = pd.to_numeric(ic["收盘价"], errors="coerce").dropna()
+            if len(close) < 20:
+                return 0.0
+
+            # Sharp drop in IC futures = quant unwind signal
+            ret_5d = (close.iloc[-1] - close.iloc[-5]) / close.iloc[-5]
+            ret_20d = (close.iloc[-1] - close.iloc[-20]) / close.iloc[-20]
+
+            # -5% in 5 days → negative signal
+            score = max(-1, min(1, ret_5d / 0.05))
+            return round(score, 3)
+        except Exception:
+            return 0.0
+
+    def _fx_risk(self, date: str) -> float:
+        """USD/CNY movement → currency risk [-1, +1].
+
+        Rapid CNY depreciation = negative (capital outflow risk).
+        """
+        try:
+            fx = pd.read_parquet(DATA_DIR / "ak_usdcny.parquet")
+            # Find the exchange rate column
+            rate_col = None
+            for col in fx.columns:
+                vals = pd.to_numeric(fx[col], errors="coerce").dropna()
+                if len(vals) > 100 and 5 < vals.mean() < 10:  # USD/CNY around 7
+                    rate_col = col
+                    break
+
+            if not rate_col:
+                return 0.0
+
+            # Find date column
+            date_col = None
+            for col in fx.columns:
+                if "日期" in col or "date" in col.lower():
+                    date_col = col
+                    break
+
+            if date_col:
+                fx[date_col] = pd.to_datetime(fx[date_col], errors="coerce")
+                fx = fx.dropna(subset=[date_col])
+                fx = fx[fx[date_col] <= pd.Timestamp(date)].sort_values(date_col)
+
+            rate = pd.to_numeric(fx[rate_col], errors="coerce").dropna()
+            if len(rate) < 20:
+                return 0.0
+
+            # 5-day change: USD/CNY going up = CNY weakening = negative
+            change_5d = (rate.iloc[-1] - rate.iloc[-5]) / rate.iloc[-5]
+            # +1% in 5 days (CNY depreciation) → -0.5 score
+            score = max(-1, min(1, -change_5d / 0.02))
+            return round(score, 3)
+        except Exception:
+            return 0.0
 
     def _suggest_adjustments(self, scores: dict) -> dict:
         """Suggest trading parameter changes based on regime."""
