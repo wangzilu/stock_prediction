@@ -2564,6 +2564,67 @@ Layer 4: Downstream Freshness Gate          ⬜ 待实现
 - Layer 3 ⬜ retry 时段已在 cron 排布中预留，collector 脚本未支持 `--retry` 模式
 - Layer 4 ⬜ `scheduler/job_deps.py` 有 `check_upstream()`，未接入训练/预测脚本
 
-**ssproxy LaunchAgent**：增强可用性但不替代 wrapper。两者都要：
-- LaunchAgent 保证 proxy 端口常驻
-- wrapper 保证每个 job 独立验证 + fail-fast
+**ssproxy 按需启动**：不需要 LaunchAgent 常驻。`run_network_job.py --network global`
+会在每次 global job 时按需启动 ssproxy（通过 `zsh -ic 'ssproxy'`），用完不管。
+cron 环境验证通过：`zsh -ic` 能正确加载 `.zshrc` 中的 ssproxy function。
+
+---
+
+### 28.15 Data Reliability Layer（CX 终版架构）
+
+**目标**：任何单个源、单个网络、单次 cron 失败都不会让系统停摆。不是相信某一个源一定能拉到，而是系统能自动重试、换源、降级。
+
+**每类信息至少 3 个源**：
+
+| 类别 | 源 1 | 源 2 | 源 3 |
+|------|------|------|------|
+| 国内公告 | 东财公告 | 巨潮 | 交易所公告 |
+| 国内情绪 | 东财股吧 | 雪球 | 同花顺/财联社 |
+| 全球新闻 | GDELT | Google News RSS | Reuters/BBC/公司 IR |
+| 宏观政策 | 央行 | 发改委 | 证监会/国常会 |
+
+**Collector 状态文件**（machine-readable）：
+
+```json
+{
+  "source": "gdelt_ai_server",
+  "run_id": "20260525_163500",
+  "started_at": "...",
+  "finished_at": "...",
+  "status": "success|partial|failed",
+  "n_items": 42,
+  "latest_publish_time": "2026-05-25T15:30:00",
+  "error_type": null,
+  "retry_count": 0,
+  "network_profile": "global"
+}
+```
+
+**Retry 策略**：
+
+```text
+第一次失败 → 10 分钟后 retry（同源同网络）
+第二次失败 → 换源 retry（如 GDELT 失败换 Google RSS）
+第三次失败 → 换网络 profile 或重启 proxy
+最后仍失败 → WeChat 告警 + 下游降级
+```
+
+**Freshness Gate 规则**：
+
+```text
+全球新闻 latest_date < today → event overlay 标记 global_news_stale
+LLM 事件 latest_date < today → LLM overlay 降权或关闭
+国内行情 latest_date < today → 禁止训练/推荐
+核心行情/复权/日历/ST → 必须落本地 parquet，公网坏不影响已有数据
+```
+
+**实施优先级**：
+
+| 步骤 | 内容 | 优先级 |
+|------|------|--------|
+| 1 | collector status 写入（每个 collector 跑完写状态） | P0 |
+| 2 | freshness gate 接入训练/预测 | P0 |
+| 3 | retry 队列（10min retry + 换源） | P1 |
+| 4 | 多源 fallback（每类信息 ≥ 2 源） | P1 |
+| 5 | WeChat 告警接入 | P1 |
+| 6 | 本地关键数据镜像校验 | P2 |
