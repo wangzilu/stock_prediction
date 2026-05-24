@@ -64,9 +64,11 @@
 | 4N-2 | 事件 surprise 特征 | direction/confidence/novelty/attention | ✅ 初版完成（需更多数据） |
 | 4N-3 | 历史校准表 | event_type × 行业 × 市值 × regime | ⏳ 需 60+ 天事件数据 |
 | 4N-4 | overlay/reranker rolling PIT 验证 | 不改 XGB，rerank 对照 | ⏳ 需 rolling pred artifact |
-| **4O** | **Downside Risk Layer** | **crash label + 负面事件因子 + 踩踏/退潮因子** | **P1 优先** |
-| **4P** | **RiskGuard 接入** | **crash_prob → cannot_buy / reduce_weight / force_sell** | **4O 后** |
-| 4T-1~7 | LLM pipeline 收敛 | V2 默认/EventStore 唯一/规则筛选/公告正文/校准表 | 逐步推进 |
+| 4O | Downside Risk Layer | crash label + 负面事件因子 + 踩踏/退潮因子 | ⚠️ crash labels 已建，模型待训练 |
+| 4P | RiskGuard 接入 | crash_prob → cannot_buy / reduce_weight / force_sell | 4O 后 |
+| 4T-1~7 | LLM pipeline 收敛 | V2 默认/EventStore 唯一/规则筛选/公告正文/校准表 | ⚠️ 4T-1/4T-2 已完成 |
+| 4U | Global Supply Chain Overlay | 全球产业事件 → 供应链映射 → A 股因子 | 设计完成，待实施 |
+| **4X** | **网络分层 + 数据稳定性** | **domestic/global/none profile, proxy wrapper, cron 分类** | **待实施** |
 | 5A | Research Governance | 数据/实验/模型/报告治理 | 合并入 4S |
 | 5B | Deep Sequence Models | HIST/ALSTM/Transformer 类模型研究 | 4S 后 |
 | 5C | RL Portfolio Controller | RL 只做仓位/换手/风险预算控制 | 组合引擎稳定后 |
@@ -2050,3 +2052,97 @@ LLM 链:            拆成 collect(domestic/global) + extract(看 LLM API) + bui
 2. 外网检测: curl https://www.google.com/generate_204
 3. 失败: 尝试 zsh -ic 'ssproxy' → 再测 → 仍失败则 job fail
 ```
+
+---
+
+## 28. Phase 4X：网络分层 + 数据拉取稳定性（CX 详细设计）
+
+**目标**：拉数据万无一失。国内链不碰 VPN，全球链自动确保 ssproxy，混合任务拆开。
+
+### 28.1 实施计划（10 步）
+
+| 步骤 | 内容 | 优先级 |
+|------|------|--------|
+| 1 | 新增 `run_network_job.py` 统一 wrapper | P0 |
+| 2 | 业务脚本不自己管网络 | P0 原则 |
+| 3 | `install_crontab.py` CronJob 加 `network` 字段 | P0 |
+| 4 | 现有 job 分类标注 domestic/global/none/llm | P0 |
+| 5 | 拆 `run_llm_event_pipeline.py` 成 4 个独立 job | P1 |
+| 6 | 代理启动策略：先检测 → 再启动 → 等待 → 重试 | P1 |
+| 7 | 日志 + health check 增加网络链路状态 | P1 |
+| 8 | 失败隔离：global 失败不影响 domestic | P1 |
+| 9 | cron 时间排布优化（含 retry 时段） | P2 |
+| 10 | 清理各脚本内部零散 proxy unset | P2 |
+
+### 28.2 网络配置文件
+
+```python
+# config/network_profiles.py
+PROXY_URL = "http://127.0.0.1:7890"
+PROXY_START_CMD = ["zsh", "-ic", "ssproxy"]
+GLOBAL_CHECK_URLS = [
+    "https://api.gdeltproject.org/api/v2/doc/doc",
+    "https://www.google.com/generate_204",
+]
+DOMESTIC_CHECK_URLS = [
+    "https://emappdata.eastmoney.com",
+]
+```
+
+### 28.3 Cron 任务分类（终版）
+
+**国内链 (domestic)**：
+```text
+09:20 morning_recommendation
+14:30 sell_check
+16:25 domestic_event_collect (公告+新闻)
+16:35 guba_popularity
+17:45 qlib_data_update
+17:55 fund_flow_update
+18:00 valuation_update
+18:05 regime_daily_update
+```
+
+**全球链 (global)**：
+```text
+16:30 global_macro_news_update
+16:40 global_supply_chain_news
+21:30 global_news_retry
+```
+
+**计算链 (none)**：
+```text
+17:05 event_factor_build
+18:35 smoke_lgb_predict
+18:40 shadow_optimizer (pending order generate)
+18:42 paper_trading (pending order generate)
+18:55 daily_health_check
+次日 10:00 reconcile (pending order fill)
+```
+
+**LLM 链 (llm)**：
+```text
+16:50 llm_event_extract
+22:10 llm_event_retry
+```
+
+### 28.4 LLM pipeline 拆分
+
+```text
+现在：run_llm_event_pipeline.py = collect + extract + build (混合)
+改成：
+  domestic_event_collect.py   → domestic
+  global_event_collect.py     → global
+  llm_event_extract.py        → llm (读 collected raw, 写 EventStore)
+  event_factor_build.py       → none (读 EventStore, 生成因子)
+```
+
+### 28.5 验收标准
+
+1. crontab dry-run 输出每个 job 都带 network wrapper
+2. domestic job 日志 `proxy_env_set=false`
+3. global job 日志 `proxy_env_set=true`
+4. ssproxy 未启动时，global job 能自动启动或明确失败
+5. ssproxy 启动失败，不影响 qlib_data_update
+6. daily_health_check 区分国内/全球/LLM 链路状态
+7. 连跑 5 个交易日，国内数据更新成功率不下降
