@@ -458,8 +458,48 @@ class PaperOMS:
             self._save_state()
             return pnl
 
+        # RiskGuard: check for force exits, cooldowns, drawdown
+        try:
+            from backtest.risk_guard import RiskGuard
+            guard = RiskGuard()
+            prices = self._load_real_prices(date, extra_codes=list(self.state.get("positions", {}).keys()))
+            risk = guard.check(
+                positions=self.state.get("positions", {}),
+                prices=prices,
+                date=date,
+            )
+            # Update portfolio peak for drawdown tracking
+            guard.update_portfolio_value(self.state.get("total_value", 1e6), date)
+
+            # Apply force sells
+            if risk.force_sell:
+                logger.warning(f"  RiskGuard force_sell: {risk.force_sell}")
+                for code in risk.force_sell:
+                    reason = risk.risk_reasons.get(code, "")
+                    logger.warning(f"    {code}: {reason}")
+
+            # Apply cannot_buy to predictions
+            if risk.cannot_buy:
+                predictions = {k: v for k, v in predictions.items()
+                               if k not in risk.cannot_buy and k.lower() not in risk.cannot_buy}
+
+            # Merge force_sell into sells
+            extra_sells = [code for code in risk.force_sell
+                           if code in self.state.get("positions", {})]
+        except Exception as e:
+            logger.warning(f"  RiskGuard failed (continuing without): {e}")
+            extra_sells = []
+            risk = None
+
         # Generate target
         target, sells, buys = self.generate_target(predictions)
+
+        # Add risk-forced sells
+        if extra_sells:
+            sells = list(set(sells + extra_sells))
+            # Remove force-sold stocks from target
+            target = [t for t in target if t not in set(extra_sells)]
+
         logger.info(f"  Target: {len(target)} stocks, sell={len(sells)}, buy={len(buys)}")
 
         # Execute
