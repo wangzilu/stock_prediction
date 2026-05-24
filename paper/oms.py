@@ -497,7 +497,9 @@ class PaperOMS:
         risk_info = {"force_sell": [], "alert_level": "normal"}
         try:
             from backtest.risk_guard import RiskGuard
-            guard = RiskGuard()
+            # Pass state_dir to RiskGuard for champion/shadow isolation
+            _sd = str(self._state_dir.name) if self._state_dir != PAPER_DIR else None
+            guard = RiskGuard(state_dir=_sd)
             prices = self._load_real_prices(
                 date, extra_codes=list(self.state.get("positions", {}).keys()))
             risk = guard.check(

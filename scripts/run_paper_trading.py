@@ -85,10 +85,17 @@ def main():
     logger.info(f"=== Paper Trading: {date} ===")
     pnl = oms.run_daily(date)
 
+    # Handle pending mode: run_daily may return {"status": "pending"} when
+    # T+1 open prices are not yet available (e.g., running same-day after close)
+    if isinstance(pnl, dict) and pnl.get("status") == "pending":
+        logger.info(f"\n  Orders generated, awaiting T+1 open for reconciliation.")
+        logger.info(f"  Run again tomorrow after 10:00 to reconcile.")
+        return
+
     logger.info(f"\nDaily summary:")
-    logger.info(f"  Value: {pnl['total_value']:,.2f}")
-    logger.info(f"  Return: {pnl['daily_return']:+.4f}")
-    logger.info(f"  Positions: {pnl['n_positions']}")
+    logger.info(f"  Value: {pnl.get('total_value', 0):,.2f}")
+    logger.info(f"  Return: {pnl.get('daily_return', 0):+.4f}")
+    logger.info(f"  Positions: {pnl.get('n_positions', 0)}")
 
     # Push notification
     try:

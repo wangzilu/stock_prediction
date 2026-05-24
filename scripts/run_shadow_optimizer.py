@@ -93,10 +93,15 @@ def main():
     logger.info(f"=== Shadow Optimizer: {date} ===")
     pnl = oms.run_daily(date)
 
+    # Handle pending mode
+    if isinstance(pnl, dict) and pnl.get("status") == "pending":
+        logger.info(f"\n  Orders generated, awaiting T+1 open for reconciliation.")
+        return
+
     logger.info(f"\nDaily summary:")
-    logger.info(f"  Value: {pnl['total_value']:,.2f}")
-    logger.info(f"  Return: {pnl['daily_return']:+.4f}")
-    logger.info(f"  Positions: {pnl['n_positions']}")
+    logger.info(f"  Value: {pnl.get('total_value', 0):,.2f}")
+    logger.info(f"  Return: {pnl.get('daily_return', 0):+.4f}")
+    logger.info(f"  Positions: {pnl.get('n_positions', 0)}")
 
     # Auto-compare
     _compare_with_champion(oms)

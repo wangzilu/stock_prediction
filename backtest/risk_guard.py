@@ -57,7 +57,9 @@ class RiskGuard:
                  cooldown_event_days: int = 30,           # 连续跌停/监管/负面事件
                  cooldown_st_until_clear: bool = True,    # ST: 直到摘帽
                  # CX: drawdown recovery needs 5 consecutive days
-                 drawdown_recovery_days: int = 5):
+                 drawdown_recovery_days: int = 5,
+                 # State isolation: champion/shadow/backtest use separate dirs
+                 state_dir: str = None):
         self.hard_stop_pct = hard_stop_pct
         self.vol_stop_multiplier = vol_stop_multiplier
         self.vol_stop_min = vol_stop_min
@@ -67,8 +69,14 @@ class RiskGuard:
         self.cooldown_st_until_clear = cooldown_st_until_clear
         self.drawdown_recovery_days = drawdown_recovery_days
 
-        # Persistent state
-        self._state_path = DATA_DIR / "risk_guard_state.json"
+        # Persistent state — isolated per state_dir to prevent
+        # champion/shadow/backtest from polluting each other
+        if state_dir:
+            state_base = DATA_DIR / "paper" / state_dir
+        else:
+            state_base = DATA_DIR
+        state_base.mkdir(parents=True, exist_ok=True)
+        self._state_path = state_base / "risk_guard_state.json"
         self._state = self._load_state()
 
     def check(self, positions: dict, prices: dict, date: str,
