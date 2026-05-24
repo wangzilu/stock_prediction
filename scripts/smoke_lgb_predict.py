@@ -128,9 +128,32 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Iterable[str] | None = None) -> int:
-    from scheduler.data_health import write_health, HealthStatus
+    from scheduler.data_health import write_health, HealthStatus, check_training_gate
 
     args = parse_args(argv)
+
+    # --- Freshness gate: check upstream data before predicting ---
+    gate_result = check_training_gate()
+    gate = gate_result["gate"]
+
+    if gate == "fail":
+        logger.error(
+            "Training gate FAILED — skipping prediction. Reason: %s",
+            gate_result.get("reason", "unknown"),
+        )
+        write_health("lgb_smoke_predict", HealthStatus(
+            success=False,
+            error_type="GateFail",
+            error_message=gate_result.get("reason", "upstream data stale")[:200],
+        ))
+        return 1
+
+    if gate == "degrade":
+        logger.warning(
+            "Training gate DEGRADED — proceeding with degraded overlays: %s",
+            gate_result.get("degraded_overlays", []),
+        )
+
     try:
         output = None if args.no_cache else args.output
         result = run_smoke(args.model_path, args.min_predictions, args.qlib_dir, output)

@@ -168,6 +168,54 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
         logger.debug(traceback.format_exc())
         return False
 
+    # Step 1.5: Filter news through event_filter (Phase 4T-3)
+    logger.info("[Step 1.5/3] Filtering news via event_filter...")
+    try:
+        from factors.event_filter import filter_candidates, select_for_llm
+        import json as _json_filter
+
+        if news_path.exists():
+            raw_items = []
+            with open(news_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        raw_items.append(_json_filter.loads(line))
+                    except _json_filter.JSONDecodeError:
+                        continue
+
+            total_before = len(raw_items)
+            if total_before > 0:
+                scored = filter_candidates(raw_items)
+                selected = select_for_llm(scored)
+                total_after = len(selected)
+                logger.info(
+                    f"  Filtered {total_before} items -> {total_after} for LLM extraction"
+                )
+
+                # Overwrite news file with filtered items only
+                with open(news_path, "w", encoding="utf-8") as f:
+                    for item in selected:
+                        # Remove internal scoring fields before writing
+                        item.pop("priority_score", None)
+                        item.pop("must_send", None)
+                        f.write(_json_filter.dumps(item, ensure_ascii=False) + "\n")
+            else:
+                logger.info("  No items to filter")
+        else:
+            logger.info("  News file not found, skipping filter")
+
+    except ImportError:
+        logger.warning(
+            "  event_filter not importable — falling back to unfiltered news"
+        )
+    except Exception as e:
+        logger.warning(
+            "  event_filter failed (non-fatal, using unfiltered news): %s", e
+        )
+
     # Step 2: Extract events via LLM (120-min timeout for full-A 5000 stocks)
     logger.info("[Step 2/3] Extracting events via MiniMax LLM...")
     try:

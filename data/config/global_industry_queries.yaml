@@ -1,0 +1,72 @@
+# Global Industry News Queries — Phase 4U Day2
+# Each topic maps to supply_chain_edges.yaml topics
+# Updated: 2026-05-24
+
+ai_server:
+  label: "AI Server / 算力链"
+  queries:
+    - "Nvidia Blackwell shipment"
+    - "Nvidia GPU demand datacenter"
+    - "Nvidia earnings revenue guidance"
+    - "AMD MI300 datacenter AI"
+    - "Microsoft Azure AI capex"
+    - "Google TPU cloud AI infrastructure"
+    - "Meta AI infrastructure spending"
+    - "800G optical module transceiver"
+    - "AI server PCB demand"
+    - "HBM memory SK Hynix Samsung"
+  gdelt_max: 50
+  rss_max: 20
+
+apple_chain:
+  label: "Apple Chain / 苹果链"
+  queries:
+    - "Apple iPhone production shipment"
+    - "Apple supply chain China"
+    - "Apple Vision Pro production"
+    - "Apple supplier order"
+    - "Foxconn Apple assembly"
+    - "Apple new product launch"
+    - "Apple earnings revenue forecast"
+  gdelt_max: 50
+  rss_max: 20
+
+tesla_robot:
+  label: "Tesla / Robot / 特斯拉机器人链"
+  queries:
+    - "Tesla delivery production volume"
+    - "Tesla Optimus robot humanoid"
+    - "Tesla factory Shanghai Gigafactory"
+    - "Tesla FSD autonomous driving"
+    - "humanoid robot actuator reducer"
+    - "Tesla earnings revenue"
+    - "Tesla supplier China parts"
+  gdelt_max: 50
+  rss_max: 20
+
+semiconductor:
+  label: "Semiconductor Equipment / 半导体设备"
+  queries:
+    - "TSMC capex expansion fab"
+    - "ASML EUV lithography order"
+    - "semiconductor equipment spending"
+    - "chip export control sanctions"
+    - "US China semiconductor restriction"
+    - "advanced packaging CoWoS"
+    - "Micron DRAM NAND production"
+    - "Samsung foundry chip"
+  gdelt_max: 50
+  rss_max: 20
+
+ev_battery:
+  label: "EV Battery / 新能源电池链"
+  queries:
+    - "lithium price carbonate hydroxide"
+    - "CATL battery production expansion"
+    - "BYD sales delivery EV"
+    - "EV battery supply chain"
+    - "polysilicon solar price"
+    - "lithium mining supply"
+    - "electric vehicle sales global"
+  gdelt_max: 50
+  rss_max: 20

@@ -83,6 +83,15 @@ def main():
     # Run daily
     date = args.date or datetime.now().strftime("%Y-%m-%d")
     logger.info(f"=== Paper Trading: {date} ===")
+
+    # --- Freshness check: warn if predictions are stale ---
+    from scheduler.data_health import is_fresh
+    pred_fresh = (
+        is_fresh("lgb_smoke_predict") or is_fresh("lgb_after_close_smoke")
+    )
+    if not pred_fresh:
+        logger.warning("Using stale predictions — no fresh prediction health found for today")
+
     pnl = oms.run_daily(date)
 
     # Handle pending mode: run_daily may return {"status": "pending"} when
@@ -101,7 +110,8 @@ def main():
     try:
         from push.wechat import WeChatPusher
         s = oms.status()
-        msg = (f"📋 Paper Trading {date}\n"
+        stale_tag = " [STALE PREDICTIONS]" if not pred_fresh else ""
+        msg = (f"📋 Paper Trading {date}{stale_tag}\n"
                f"Value: {s['total_value']:,.0f}\n"
                f"Return: {s['total_return']*100:+.2f}%\n"
                f"Positions: {s['n_positions']}\n"
