@@ -59,9 +59,11 @@
 | 4E | Model Ensemble 基建 | 模型 zoo artifact、rank/zscore fusion、rolling IC weighting、disagreement | ⚠️ 单 split 完成，24-split 待跑 |
 | **4G** | **Feature Path 统一 + Factor Inventory** | **官方因子路径、自动清单、晋级流程** | **当前最高优先级** |
 | 4R | Meta-filter / Reranker | Top100 二阶段过滤、risk-aware rerank、optimizer_v2 shadow | 4E/4G 后 |
-| 4T | LLM 结构化事件库 | 统一 JSON schema，PIT-safe 事件存储 | 4S 后 |
-| 4U | 事件研究校准 | 每类事件 1/3/5/10/20 日 CAR | 4T 事件库 60+ 天 |
-| 4V | 政策/情绪 overlay shadow | 不改 XGB，rerank 对照 30 天 | 4U 校准通过 |
+| 4T | LLM 结构化事件库 | 统一 JSON schema，PIT-safe 事件存储 | ✅ EventStore 基础完成 |
+| **4N-1** | **EventStore 统一 + 5 时间字段** | **废弃 legacy 双轨** | **可现在做** |
+| **4N-2** | **事件 surprise 特征** | **合同/回购/增持/业绩 surprise** | **可现在做** |
+| 4N-3 | 历史校准表 | event_type × 行业 × 市值 × regime | ⏳ 需 60+ 天事件数据 |
+| 4N-4 | overlay/reranker rolling PIT 验证 | 不改 XGB，rerank 对照 | ⏳ 需 rolling pred artifact |
 | 5A | Research Governance | 数据/实验/模型/报告治理 | 合并入 4S |
 | 5B | Deep Sequence Models | HIST/ALSTM/Transformer 类模型研究 | 4S 后 |
 | 5C | RL Portfolio Controller | RL 只做仓位/换手/风险预算控制 | 组合引擎稳定后 |
@@ -1642,3 +1644,173 @@ SUPPLEMENT_PATH = {
 
 > 这个项目现在不是玩具了，已经进入"研究体系初成，但生产语义需要收敛"的阶段。
 > 当前真正强的是价量模型和研究框架；距离"百亿私募味道"的差距，不在于再随手加 100 个因子，而在于把候选因子纳入统一晋级制度。
+
+---
+
+## 23. Phase 4N 重构：LLM/Event 三层架构（2026-05-24 CX LLM 深度审查）
+
+**核心问题**：当前 LLM 被要求直接预测收益 impact（`impact_1d/impact_5d`），把"信息抽取"和"收益定价"混在一起。LLM 对"发生了什么"很强，但对"1 日涨跌多少"不稳定。
+
+**正确架构**：LLM 做信息抽取，quant 模型做收益定价。
+
+### 23.1 当前链路问题清单
+
+| 问题 | 位置 | 影响 |
+|------|------|------|
+| LLM 直接预测 impact_1d/5d | `llm_event_extractor.py` prompt | impact 数值尺度不稳定 |
+| build_llm_event_factors 直接用 impact×confidence×... | `build_llm_event_factors.py:171` | LLM 主观判断当 alpha 本体 |
+| legacy llm_events/ + unified events/ 双轨并行 | pipeline + validate | 同一事件两个版本、口径不同 |
+| 时间语义三套逻辑 | EventStore/build_factors/validate | 不是同一个"唯一真相" |
+| overlay backtest 承认不是 PIT-safe | `build_event_overlay.py:150` | 不能作为晋级依据 |
+| max_news_per_stock=1 太粗 | `run_llm_event_pipeline.py:173` | 可能漏掉重要公告 |
+
+### 23.2 三层架构
+
+```text
+第一层：结构化事件抽取（LLM 只做这一层）
+  输入：新闻/公告/政策原文
+  输出：event_type, direction, magnitude_raw, amount, is_first_time, is_rumor, source_quality
+  不输出：impact_1d, impact_5d
+
+第二层：事件收益校准（quant 模型做这一层）
+  输入：event_type × 行业 × 市值分层 × 市场 regime × 是否超预期
+  输出：calibrated_alpha_1d, calibrated_alpha_5d
+  来源：历史校准表，不是 LLM
+
+第三层：overlay / reranker / risk flag
+  XGB174 给 base score
+  event_model 给 event_alpha
+  只对高置信事件的股票调分
+  低覆盖事件不填 0
+```
+
+### 23.3 LLM 应输出的字段（替代 impact_1d/5d）
+
+```json
+{
+  "event_type": "major_contract",
+  "direction": 1,
+  "magnitude_raw": "large",
+  "amount_wan": 50000,
+  "amount_ratio_to_revenue": 0.15,
+  "amount_ratio_to_mcap": 0.03,
+  "customer_quality": "government",
+  "is_first_time": true,
+  "is_repeat_announcement": false,
+  "is_policy_related": false,
+  "is_rumor": false,
+  "source_quality": 0.9,
+  "publish_time": "2026-05-24T17:30:00",
+  "summary": "..."
+}
+```
+
+### 23.4 事件 Surprise 因子（P1 优先）
+
+| 因子 | 公式 | 用途 |
+|------|------|------|
+| `evt_contract_revenue_ratio` | 合同金额 / 最近年营收 | 合同规模相对性 |
+| `evt_buyback_mcap_ratio` | 回购金额 / 市值 | 回购力度 |
+| `evt_insider_buy_float_ratio` | 增持金额 / 自由流通市值 | 增持信号强度 |
+| `evt_forecast_surprise` | 业绩预告中值 - 历史基线 | 业绩超预期 |
+| `evt_penalty_np_ratio` | 处罚金额 / 净利润 | 处罚严重度 |
+| `evt_calibrated_alpha_1d` | 校准表输出 | 历史同类事件 T+1 超额 |
+| `evt_calibrated_alpha_5d` | 校准表输出 | 历史同类事件 T+5 超额 |
+| `evt_event_count_20d` | 近 20 日事件数 | 关注度/催化密度 |
+| `evt_novelty_score` | 是否首次 × 非重复 | 信息新鲜度 |
+| `evt_source_quality` | 来源权重 | 可信度 |
+
+接入方式：**先 overlay/reranker，不进 XGB 主特征。**
+
+### 23.5 Phase 4N 细分
+
+| Phase | 内容 | 前置 | 可现在做？ |
+|-------|------|------|-----------|
+| **4N-1** | EventStore 统一：废弃 legacy 双轨，统一 5 时间字段 | 无 | ✅ |
+| **4N-2** | 事件 surprise 特征工程 | 4N-1 | ✅ |
+| **4N-3** | 历史校准表：event_type × 行业 × 市值 × regime 分桶 | 60+ 天事件数据 | ⏳ |
+| **4N-4** | overlay/reranker rolling PIT 验证 | 4N-3 + rolling pred artifact | ⏳ |
+
+### 23.6 板块扩散因子（P1 第二优先）
+
+A 股大涨逻辑：政策/主题 → 板块龙头涨停 → 二线扩散 → 补涨。
+
+| 因子 | 说明 |
+|------|------|
+| `sector_ret_1d/3d/5d` | 行业近期收益 |
+| `sector_volume_zscore` | 行业成交量异常 |
+| `sector_limit_up_count` | 行业涨停家数 |
+| `sector_up_ratio` | 行业上涨比例 |
+| `sector_turnover_zscore` | 行业换手异常 |
+| `sector_moneyflow_rank` | 行业资金流排名 |
+| `stock_beta_to_hot_sector` | 个股对热门板块的弹性 |
+| `stock_relative_strength_in_sector` | 个股在行业内相对强弱 |
+| `sector_heat` | 综合板块热度 |
+| `sector_breadth` | 板块扩散宽度 |
+
+接入方式：可进主 cache，但必须经过 24-split gate。
+
+### 23.7 龙虎榜/游资（P2 reranker/risk tag）
+
+| 因子 | 说明 |
+|------|------|
+| `ti_net_buy_mcap_ratio` | 净买入/市值 |
+| `ti_inst_buy_ratio` | 机构席位占比 |
+| `ti_hot_money_buy_ratio` | 游资席位占比 |
+| `ti_repeat_seat_count` | 重复席位次数 |
+| `ti_famous_seat_score` | 知名游资评分 |
+| `ti_after_limit_up_flag` | 涨停后龙虎榜 |
+| `ti_lhb_5d_decay` | 5 日衰减 |
+
+**注意**：龙虎榜容易变成"已涨后追高"信号。用于 risk/加速识别，不直接用于选股 alpha。
+
+### 23.8 涨停情绪（P2 独立模型）
+
+| 因子 | 说明 |
+|------|------|
+| `limit_up_chain_len` | 连板天数 |
+| `open_board_count` | 炸板次数 |
+| `sealed_board_strength` | 封板强度 |
+| `first_limit_up_time` | 首次封板时间 |
+| `sector_limit_up_breadth` | 板块涨停扩散 |
+| `yesterday_limit_up_premium` | 昨日涨停今日溢价 |
+| `dragon_head_score` | 龙头评分 |
+
+**不混入全市场回归**——分布太极端，会污染普通选股信号。用于短线加速/涨停后风险模型。
+
+### 23.9 公募拥挤度（Phase 5，中期模型）
+
+| 因子 | 说明 |
+|------|------|
+| `fund_holding_pct` | 基金持仓占比 |
+| `fund_holding_change_qoq` | 季度环比变化 |
+| `num_funds_holding` | 持有基金数 |
+| `fund_crowding_zscore` | 拥挤度 z-score |
+| `crowding_unwind_risk` | 抱团瓦解风险 |
+
+中期选股和风格暴露控制用，不抢 Phase 4 主线。
+
+### 23.10 新闻筛选改进
+
+当前 `max_news_per_stock=1` 太粗。改为规则优先筛选：
+
+```text
+1. 公告优先于新闻
+2. 标题命中关键词：重大合同/中标/回购/增持/减持/业绩预告/处罚/诉讼/股权激励
+3. 来源优先级排序（交易所公告 > 财联社 > 东财 > 其他）
+4. 去重后 top K
+5. LLM 只吃"候选高信息密度文本"
+```
+
+### 23.11 开发顺序（终版）
+
+```text
+1. EventStore 统一 + 5 时间字段 → 可现在做
+2. LLM prompt 改成"结构化事实"（去掉 impact_1d/5d） → 可现在做
+3. 事件 surprise overlay → 可现在做（用已有事件数据）
+4. 板块热度/扩散 candidate factor → 可现在做
+5. 龙虎榜/涨停做 reranker/risk tag → P2
+6. 公募拥挤度 → Phase 5
+7. 历史校准表 → 需 60+ 天数据
+8. overlay rolling PIT 验证 → 需 rolling pred artifact
+```
