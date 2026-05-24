@@ -56,8 +56,9 @@
 | 4N | LLM Event Alpha | 新闻/公告/舆情结构化为 PIT 事件因子 | 中优先级 (B'+C' overlay 已做) |
 | 4S | 实验治理 + 组合风险 + Alpha Factory | 统一产物契约、ShrinkCov、Barra报告、regime-weighted sampler | ✅ 已完成 |
 | 4W | 可信度收敛 | 数据时间字典、Paper OMS pending order、统一时间语义 | ✅ 已完成 |
-| **4E** | **Model Ensemble 基建** | **模型 zoo artifact、rank/zscore fusion、rolling IC weighting、disagreement** | **下一优先级** |
-| **4R** | **Meta-filter / Reranker** | **Top100 二阶段过滤、risk-aware rerank、optimizer_v2 shadow** | **4E 后** |
+| 4E | Model Ensemble 基建 | 模型 zoo artifact、rank/zscore fusion、rolling IC weighting、disagreement | ⚠️ 单 split 完成，24-split 待跑 |
+| **4G** | **Feature Path 统一 + Factor Inventory** | **官方因子路径、自动清单、晋级流程** | **当前最高优先级** |
+| 4R | Meta-filter / Reranker | Top100 二阶段过滤、risk-aware rerank、optimizer_v2 shadow | 4E/4G 后 |
 | 4T | LLM 结构化事件库 | 统一 JSON schema，PIT-safe 事件存储 | 4S 后 |
 | 4U | 事件研究校准 | 每类事件 1/3/5/10/20 日 CAR | 4T 事件库 60+ 天 |
 | 4V | 政策/情绪 overlay shadow | 不改 XGB，rerank 对照 30 天 | 4U 校准通过 |
@@ -1520,3 +1521,124 @@ Phase 5B：Deep Sequence Models
 Phase 5E：Regime-aware Ensemble
 Phase 6：Execution / Paper OMS 生产
 ```
+
+---
+
+## 22. Phase 4G：Feature Path 统一 + Factor Inventory（2026-05-24 CX 深度审查）
+
+**背景**：CX 重新扫描代码后发现核心认知偏差——XGB174 实际只吃 Alpha158 + 3 flow + 13 custom + holder + regime 广播。大量"已有"因子（ST moneyflow 大小单、northbound per-stock、CYQ、block trade、龙虎榜、LLM event）只有 loader 和数据，没有进入 champion 主链路。
+
+**核心问题**：项目有两条 feature path，语义不统一。
+
+```text
+路径 A（XGB174/175 主链路）:
+  models/feature_pipeline.py → prepare_features_174()
+  Alpha158 + 3 flow + 13 custom + holder + cross-market regime
+  → feature_cache_174_holder_regime_ma.parquet (207 列)
+
+路径 B（LGB/production supplement）:
+  scripts/train_lgb.py → _load_supplementary()
+  Alpha158 + 大量补充因子（ST daily_basic, moneyflow, northbound, quality...）
+  → 没有统一 cache，每次训练临时加载
+```
+
+这导致：XGB gate 测出来的结论 ≠ LGB production 链路的结论。
+
+### 22.1 当前主模型真实覆盖
+
+| 类别 | 实际进入 cache | 数量 |
+|------|---------------|------|
+| Alpha158 基础价量技术 | ✅ | 158 |
+| 资金流简化 (flow_net_mf) | ✅ | 3 |
+| 自定义估值/换手/成交 | ✅ | 13 |
+| 股东户数 | ✅ | 1 |
+| 恒生/恒科/纳指 regime 广播 | ✅ | 27 |
+| MA 辅助列 | ✅ | 3 |
+| **合计** | | **205 feature + 2 label** |
+
+### 22.2 项目有但未进主模型的因子
+
+| 因子类 | 数据状态 | 主模型状态 | 建议 |
+|--------|---------|-----------|------|
+| ST daily_basic (PE/PB/MV) | ✅ 有 parquet | ❌ 未进 cache | P1 晋级候选 |
+| ST moneyflow 大单/小单 | ✅ 有 parquet | ❌ 未进 cache | P1 晋级候选 |
+| northbound per-stock | ✅ 有 parquet | ❌ 未进 cache | P2 |
+| CYQ 筹码分布 | ✅ 有 parquet | ❌ 未进 cache | P3（高自相关） |
+| block trade 大宗交易 | ✅ 有 parquet | ❌ 未进 cache | P3（事件型） |
+| 龙虎榜/机构席位 | ✅ 有 parquet | ❌ 未进 cache | P2 overlay |
+| LLM event factors | ✅ 有 pipeline | ❌ 未进 cache | overlay/rerank |
+| sector_spillover | ✅ 有脚本 | ❌ 未进 cache | P1 优先 |
+| fundamental quality | ✅ 有 parquet | ❌ 未进 cache | P2 |
+| pledge 股权质押 | ✅ 有 parquet | ❌ 未进 cache | P3 |
+| guba 情绪 | ⚠️ 1 个文件 | ❌ | 等数据积累 |
+| fund_portfolio 公募重仓 | ⚠️ 部分数据 | ❌ | P3 |
+
+### 22.3 A 股大涨逻辑缺口
+
+当前主模型最强的是"价量交易结构 + 基础估值换手"。距离完整 A 股大涨逻辑还缺：
+
+| 大涨逻辑 | 覆盖状态 | 优先级 |
+|---------|---------|--------|
+| 趋势/动量/反转/波动 | ✅ Alpha158 覆盖 | - |
+| 成交量/换手异常 | ✅ 已有 | - |
+| 基础估值 PE/PB | ✅ 已有 | - |
+| 简单资金流 | ✅ 3 个 flow | - |
+| **事件 surprise** | ❌ LLM 有但未校准 | **P1** |
+| **板块扩散/主题强度** | ❌ 有脚本没生产化 | **P1** |
+| **龙虎榜/游资** | ❌ 有数据没生产化 | **P2** |
+| **公募/ETF 拥挤度** | ❌ 部分数据 | **P2** |
+| **涨停连板情绪** | ❌ monster_stock 未生产化 | **P2** |
+| 分钟级/盘口信号 | ❌ 仅日频 | P3 |
+
+### 22.4 P0：Factor Inventory 自动生成
+
+创建 `scripts/generate_factor_inventory.py`，自动扫描并输出：
+
+```json
+{
+  "column_name": "flow_net_mf_5d",
+  "source_parquet": "feature_cache_174_holder_regime_ma.parquet",
+  "factor_group": "capital_flow",
+  "in_feature_cache_174": true,
+  "in_train_lgb_supplementary": true,
+  "in_champion_xgb": true,
+  "pit_safe": true,
+  "last_gate_result": "pass",
+  "rank_ic": 0.012,
+  "notes": ""
+}
+```
+
+### 22.5 P0：Official Champion Feature Path 定义
+
+创建 `config/feature_path.py`，明确定义：
+
+```python
+CHAMPION_PATH = {
+    "cache_file": "feature_cache_174_holder_regime_ma.parquet",
+    "builder": "models.feature_pipeline.prepare_features_174",
+    "feature_count": 205,
+    "label": "__label_5d",
+    "status": "champion",
+}
+
+SUPPLEMENT_PATH = {
+    "loader": "models.feature_merger.FeatureMerger._load_supplementary",
+    "status": "research_only",
+    "note": "NOT used by champion; only for ablation/exploration",
+}
+
+# 因子晋级流程：
+# candidate_factors/ → Alpha Factory gate → supplement ablation → cache rebuild → 24-split gate → shadow → champion
+```
+
+### 22.6 P1：优先晋级三类因子
+
+1. **moneyflow_v2**：大单/小单/主力流，比现有 3 个 flow 更细
+2. **sector_spillover / sector heat**：A 股板块效应强
+3. **event surprise overlay**：重大合同、业绩预告、回购、增持 → overlay/reranker
+
+### 22.7 CX 总评
+
+> 这个项目现在不是玩具了，已经进入"研究体系初成，但生产语义需要收敛"的阶段。
+> 当前真正强的是价量模型和研究框架；距离"百亿私募味道"的差距，不在于再随手加 100 个因子，而在于把候选因子纳入统一晋级制度。
