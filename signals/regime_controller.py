@@ -6,15 +6,23 @@ NOT for stock selection. Controls:
   - Small-cap exposure
   - Whether to enable LLM event overlay
 
-8 regime scores (CX design):
-  1. policy_support_score: 政策支持力度
-  2. liquidity_score: 流动性充裕度
-  3. credit_stress_score: 信用压力
-  4. leverage_unwind_score: 杠杆解除风险
-  5. microcap_crash_risk: 小微盘踩踏风险
-  6. external_shock_score: 海外冲击
-  7. theme_breadth_score: 题材扩散宽度
-  8. risk_on_score: 综合风险偏好
+12 regime scores:
+  1. liquidity_score: 流动性充裕度 (M2 + Shibor)
+  2. credit_stress_score: 信用压力 (Shibor spread)
+  3. leverage_unwind_score: 杠杆解除风险 (融资余额)
+  4. microcap_crash_risk: 小微盘踩踏风险 (跌停家数)
+  5. external_shock_score: 海外冲击 (美债 + 纳指)
+  6. policy_support_score: 政策支持力度 (LLM events) [NOT PIT-safe for replay]
+  7. theme_breadth_score: 题材扩散宽度 (人气榜) [NOT PIT-safe for replay]
+  8. inflation_score: 通胀/通缩压力 (CPI)
+  9. northbound_score: 北向资金 (HSGT)
+  10. futures_basis_score: IC 期货真基差 (期货-现货)
+  11. fx_risk_score: 汇率风险 (USD/CNY)
+  12. risk_on_score: 加权综合
+
+Alert logic: weighted average + hard/soft break override.
+  - hard_break: PIT-safe + semantically accurate scores only.
+  - soft_break: reported but not auto-triggered until validated.
 
 Usage:
     from signals.regime_controller import RegimeController
@@ -35,6 +43,24 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data" / "storage"
+
+# --- Hard/soft break admission rules (CX-approved 2026-05-24) ---
+# hard_break: PIT-safe + semantically accurate → can auto-trigger alert override
+# soft_break: reported only, no auto-trigger until PIT validation complete
+HARD_BREAK_THRESHOLDS = {
+    "microcap_crash_risk": -0.8,
+    "leverage_unwind_score": -0.8,
+    "credit_stress_score": -0.8,
+    "external_shock_score": -0.9,
+    # futures_basis_score: NOT in hard_break until real basis validated
+    # fx_risk_score: NOT in hard_break until 百倍报价 fix validated over time
+}
+SOFT_BREAK_THRESHOLDS = {
+    "northbound_score": -0.8,
+    "policy_support_score": -0.8,   # not PIT-safe
+    "futures_basis_score": -0.8,    # real basis, but newly implemented
+    "fx_risk_score": -0.8,          # newly fixed
+}
 
 
 class RegimeController:
@@ -75,15 +101,44 @@ class RegimeController:
         risk_on = sum(scores[k] * w for k, w in weights.items())
         scores["risk_on_score"] = round(risk_on, 3)
 
-        # Alert level
-        if risk_on < -0.5:
-            scores["alert_level"] = "critical"
-        elif risk_on < -0.25:
-            scores["alert_level"] = "warning"
-        elif risk_on < -0.1:
-            scores["alert_level"] = "watch"
+        # Alert level — provisional thresholds (pending PIT-safe replay calibration)
+        if risk_on < -0.15:
+            alert = "critical"
+        elif risk_on < -0.08:
+            alert = "warning"
+        elif risk_on < -0.02:
+            alert = "watch"
         else:
-            scores["alert_level"] = "normal"
+            alert = "normal"
+
+        # --- Hard break override ---
+        hard_triggered = {
+            k: scores[k] for k, thresh in HARD_BREAK_THRESHOLDS.items()
+            if scores.get(k, 0) <= thresh
+        }
+        soft_triggered = {
+            k: scores[k] for k, thresh in SOFT_BREAK_THRESHOLDS.items()
+            if scores.get(k, 0) <= thresh
+        }
+
+        if hard_triggered:
+            # Special combo: microcap + leverage → direct warning
+            if (hard_triggered.get("microcap_crash_risk", 0) <= -0.8
+                    and scores.get("leverage_unwind_score", 0) <= -0.5):
+                if alert in ("normal", "watch"):
+                    alert = "warning"
+            # 2+ hard breaks → at least warning
+            elif len(hard_triggered) >= 2:
+                if alert in ("normal", "watch"):
+                    alert = "warning"
+            # 1 hard break → at least watch
+            else:
+                if alert == "normal":
+                    alert = "watch"
+
+        scores["alert_level"] = alert
+        scores["hard_break_signals"] = hard_triggered if hard_triggered else None
+        scores["soft_break_signals"] = soft_triggered if soft_triggered else None
 
         # Trading parameter adjustments
         scores["suggested_adjustments"] = self._suggest_adjustments(scores)
@@ -209,7 +264,6 @@ class RegimeController:
         # US treasury yield change
         try:
             us = pd.read_parquet(DATA_DIR / "st_us_tycr.parquet")
-            # Try to find date column and filter
             for dcol in ["date", "trade_date"]:
                 if dcol in us.columns:
                     us[dcol] = pd.to_datetime(us[dcol], format="%Y%m%d", errors="coerce")
@@ -247,39 +301,65 @@ class RegimeController:
         return round(score / max(n, 1), 3)
 
     def _policy_support(self, date: str) -> float:
-        """LLM event: policy-related events → support score [-1, +1]."""
+        """LLM event: policy-related events → support score [-1, +1].
+
+        PIT-safe: only reads event files with filename date <= target date.
+        Note: only 18 days of data (2026-04-27~), so historical replay before
+        that range will return 0.0.
+        """
         try:
             events_dir = DATA_DIR / "llm_events"
-            # Check last 5 days of events for policy signals
-            policy_scores = []
             target = pd.Timestamp(date)
+            target_str = target.strftime("%Y-%m-%d")
 
-            for f in sorted(events_dir.glob("*.jsonl"), reverse=True)[:5]:
+            policy_scores = []
+            count = 0
+            for f in sorted(events_dir.glob("*.jsonl"), reverse=True):
+                # PIT filter: only use files with date <= target
+                file_date = f.stem  # e.g. "2026-05-22"
+                if file_date > target_str:
+                    continue
+                if count >= 5:
+                    break
+                count += 1
+
                 for line in open(f):
                     e = json.loads(line)
                     etype = e.get("event_type", "")
                     if "policy" in etype:
                         impact = e.get("impact_1d", 0)
-                        policy_scores.append(impact)
+                        if isinstance(impact, (int, float)):
+                            policy_scores.append(impact)
 
             if policy_scores:
                 avg = np.mean(policy_scores)
-                return round(max(-1, min(1, avg * 10)), 3)  # amplify small impacts
+                return round(max(-1, min(1, avg * 10)), 3)
         except Exception:
             pass
         return 0.0
 
     def _theme_breadth(self, date: str) -> float:
-        """Popularity ranking breadth → theme heat [-1, +1]."""
+        """Popularity ranking breadth → theme heat [-1, +1].
+
+        PIT-safe: only reads guba files with filename date <= target date.
+        Note: very sparse data (currently 1 file), so most historical replay
+        will return 0.0.
+        """
         try:
             guba_dir = DATA_DIR / "guba"
-            files = sorted(guba_dir.glob("*.jsonl"), reverse=True)
-            if not files:
+            target_str = pd.Timestamp(date).strftime("%Y-%m-%d")
+
+            # Find latest file on or before target date
+            best_file = None
+            for f in sorted(guba_dir.glob("*.jsonl"), reverse=True):
+                if f.stem <= target_str:
+                    best_file = f
+                    break
+
+            if not best_file:
                 return 0.0
 
-            latest = files[0]
-            n_hot = sum(1 for _ in open(latest))
-            # 100 hot stocks is normal, fewer means narrow market
+            n_hot = sum(1 for _ in open(best_file))
             return round(max(-1, min(1, (n_hot - 50) / 50)), 3)
         except Exception:
             return 0.0
@@ -288,13 +368,17 @@ class RegimeController:
         """CPI → inflation pressure [-1, +1]. High inflation = negative."""
         try:
             cpi = pd.read_parquet(DATA_DIR / "st_cn_cpi.parquet")
-            # CPI data has various columns, find YoY
-            for col in cpi.columns:
-                vals = pd.to_numeric(cpi[col], errors="coerce").dropna()
-                if len(vals) > 10 and vals.mean() > 0 and vals.mean() < 20:
-                    # Looks like a % column
-                    latest = vals.iloc[-1]
-                    return round(max(-1, min(1, -(latest - 2) / 2)), 3)
+            if "nt_yoy" not in cpi.columns:
+                return 0.0
+            cpi["nt_yoy"] = pd.to_numeric(cpi["nt_yoy"], errors="coerce")
+            cpi["month"] = pd.to_datetime(cpi["month"], format="%Y%m", errors="coerce")
+            cpi = cpi.dropna(subset=["nt_yoy", "month"])
+            cpi = cpi[cpi["month"] <= pd.Timestamp(date)].sort_values("month")
+            if cpi.empty:
+                return 0.0
+            latest = cpi.iloc[-1]["nt_yoy"]
+            # CPI YoY ~2% is neutral; >4% is inflationary pressure; <0% is deflationary
+            return round(max(-1, min(1, -(latest - 2) / 2)), 3)
         except Exception:
             pass
         return 0.0
@@ -309,7 +393,6 @@ class RegimeController:
             hsgt = hsgt.dropna(subset=["trade_date"])
             hsgt = hsgt[hsgt["trade_date"] <= pd.Timestamp(date)].sort_values("trade_date")
 
-            # Find net buy column
             for col in ["north_money", "ggt_ss", "hgt"]:
                 if col in hsgt.columns:
                     hsgt[col] = pd.to_numeric(hsgt[col], errors="coerce")
@@ -326,30 +409,51 @@ class RegimeController:
         return 0.0
 
     def _futures_basis(self, date: str) -> float:
-        """IC/IM futures basis → quant crowding risk [-1, +1].
+        """IC futures real basis vs CSI 500 spot → quant crowding risk [-1, +1].
 
-        Large discount (basis < 0) = quant short pressure / forced unwind.
+        basis = futures_close / spot_close - 1
+        Large discount (basis << 0) = quant short pressure / forced unwind.
+        Falls back to IC momentum if spot data unavailable.
         """
         try:
-            # IC main contract
             ic = pd.read_parquet(DATA_DIR / "ak_futures_ic0.parquet")
             ic["日期"] = pd.to_datetime(ic["日期"], errors="coerce")
             ic = ic.dropna(subset=["日期"])
+            ic["收盘价"] = pd.to_numeric(ic["收盘价"], errors="coerce")
+            ic = ic.dropna(subset=["收盘价"])
             ic = ic[ic["日期"] <= pd.Timestamp(date)].sort_values("日期")
 
             if len(ic) < 20:
                 return 0.0
 
-            # Basis proxy: 5-day change rate of close price
-            close = pd.to_numeric(ic["收盘价"], errors="coerce").dropna()
-            if len(close) < 20:
-                return 0.0
+            # Try real basis with CSI 500 spot
+            spot_path = DATA_DIR / "ak_index_csi500.parquet"
+            if spot_path.exists():
+                spot = pd.read_parquet(spot_path)
+                spot["date"] = pd.to_datetime(spot["date"], errors="coerce")
+                spot["close"] = pd.to_numeric(spot["close"], errors="coerce")
+                spot = spot.dropna(subset=["date", "close"])
+                spot = spot[spot["date"] <= pd.Timestamp(date)].sort_values("date")
 
-            # Sharp drop in IC futures = quant unwind signal
+                if not spot.empty:
+                    # Match latest dates
+                    ic_latest = ic.iloc[-1]
+                    # Find spot on same date or closest prior date
+                    spot_on_date = spot[spot["date"] <= ic_latest["日期"]]
+                    if not spot_on_date.empty:
+                        futures_close = ic_latest["收盘价"]
+                        spot_close = spot_on_date.iloc[-1]["close"]
+                        if spot_close > 0:
+                            basis = futures_close / spot_close - 1
+                            # Typical IC basis: -3% to +1%
+                            # -5% = extreme discount = quant panic → -1.0
+                            # 0% = fair value → 0.0
+                            score = max(-1, min(1, basis / 0.05))
+                            return round(score, 3)
+
+            # Fallback: IC 5-day momentum (less accurate proxy)
+            close = ic["收盘价"]
             ret_5d = (close.iloc[-1] - close.iloc[-5]) / close.iloc[-5]
-            ret_20d = (close.iloc[-1] - close.iloc[-20]) / close.iloc[-20]
-
-            # -5% in 5 days → negative signal
             score = max(-1, min(1, ret_5d / 0.05))
             return round(score, 3)
         except Exception:
@@ -359,33 +463,39 @@ class RegimeController:
         """USD/CNY movement → currency risk [-1, +1].
 
         Rapid CNY depreciation = negative (capital outflow risk).
+        Data source: 中行折算价 (百倍报价, e.g. 683.73 = 6.8373).
         """
         try:
             fx = pd.read_parquet(DATA_DIR / "ak_usdcny.parquet")
-            # Find the exchange rate column
-            rate_col = None
-            for col in fx.columns:
-                vals = pd.to_numeric(fx[col], errors="coerce").dropna()
-                if len(vals) > 100 and 5 < vals.mean() < 10:  # USD/CNY around 7
-                    rate_col = col
-                    break
 
-            if not rate_col:
-                return 0.0
+            # Use 中行折算价 explicitly (most complete column, 1488 rows)
+            rate_col = "中行折算价"
+            if rate_col not in fx.columns:
+                # Fallback: find column with 百倍报价 range (600~800)
+                for col in fx.columns:
+                    vals = pd.to_numeric(fx[col], errors="coerce").dropna()
+                    if len(vals) > 100 and 500 < vals.mean() < 1000:
+                        rate_col = col
+                        break
+                else:
+                    return 0.0
 
-            # Find date column
-            date_col = None
-            for col in fx.columns:
-                if "日期" in col or "date" in col.lower():
-                    date_col = col
-                    break
+            # Date column
+            date_col = "日期"
+            if date_col not in fx.columns:
+                for col in fx.columns:
+                    if "日期" in col or "date" in col.lower():
+                        date_col = col
+                        break
+                else:
+                    return 0.0
 
-            if date_col:
-                fx[date_col] = pd.to_datetime(fx[date_col], errors="coerce")
-                fx = fx.dropna(subset=[date_col])
-                fx = fx[fx[date_col] <= pd.Timestamp(date)].sort_values(date_col)
+            fx[date_col] = pd.to_datetime(fx[date_col], errors="coerce")
+            fx = fx.dropna(subset=[date_col])
+            fx = fx[fx[date_col] <= pd.Timestamp(date)].sort_values(date_col)
 
-            rate = pd.to_numeric(fx[rate_col], errors="coerce").dropna()
+            # Convert 百倍报价 to actual rate (683.73 → 6.8373)
+            rate = pd.to_numeric(fx[rate_col], errors="coerce").dropna() / 100.0
             if len(rate) < 20:
                 return 0.0
 
@@ -398,16 +508,19 @@ class RegimeController:
             return 0.0
 
     def _suggest_adjustments(self, scores: dict) -> dict:
-        """Suggest trading parameter changes based on regime."""
+        """Suggest trading parameter changes based on regime.
+
+        NOTE: These are advisory only. Do NOT auto-execute in OMS until
+        PIT-safe replay validation and 24-split backtest are complete.
+        """
         alert = scores["alert_level"]
-        risk_on = scores["risk_on_score"]
 
         if alert == "critical":
             return {
-                "max_position": 0.3,       # 30% invested, 70% cash
-                "max_turnover": 0.05,       # minimal trading
-                "smallcap_exposure": 0.0,   # no small caps
-                "event_overlay": False,     # disable experimental signals
+                "max_position": 0.3,
+                "max_turnover": 0.05,
+                "smallcap_exposure": 0.0,
+                "event_overlay": False,
                 "reason": "多重风险信号共振，大幅降仓",
             }
         elif alert == "warning":
@@ -451,6 +564,9 @@ def main():
             print(f"\n  Adjustments:")
             for ak, av in v.items():
                 print(f"    {ak}: {av}")
+        elif k in ("hard_break_signals", "soft_break_signals"):
+            if v:
+                print(f"  {k}: {v}")
         else:
             print(f"  {k}: {v}")
 
