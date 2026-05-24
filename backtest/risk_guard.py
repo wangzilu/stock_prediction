@@ -82,7 +82,8 @@ class RiskGuard:
     def check(self, positions: dict, prices: dict, date: str,
               xgb_ranks: dict = None, regime: dict = None,
               events: dict = None,
-              prev_closes: dict = None) -> RiskConstraints:
+              prev_closes: dict = None,
+              crash_probs: dict = None) -> RiskConstraints:
         """Run all risk checks and return constraints.
 
         Args:
@@ -93,6 +94,7 @@ class RiskGuard:
             regime: regime controller output dict
             events: {code: impact} — LLM event alphas for today
             prev_closes: {code: prev_close_price} — for limit-down check
+            crash_probs: {code: crash_prob_5d} — crash model output (optional)
         """
         constraints = RiskConstraints()
 
@@ -104,6 +106,10 @@ class RiskGuard:
         self._check_limit_down(positions, prices, constraints, prev_closes)
         self._check_pending_exits(constraints, date)
         self._apply_cooldowns(constraints, date)
+
+        # === L1.5: Crash model checks ===
+        if crash_probs is not None:
+            self._check_crash_risk(positions, crash_probs, date, constraints)
 
         # === L2: Portfolio drawdown state machine ===
         self._check_drawdown(constraints, date)
@@ -393,6 +399,65 @@ class RiskGuard:
                 expired.append(code)
         for code in expired:
             del cooldowns[code]
+
+    # ---- L1.5: Crash model ----
+
+    def check_crash_risk(self, positions: dict, crash_probs: dict,
+                         date: str) -> list:
+        """Standalone crash risk check — returns list of flagged stocks.
+
+        Args:
+            positions: {code: pos_dict} — currently held positions
+            crash_probs: {code: crash_prob_5d} — crash model output
+            date: current date string
+
+        Returns:
+            List of dicts with flagged stock info:
+              [{"code": ..., "crash_prob": ..., "action": "block"/"exit",
+                "reason": ...}, ...]
+        """
+        flagged = []
+        for code, prob in crash_probs.items():
+            if not np.isfinite(prob):
+                continue
+            if prob > 0.80 and code in positions:
+                flagged.append({
+                    "code": code,
+                    "crash_prob": prob,
+                    "action": "exit",
+                    "reason": f"崩盘概率{prob:.1%}>80%，建议退出",
+                })
+            elif prob > 0.65:
+                flagged.append({
+                    "code": code,
+                    "crash_prob": prob,
+                    "action": "block",
+                    "reason": f"崩盘概率{prob:.1%}>65%，禁止买入",
+                })
+        return flagged
+
+    def _check_crash_risk(self, positions: dict, crash_probs: dict,
+                          date: str, constraints: RiskConstraints):
+        """Wire crash model into RiskConstraints (called from check()).
+
+        - crash_prob > 0.65 → cannot_buy
+        - crash_prob > 0.80 and held → pending_exit
+        """
+        for code, prob in crash_probs.items():
+            if not np.isfinite(prob):
+                continue
+            if prob > 0.65:
+                constraints.cannot_buy.add(code)
+                if prob > 0.80 and code in positions:
+                    constraints.pending_exit.append(code)
+                    constraints.risk_reasons[code] = (
+                        f"崩盘概率{prob:.1%}>80%，标记退出"
+                    )
+                else:
+                    constraints.risk_reasons.setdefault(
+                        code,
+                        f"崩盘概率{prob:.1%}>65%，禁止买入"
+                    )
 
     # ---- L2: Portfolio drawdown state machine ----
 

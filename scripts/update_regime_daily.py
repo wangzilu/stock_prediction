@@ -169,23 +169,39 @@ def update_usdcny_akshare():
 
 
 def main():
+    from scheduler.data_health import write_health, HealthStatus
+
     today = datetime.now().strftime("%Y-%m-%d")
     logger.info(f"=== Daily Regime Data Update: {today} ===")
 
-    # ST_CLIENT data
     try:
-        st = get_st_client()
-        update_margin(st, today)
-        update_limit_list(st, today)
-        update_hsgt(st, today)
+        # ST_CLIENT data
+        try:
+            st = get_st_client()
+            update_margin(st, today)
+            update_limit_list(st, today)
+            update_hsgt(st, today)
+        except Exception as e:
+            logger.error(f"ST_CLIENT failed: {e}")
+
+        # AKShare data (no auth)
+        update_futures_akshare()
+        update_usdcny_akshare()
+
+        logger.info("Done!")
+        write_health("regime_daily_update", HealthStatus(
+            success=True,
+            n_items=5,  # margin, limit_list, hsgt, futures, usdcny
+            latest_date=today,
+            network_profile="domestic",
+        ))
     except Exception as e:
-        logger.error(f"ST_CLIENT failed: {e}")
-
-    # AKShare data (no auth)
-    update_futures_akshare()
-    update_usdcny_akshare()
-
-    logger.info("Done!")
+        write_health("regime_daily_update", HealthStatus(
+            success=False,
+            error_type=type(e).__name__,
+            error_message=str(e)[:200],
+        ))
+        raise
 
 
 if __name__ == "__main__":

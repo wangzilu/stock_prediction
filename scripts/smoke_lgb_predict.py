@@ -128,6 +128,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Iterable[str] | None = None) -> int:
+    from scheduler.data_health import write_health, HealthStatus
+
     args = parse_args(argv)
     try:
         output = None if args.no_cache else args.output
@@ -152,6 +154,21 @@ def main(argv: Iterable[str] | None = None) -> int:
             logger.info("Prediction cache written: %s", result["cache_path"])
     else:
         logger.error("LGB smoke failed: %s", result.get("error", "unknown error"))
+
+    # Write health status
+    if result["ok"]:
+        write_health("lgb_smoke_predict", HealthStatus(
+            success=True,
+            n_items=result.get("finite_prediction_count", 0),
+            latest_date=result.get("cache_latest_date", ""),
+            network_profile="domestic",
+        ))
+    else:
+        write_health("lgb_smoke_predict", HealthStatus(
+            success=False,
+            error_type="PredictionFailure",
+            error_message=str(result.get("error", ""))[:200],
+        ))
 
     return 0 if result["ok"] else 1
 

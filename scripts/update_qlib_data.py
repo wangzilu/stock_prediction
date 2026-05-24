@@ -59,6 +59,7 @@ def progress_bar(total: int, desc: str, unit: str) -> Iterator[object | None]:
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from scheduler.data_health import write_health, HealthStatus  # noqa: E402
 from scripts.check_qlib_data_health import check_qlib_dir  # noqa: E402
 from config.settings import (  # noqa: E402
     QLIB_DATA_PROVIDER,
@@ -1304,6 +1305,19 @@ def main(argv: Iterable[str] | None = None) -> int:
         pass  # SIGALRM not available on Windows
 
     args = parse_args(argv)
+
+    try:
+        return _main_inner(args)
+    except Exception as e:
+        write_health("qlib_data_update", HealthStatus(
+            success=False,
+            error_type=type(e).__name__,
+            error_message=str(e)[:200],
+        ))
+        raise
+
+
+def _main_inner(args: argparse.Namespace) -> int:
     mode = "repair-only" if args.repair_only else "full" if args.full else "incremental"
     full_start_date = (
         datetime.strptime(args.end_date, "%Y-%m-%d") - timedelta(days=365 * args.full_years)
@@ -1476,6 +1490,13 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     logger.info("Update complete: %s stocks updated, %s failed, source=%s", success, fail, source)
     logger.info("Data stored in %s", args.qlib_dir)
+
+    write_health("qlib_data_update", HealthStatus(
+        success=True,
+        n_items=success,
+        latest_date=args.end_date,
+        network_profile="domestic",
+    ))
 
     # --check-today: verify latest data date matches the most recent trading day
     if getattr(args, "check_today", False):

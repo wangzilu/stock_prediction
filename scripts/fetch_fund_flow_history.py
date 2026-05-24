@@ -655,6 +655,8 @@ def _save_with_merge(new_df: pd.DataFrame, path: Path, dedup_cols: list, label: 
 
 
 def main():
+    from scheduler.data_health import write_health, HealthStatus
+
     signal.signal(signal.SIGINT, _handle_shutdown)
     signal.signal(signal.SIGTERM, _handle_shutdown)
 
@@ -675,42 +677,72 @@ def main():
                         help="Number of trading days for batch mode (default: 60)")
     args = parser.parse_args()
 
-    # ===== Batch-by-date mode (default, ~100x fewer requests) =====
-    if args.source == "st" and not args.per_stock:
-        logger.info(f"=== Batch mode: {args.days} trading days, ~{args.days * 2} requests ===")
+    n_items = 0
+    latest_date = ""
+    try:
+        # ===== Batch-by-date mode (default, ~100x fewer requests) =====
+        if args.source == "st" and not args.per_stock:
+            logger.info(f"=== Batch mode: {args.days} trading days, ~{args.days * 2} requests ===")
+
+            if not args.nb_only:
+                flow_df = fetch_fund_flow_batch(days=args.days)
+                _save_with_merge(flow_df, FLOW_PATH,
+                                 dedup_cols=["qlib_code", "trade_date"], label="fund flow")
+                n_items += len(flow_df)
+                if not flow_df.empty and "trade_date" in flow_df.columns:
+                    latest_date = str(flow_df["trade_date"].max())
+
+            if not args.flow_only:
+                nb_df = fetch_northbound_batch(days=args.days)
+                _save_with_merge(nb_df, NB_PATH,
+                                 dedup_cols=["qlib_code", "trade_date"], label="northbound")
+                n_items += len(nb_df)
+
+            logger.info("Done!")
+            write_health("fund_flow_update", HealthStatus(
+                success=True,
+                n_items=n_items,
+                latest_date=latest_date,
+                network_profile="domestic",
+            ))
+            return
+
+        # ===== Per-stock mode (old, slow) =====
+        logger.info("=== Per-stock mode (slow) ===")
+        codes = get_all_stock_codes(top_n=args.top)
 
         if not args.nb_only:
-            flow_df = fetch_fund_flow_batch(days=args.days)
+            existing = load_existing_codes(FLOW_PATH) if args.incremental else set()
+            flow_df = fetch_fund_flow(codes, workers=args.workers,
+                                      existing_codes=existing, source=args.source)
             _save_with_merge(flow_df, FLOW_PATH,
                              dedup_cols=["qlib_code", "trade_date"], label="fund flow")
+            n_items += len(flow_df)
+            if not flow_df.empty and "trade_date" in flow_df.columns:
+                latest_date = str(flow_df["trade_date"].max())
 
         if not args.flow_only:
-            nb_df = fetch_northbound_batch(days=args.days)
+            existing = load_existing_codes(NB_PATH) if args.incremental else set()
+            nb_df = fetch_northbound(codes, workers=args.workers,
+                                     existing_codes=existing, source=args.source)
             _save_with_merge(nb_df, NB_PATH,
                              dedup_cols=["qlib_code", "trade_date"], label="northbound")
+            n_items += len(nb_df)
 
         logger.info("Done!")
-        return
-
-    # ===== Per-stock mode (old, slow) =====
-    logger.info("=== Per-stock mode (slow) ===")
-    codes = get_all_stock_codes(top_n=args.top)
-
-    if not args.nb_only:
-        existing = load_existing_codes(FLOW_PATH) if args.incremental else set()
-        flow_df = fetch_fund_flow(codes, workers=args.workers,
-                                  existing_codes=existing, source=args.source)
-        _save_with_merge(flow_df, FLOW_PATH,
-                         dedup_cols=["qlib_code", "trade_date"], label="fund flow")
-
-    if not args.flow_only:
-        existing = load_existing_codes(NB_PATH) if args.incremental else set()
-        nb_df = fetch_northbound(codes, workers=args.workers,
-                                 existing_codes=existing, source=args.source)
-        _save_with_merge(nb_df, NB_PATH,
-                         dedup_cols=["qlib_code", "trade_date"], label="northbound")
-
-    logger.info("Done!")
+        write_health("fund_flow_update", HealthStatus(
+            success=True,
+            n_items=n_items,
+            latest_date=latest_date,
+            network_profile="domestic",
+        ))
+    except Exception as e:
+        write_health("fund_flow_update", HealthStatus(
+            success=False,
+            error_type=type(e).__name__,
+            error_message=str(e)[:200],
+        ))
+        raise
 
 
 if __name__ == "__main__":
