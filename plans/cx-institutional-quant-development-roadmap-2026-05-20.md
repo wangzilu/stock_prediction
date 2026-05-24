@@ -55,7 +55,9 @@
 | 4M | Alpha360 & Model Diversity | 表格 + 深度模型分层验证 | 中高优先级 |
 | 4N | LLM Event Alpha | 新闻/公告/舆情结构化为 PIT 事件因子 | 中优先级 (B'+C' overlay 已做) |
 | 4S | 实验治理 + 组合风险 + Alpha Factory | 统一产物契约、ShrinkCov、Barra报告、regime-weighted sampler | ✅ 已完成 |
-| **4W** | **可信度收敛** | **数据时间字典、Paper OMS pending order、统一时间语义** | **当前最高优先级** |
+| 4W | 可信度收敛 | 数据时间字典、Paper OMS pending order、统一时间语义 | ✅ 已完成 |
+| **4E** | **Model Ensemble 基建** | **模型 zoo artifact、rank/zscore fusion、rolling IC weighting、disagreement** | **下一优先级** |
+| **4R** | **Meta-filter / Reranker** | **Top100 二阶段过滤、risk-aware rerank、optimizer_v2 shadow** | **4E 后** |
 | 4T | LLM 结构化事件库 | 统一 JSON schema，PIT-safe 事件存储 | 4S 后 |
 | 4U | 事件研究校准 | 每类事件 1/3/5/10/20 日 CAR | 4T 事件库 60+ 天 |
 | 4V | 政策/情绪 overlay shadow | 不改 XGB，rerank 对照 30 天 | 4U 校准通过 |
@@ -1355,3 +1357,166 @@ Phase 4W 完成时，项目应该满足：
 5. **所有滚动训练脚本** 共享同一套窗口配置
 
 达到这些标准后，CX 的"实盘可信度"评分应该从 5.5-6 提升到 7-7.5。
+
+---
+
+## 18. Phase 4E：Model Ensemble 基建（2026-05-24 CX 设计）
+
+**核心判断**：之前 XGB + Ranker 简单 rank 加权没赢，原因不是 ensemble 方向错，而是方式太浅。前沿做法是分层 ensemble：模型层、样本/特征层、regime routing 层、二阶段 rerank 层各司其职。
+
+**原则**：XGB174/optimizer_v2 主线不动，ensemble 先 shadow。
+
+### 18.1 Model Zoo Artifact 统一
+
+所有模型必须输出标准 artifact（通过 `tracker/artifact_contract.py`）：
+
+| 模型 | 特征集 | 状态 |
+|------|--------|------|
+| XGB174 | FS-174 | ✅ champion |
+| XGB175 | FS-175 | 待训练 |
+| LGB regression | FS-174 | 待训练 |
+| CatBoost regression | FS-174 | 待训练 |
+| LGBMRanker | FS-174 | 已有结果，待标准化 |
+| DoubleEnsemble | FS-174 | 待实现 |
+| Alpha360-XGB | FS-360 | ✅ artifact 已建 |
+
+### 18.2 Ensemble Fusion
+
+**新增文件**：`models/ensemble_fusion.py`
+
+三种融合方式（不允许 raw score mean）：
+
+```text
+rank_mean:       mean(rank_percentile_per_model)
+robust_z_mean:   mean(winsorized_zscore_per_model)
+rolling_ic_weighted:
+  weight_m,t ∝ max(0, rolling_rank_ic_m,t) / vol(rank_ic_m,t)
+```
+
+**约束**：
+- 单模型权重 ≤ 60%
+- Ranker 权重 ≤ 25%
+- 深度模型权重 ≤ 15%
+- LLM/event overlay 不参与主 ensemble，只参与 rerank
+
+### 18.3 Model Disagreement 特征
+
+```text
+model_disagreement_i,t = std(rank_xgb, rank_lgb, rank_cat, rank_ranker)
+model_consensus_i,t = mean(top_decile_votes)
+```
+
+不直接进主模型，先作为 ensemble report + Phase 4R meta-filter 特征。
+
+### 18.4 验收门槛（硬）
+
+ensemble 必须和**最强单模型**比，不是和平均模型比：
+- `ensemble_rank_ic > best_single_rank_ic * 1.05`
+- `ensemble_top20_spread > best_single_spread * 1.10`
+- 24 split 中 ≥ 16 split 净收益优于 XGB175
+- avg turnover 不恶化超过 15%
+- max drawdown 不恶化
+- 行业/市值暴露不明显漂移
+- negative control 不通过则直接否决
+
+### 18.5 参考文献
+
+- Qlib DoubleEnsemble: 样本重加权 + 特征选择
+- Qlib TRA: 市场模式 routing
+- Pooling/winsorizing ML forecasts (多市场实证)
+- SABER: ranking 不确定性
+
+---
+
+## 19. Phase 4R：Meta-filter / Reranker（接 `phase4r-rerank-meta-label-spec.md`）
+
+**目标**：不重新选全市场，判断 XGB/ensemble Top100 里哪些更可信。
+
+### 19.1 流程
+
+```text
+XGB175 or ensemble_score
+→ Top100 candidate pool
+→ meta-filter (binary classifier)
+→ 去掉 meta_prob 最低 20%-30%
+→ optimizer_v2
+```
+
+### 19.2 Meta Label
+
+```text
+meta_label = future_5d_return > median(candidate_pool_return) + cost_threshold
+```
+
+### 19.3 Meta 特征（不重复 174 维）
+
+```text
+xgb_rank_pct              # 主模型排名百分位
+ensemble_rank_pct          # ensemble 排名百分位
+model_disagreement         # 模型分歧度
+rank_gap_to_cutoff         # 距离入选边界的距离
+volatility_20d             # 20 日波动率
+adv_20d                    # 20 日日均成交额
+market_cap_bucket          # 市值分档
+industry                   # 行业
+event_alpha                # LLM 事件得分
+regime_risk_on             # regime 综合分数
+correlation_penalty        # 与持仓相关性惩罚
+```
+
+### 19.4 上线方式
+
+保守版（初始）：只过滤 `meta_prob` 最低 20%，不重排。
+
+进阶版：`0.80 * rank(base_score) + 0.20 * rank(meta_prob)`
+
+### 19.5 验收
+
+- 24 split OOS meta-filter 后组合收益 > 未过滤版
+- 过滤掉的 20% 确实表现更差（事后验证）
+- 换手不因过滤而大幅增加
+
+---
+
+## 20. Phase 5E：Regime-aware Ensemble（4E/4R 通过后）
+
+**目标**：不同市场状态用不同模型权重。
+
+```text
+normal:          XGB/CatBoost 权重大
+policy_bull:     event overlay 权重上升（设 cap）
+microcap_crash:  liquidity/risk penalty 权重上升
+external_shock:  event 降权，risk model 权重上升
+high_vol:        ranker/追涨模型降权
+```
+
+实现先用规则 + rolling 表现，不上复杂 neural routing：
+
+```text
+weight_m,t ∝ rolling_rank_ic_m,t / rolling_vol_m,t
+```
+
+长期再考虑 Qlib TRA routing。
+
+---
+
+## 21. 不优先做的 Ensemble 方向
+
+| 方向 | 理由 |
+|------|------|
+| RL ensemble | 当前执行层未成熟 |
+| 复杂 stacking neural net | 过拟合风险高，可解释性差 |
+| Transformer ensemble 生产化 | MPS 不稳定 |
+| RD-Agent 自动改模型 | 需要 Linux + Docker |
+
+### 推荐 Phase 排序（终版）
+
+```text
+Phase 4W：可信度收敛             ✅ 已完成
+Phase 4E：Model Ensemble 基建     ← 当前
+Phase 4R：Meta-filter / Reranker
+Phase 4T-V：政策/情绪因子
+Phase 5B：Deep Sequence Models
+Phase 5E：Regime-aware Ensemble
+Phase 6：Execution / Paper OMS 生产
+```
