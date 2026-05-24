@@ -2296,3 +2296,49 @@ paper trading 前：
 6. global job 失败后 → qlib_data_update 仍正常运行
 7. qlib_data_update 失败后 → train_lgb 不训练或标记 data stale
 8. pushplus 失败 → 不影响任何数据 job
+
+### 28.13 失败推送通知
+
+**任何 job 失败都必须推送到用户**。不允许静默失败。
+
+推送时机：
+- job `success=false`（业务失败）
+- job timeout（超时 kill）
+- proxy 不可用且无法恢复
+- data_health 检查发现上游缺失
+- daily_health_check 发现异常
+
+推送内容模板：
+```text
+❌ [{job_id}] 失败
+时间: {finished_at}
+网络: {network_profile}
+原因: {error_summary}
+影响: {downstream_impact}
+需要操作: {action_needed}
+```
+
+推送渠道：pushplus / WeChat（已有 `scheduler/wechat_push.py`）
+
+实现位置：`run_with_status.py` 在 job 退出后检查 exit code + data_health：
+```python
+if exit_code != 0 or not data_health_ok:
+    push_failure_alert(job_id, network, error, downstream_impact)
+```
+
+**推送也有防卡死**：
+- 推送本身 timeout ≤ 10s
+- 推送失败只写日志，不影响数据 job 判定
+- 推送走 domestic（pushplus 是国内服务）
+
+每日汇总推送（18:55 health check 后）：
+```text
+📊 今日数据链路状态
+国内行情: ✅ 5173 stocks
+国内事件: ✅ 342 events
+全球新闻: ❌ proxy timeout
+LLM 抽取: ✅ 289 events
+模型预测: ✅ 5208 predictions
+Paper OMS: ✅ pending orders generated
+Global overlay: ⚠️ 已关闭（全球新闻失败）
+```
