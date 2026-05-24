@@ -102,6 +102,8 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("weekly_st_refresh", "0 3 * * 6", [py, str(scripts / "fetch_st_list.py")], "st_refresh.log"),
         # Weekly tradable mask rebuild after ST refresh
         CronJob("weekly_mask_rebuild", "10 3 * * 6", [py, str(scripts / "build_tradable_mask.py")], "mask_rebuild.log"),
+        # Weekly regime data refresh (macro monthly + shibor/US treasury daily)
+        CronJob("weekly_regime_data", "20 3 * * 6", [py, str(scripts / "fetch_fund_holdings.py"), "--macro", "--regime"], "regime_data.log"),
     ]
 
 
