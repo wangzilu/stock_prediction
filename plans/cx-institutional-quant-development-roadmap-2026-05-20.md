@@ -2530,3 +2530,40 @@ LLM 抽取: ✅ 289 events
 Paper OMS: ✅ pending orders generated
 Global overlay: ⚠️ 已关闭（全球新闻失败）
 ```
+
+### 28.14 四层数据可靠性架构（CX 终版）
+
+**目标不是"保证一定拉到"，而是：能拉就拉，拉不到快速失败，失败自动重试，下游明确知道缺了什么，不会误用旧数据。**
+
+```text
+Layer 1: Network Wrapper                    ✅ 已完成 (run_network_job.py)
+  代理隔离 / proxy 启动 / timeout / kill
+  → 保证不卡死、不串味
+
+Layer 2: Source Health Check                ⬜ 待实现
+  每个 collector 跑完写 data_health：
+    成功条数、失败原因、latest timestamp、coverage
+  → 保证知道拉了什么、缺了什么
+
+Layer 3: Retry Window                       ⬜ 待实现
+  国内数据 17:45 失败 → 18:30 retry
+  全球新闻 21:30 失败 → 22:30 retry
+  LLM 失败 → 次日补跑
+  → 保证一次失败不代表整天没数据
+
+Layer 4: Downstream Freshness Gate          ⬜ 待实现
+  训练/预测/overlay 启动前检查数据新鲜度：
+    if source.latest_date < today: mark missing_source
+    不能悄悄拿昨天的数据当今天的
+  → 保证模型不用脏数据
+```
+
+**当前完成状态**：
+- Layer 1 ✅ wrapper + crontab 已接入生产
+- Layer 2 ⬜ `data_health/` 文件格式已定义（28.10），写入逻辑未接入各 collector
+- Layer 3 ⬜ retry 时段已在 cron 排布中预留，collector 脚本未支持 `--retry` 模式
+- Layer 4 ⬜ `scheduler/job_deps.py` 有 `check_upstream()`，未接入训练/预测脚本
+
+**ssproxy LaunchAgent**：增强可用性但不替代 wrapper。两者都要：
+- LaunchAgent 保证 proxy 端口常驻
+- wrapper 保证每个 job 独立验证 + fail-fast
