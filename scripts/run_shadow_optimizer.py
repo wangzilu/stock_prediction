@@ -52,6 +52,7 @@ def main():
         weight_method="alpha_proportional",
         min_hold_days=2,
         state_dir=SHADOW_DIR,
+        mode="pending",
     )
 
     if args.reset:

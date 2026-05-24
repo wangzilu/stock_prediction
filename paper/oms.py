@@ -194,8 +194,14 @@ class PaperOMS:
             constraints=constraints, holding_days=holding_days,
         )
 
-        # Store weights for next day
-        self.state["prev_weights"] = target_weights
+        # Store target weights — in pending mode these are "intended" weights,
+        # only committed to prev_weights after successful reconciliation.
+        # In legacy mode, write immediately (backward compatible).
+        if self.mode == "legacy":
+            self.state["prev_weights"] = target_weights
+        else:
+            # Pending mode: store as pending, not yet committed
+            self.state["pending_target_weights"] = target_weights
 
         # Derive sells/buys from weight changes
         current = set(self.state.get("positions", {}).keys())
@@ -732,6 +738,10 @@ class PaperOMS:
                 self.state["trade_count"] += 1
 
         self.state["cash"] = round(cash, 2)
+
+        # Commit pending target weights as actual prev_weights after successful fills
+        if "pending_target_weights" in self.state:
+            self.state["prev_weights"] = self.state.pop("pending_target_weights")
 
         # Update holding days & PnL
         self.update_holding_days()

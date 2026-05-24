@@ -1027,9 +1027,12 @@ class FeatureMerger:
             ts = ts.sort_values(["qlib_code", "ann_date"]).drop_duplicates(
                 ["qlib_code", "ann_date"], keep="last")
 
+            # PIT safety: ann_date may be post-market; data available next BDay
+            ts["ann_date"] = ts["ann_date"] + pd.tseries.offsets.BDay(1)
+
             result = self._asof_merge_timeseries(ts, index, "ann_date", ["holder_num"])
             if result is not None:
-                logger.info(f"ST holder_number (PIT-safe): 1 factor, "
+                logger.info(f"ST holder_number (PIT-safe, ann_date+1BDay): 1 factor, "
                             f"{result['holder_num'].notna().sum()} non-null")
             return result
         except Exception as e:

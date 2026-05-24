@@ -129,7 +129,7 @@ class PromotionGate:
                         f"threshold={self.thresholds['max_cost_to_return']}"
                     )
         else:
-            warnings.append("No backtest.json — portfolio gate skipped")
+            failures.append("No backtest.json — portfolio-level validation required for shadow")
 
         # 4. Exposure checks
         exposure = art.load_exposure()
@@ -144,7 +144,7 @@ class PromotionGate:
                         f"threshold={self.thresholds['max_industry_deviation']}"
                     )
         else:
-            warnings.append("No exposure.json — exposure gate skipped")
+            failures.append("No exposure.json — exposure validation required for shadow")
 
         # 5. Rolling split consistency (if split experiments provided)
         if split_experiment_ids:

@@ -39,7 +39,7 @@ def main():
     parser.add_argument("--capital", type=float, default=1_000_000)
     args = parser.parse_args()
 
-    oms = PaperOMS(initial_capital=args.capital)
+    oms = PaperOMS(initial_capital=args.capital, mode="pending")
 
     if args.status:
         s = oms.status()

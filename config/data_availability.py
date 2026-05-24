@@ -213,16 +213,15 @@ _reg(DataSourceSpec(
     name="st_holder_number",
     event_time="report_end",
     publish_time="ann_date",
-    available_time_rule="ann_date+0_BDay",
-    signal_lag_bdays=0,
+    available_time_rule="ann_date+1_BDay",
+    signal_lag_bdays=1,
     execution_lag="T+1_open",
     pit_safe_level="verified",
     allowed_usage=["training", "signal"],
     notes=(
-        "Shareholder count keyed by ann_date. "
-        "feature_merger._load_st_holder_number uses ann_date directly as merge key "
-        "(no additional BDay(1) shift). Data becomes usable on ann_date itself "
-        "since announcements are typically pre-market or post-close prior day."
+        "Shareholder count keyed by ann_date + BDay(1). "
+        "A-share announcements may be post-market, so data is conservatively "
+        "available the next trading day after ann_date."
     ),
 ))
 

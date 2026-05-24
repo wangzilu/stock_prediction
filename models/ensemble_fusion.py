@@ -168,26 +168,44 @@ def robust_zscore(pred: pd.Series) -> pd.Series:
 # Fusion methods
 # ---------------------------------------------------------------------------
 
-def fuse_rank_mean(predictions: dict[str, pd.Series]) -> pd.Series:
-    """Average of rank-normalized predictions across models."""
+def fuse_rank_mean(
+    predictions: dict[str, pd.Series], min_model_count: int = 2
+) -> pd.Series:
+    """Average of rank-normalized predictions across models.
+
+    Args:
+        min_model_count: minimum number of non-NaN model predictions per row.
+            Rows with fewer models get NaN (prevents single-model masquerading
+            as ensemble).
+    """
     if not predictions:
         raise ValueError("No predictions to fuse")
 
     ranked = {k: rank_normalize(v) for k, v in predictions.items()}
     df = pd.DataFrame(ranked)
+    valid_count = df.notna().sum(axis=1)
     fused = df.mean(axis=1)
+    fused[valid_count < min_model_count] = np.nan
     fused.name = "fused_rank_mean"
     return fused
 
 
-def fuse_robust_z_mean(predictions: dict[str, pd.Series]) -> pd.Series:
-    """Average of robust z-scored predictions across models."""
+def fuse_robust_z_mean(
+    predictions: dict[str, pd.Series], min_model_count: int = 2
+) -> pd.Series:
+    """Average of robust z-scored predictions across models.
+
+    Args:
+        min_model_count: minimum number of non-NaN model predictions per row.
+    """
     if not predictions:
         raise ValueError("No predictions to fuse")
 
     zscored = {k: robust_zscore(v) for k, v in predictions.items()}
     df = pd.DataFrame(zscored)
+    valid_count = df.notna().sum(axis=1)
     fused = df.mean(axis=1)
+    fused[valid_count < min_model_count] = np.nan
     fused.name = "fused_robust_z_mean"
     return fused
 

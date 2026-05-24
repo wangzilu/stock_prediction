@@ -582,9 +582,14 @@ class PortfolioBacktest:
             ipo_filtered_count=total_ipo_filtered,
             signal_dates=signal_dates_list,
             return_dates=return_dates_list,
-            daily_pnl=pd.Series(pnl_net, index=dates[:n_days]),
-            daily_turnover=pd.Series(turnovers, index=dates[:n_days]),
-            daily_cost=pd.Series(costs, index=dates[:n_days]),
+            # Index by return realisation dates (T+1), not signal dates (T)
+            pnl_index = [d for d in return_dates_list if d is not None][:n_days]
+            if len(pnl_index) < n_days:
+                # Fallback: if return_dates incomplete, use signal dates
+                pnl_index = dates[:n_days]
+            daily_pnl=pd.Series(pnl_net, index=pnl_index),
+            daily_turnover=pd.Series(turnovers, index=pnl_index),
+            daily_cost=pd.Series(costs, index=pnl_index),
             daily_benchmark=daily_bm,
             daily_excess=daily_ex,
         )
