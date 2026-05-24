@@ -674,9 +674,14 @@ class FeatureMerger:
                 return None
 
             nb_daily = df[["qlib_code", "trade_date"] + factor_cols].copy()
+            # PIT safety: northbound data is published after market close on day T,
+            # so it should only be available for predictions on T+1.
+            nb_daily["trade_date"] = pd.to_datetime(nb_daily["trade_date"])
+            nb_daily["trade_date"] = nb_daily["trade_date"] + pd.tseries.offsets.BDay(1)
+
             result = self._asof_merge_timeseries(nb_daily, index, "trade_date", factor_cols)
             if result is not None:
-                logger.info(f"Northbound features (PIT-safe): {len(factor_cols)} factors")
+                logger.info(f"Northbound features (PIT-safe, T+1 lag): {len(factor_cols)} factors")
             return result
         except Exception as e:
             logger.warning(f"Northbound load failed: {e}")
@@ -939,10 +944,15 @@ class FeatureMerger:
             for c in factor_cols:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
 
-            result = self._asof_merge_timeseries(
-                df[["qlib_code", "date"] + factor_cols], index, "date", factor_cols)
+            daily = df[["qlib_code", "date"] + factor_cols].copy()
+            # PIT safety: daily_basic is published after market close on day T,
+            # so it should only be available for predictions on T+1.
+            daily["date"] = pd.to_datetime(daily["date"])
+            daily["date"] = daily["date"] + pd.tseries.offsets.BDay(1)
+
+            result = self._asof_merge_timeseries(daily, index, "date", factor_cols)
             if result is not None:
-                logger.info(f"ST daily_basic (PIT-safe): {len(factor_cols)} factors")
+                logger.info(f"ST daily_basic (PIT-safe, T+1 lag): {len(factor_cols)} factors")
             return result
         except Exception as e:
             logger.warning(f"ST daily_basic load failed: {e}")

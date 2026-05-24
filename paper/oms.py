@@ -242,14 +242,19 @@ class PaperOMS:
                           use_next_open: bool = True) -> dict:
         """Load execution prices from Qlib.
 
-        For realistic execution:
-        1. Try T+1 open price (next trading day's open) — realistic
-        2. Fall back to T close if T+1 open not available — optimistic
+        Two modes depending on when this runs:
+        - Historical backtest replay: T+1 open is known → use it for realistic fill.
+        - Live/paper (same-day): T+1 open is NOT yet known → use T close as
+          estimate. Orders are "pending next open" semantically.
+
+        The caller (RiskGuard, PnL) must understand that live prices are
+        estimates until next-day reconciliation.
 
         Args:
             date: signal date (today)
             extra_codes: additional stock codes to load
-            use_next_open: if True, try next day's open first
+            use_next_open: if True, try next day's open first (only works
+                for historical dates where T+1 data exists in Qlib)
         """
         prices = {}
         try:
@@ -270,8 +275,10 @@ class PaperOMS:
             qlib_insts = [c.lower() for c in insts]
 
             if use_next_open:
-                # Try T+1 open: load open price for next trading day
-                # Qlib's Ref($open, -1) on date T gives T+1 open
+                # Try T+1 open: only valid for historical replay where
+                # next trading day's data already exists in Qlib.
+                # For live/paper on today's date, this will return NaN/empty
+                # and we fall through to T close below.
                 df = D.features(qlib_insts, ["Ref($open, -1)"],
                                start_time=date, end_time=date)
                 if df is not None and not df.empty:
@@ -282,9 +289,12 @@ class PaperOMS:
                             prices[inst] = price
                     if prices:
                         logger.info(f"  Using T+1 open prices ({len(prices)} stocks)")
+                        self._price_type = "next_open"
                         return prices
 
-            # Fallback: today's close
+            # Fallback: today's close (used for live/paper when T+1 not yet available)
+            # NOTE: This is an ESTIMATE. Real execution happens at next day's open.
+            # RiskGuard decisions based on this price are preliminary.
             df = D.features(qlib_insts, ["$close"],
                            start_time=date, end_time=date)
             if df is not None and not df.empty:
@@ -295,9 +305,11 @@ class PaperOMS:
                         prices[inst] = price
                 if prices:
                     logger.info(f"  Using T close prices ({len(prices)} stocks, T+1 open unavailable)")
+                    self._price_type = "close_estimate"
 
         except Exception as e:
             logger.warning(f"Failed to load prices: {e}")
+            self._price_type = "unavailable"
         return prices
 
     def execute_orders(self, sells: list, buys: list, date: str):

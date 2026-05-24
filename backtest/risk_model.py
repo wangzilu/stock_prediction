@@ -262,21 +262,22 @@ class PortfolioRiskModel:
     def _compute_mctr(
         self, cov: np.ndarray, weights: np.ndarray, names: list
     ) -> dict:
-        """Marginal Contribution to Total Risk.
+        """Percentage Contribution to Total Risk (PCTR).
 
-        MCTR_i = w_i * (Sigma @ w)_i / sigma_p
+        PCTR_i = w_i * (Sigma @ w)_i / port_variance
         Sums to 1.0 (each stock's risk contribution as fraction of total).
         """
         sigma_w = cov @ weights
         port_var = weights @ sigma_w
-        port_vol = np.sqrt(max(port_var, 1e-12))
+        if port_var < 1e-12:
+            return {name: 0.0 for name in names}
 
-        mctr = {}
+        pctr = {}
         for i, name in enumerate(names):
-            contribution = weights[i] * sigma_w[i] / port_vol
-            mctr[name] = round(float(contribution), 6)
+            contribution = weights[i] * sigma_w[i] / port_var
+            pctr[name] = round(float(contribution), 6)
 
-        return mctr
+        return pctr
 
 
 if __name__ == "__main__":

@@ -157,23 +157,47 @@ class PromotionGate:
                     f"threshold={self.thresholds['min_splits']}"
                 )
 
-            # Count splits with positive RankIC
+            # Count splits with positive RankIC and missing metrics
             positive_splits = 0
+            missing_splits = 0
             split_ics = []
             for sid in split_experiment_ids:
                 try:
                     sart = ExperimentArtifact.load(sid)
                     sm = sart.load_metrics()
-                    ric = sm.get("rank_ic_mean", 0)
-                    split_ics.append(ric)
-                    if ric > 0:
-                        positive_splits += 1
+                    ric = sm.get("rank_ic_mean")
+                    if ric is None:
+                        missing_splits += 1
+                        split_ics.append(None)
+                    else:
+                        split_ics.append(ric)
+                        if ric > 0:
+                            positive_splits += 1
                 except Exception:
+                    missing_splits += 1
                     split_ics.append(None)
 
-            checks["split_positive_ratio"] = (
-                positive_splits / n_splits if n_splits > 0 else 0
+            valid_splits = n_splits - missing_splits
+            split_pos_ratio = (
+                positive_splits / valid_splits if valid_splits > 0 else 0
             )
+            checks["split_positive_ratio"] = split_pos_ratio
+            checks["missing_splits"] = missing_splits
+
+            # HARD FAIL: split positive ratio below threshold
+            if split_pos_ratio < self.thresholds["min_rank_ic_pos_ratio"]:
+                failures.append(
+                    f"split_positive_ratio={split_pos_ratio:.2f} < "
+                    f"threshold={self.thresholds['min_rank_ic_pos_ratio']} "
+                    f"({positive_splits}/{valid_splits} splits positive)"
+                )
+
+            # HARD FAIL: too many missing split metrics
+            if missing_splits > n_splits * 0.25:
+                failures.append(
+                    f"missing_splits={missing_splits}/{n_splits} "
+                    f"(>25% splits lack metrics)"
+                )
 
             # Delta vs champion (if provided)
             if champion_id:
@@ -182,10 +206,32 @@ class PromotionGate:
                     champion_metrics = champion_art.load_metrics()
                     champion_ric = champion_metrics.get("rank_ic_mean", 0)
                     checks["champion_rank_ic"] = champion_ric
+
+                    # Per-split delta vs champion
+                    delta_positive = 0
+                    delta_valid = 0
+                    for ric in split_ics:
+                        if ric is not None:
+                            delta_valid += 1
+                            if ric > champion_ric:
+                                delta_positive += 1
+
+                    delta_pos_ratio = (
+                        delta_positive / delta_valid if delta_valid > 0 else 0
+                    )
+                    checks["delta_positive_ratio"] = delta_pos_ratio
                     checks["delta_rank_ic"] = (
                         (metrics.get("rank_ic_mean", 0) - champion_ric)
                         if metrics else None
                     )
+
+                    # HARD FAIL: delta positive ratio below threshold
+                    if delta_pos_ratio < self.thresholds["min_delta_pos_ratio"]:
+                        failures.append(
+                            f"delta_positive_ratio={delta_pos_ratio:.2f} < "
+                            f"threshold={self.thresholds['min_delta_pos_ratio']} "
+                            f"({delta_positive}/{delta_valid} splits beat champion)"
+                        )
                 except Exception:
                     warnings.append(f"Could not load champion {champion_id}")
 

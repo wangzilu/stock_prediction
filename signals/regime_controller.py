@@ -84,8 +84,8 @@ class RegimeController:
             "fx_risk_score": self._fx_risk(date),
         }
 
-        # Composite risk_on_score: weighted average
-        weights = {
+        # Composite risk_on_score: weighted average (normalized to sum=1)
+        raw_weights = {
             "liquidity_score": 0.18,
             "credit_stress_score": 0.12,
             "leverage_unwind_score": 0.18,
@@ -98,6 +98,8 @@ class RegimeController:
             "futures_basis_score": 0.08,
             "fx_risk_score": 0.06,
         }
+        w_sum = sum(raw_weights.values())
+        weights = {k: v / w_sum for k, v in raw_weights.items()}
         risk_on = sum(scores[k] * w for k, w in weights.items())
         scores["risk_on_score"] = round(risk_on, 3)
 
@@ -365,7 +367,14 @@ class RegimeController:
             return 0.0
 
     def _inflation(self, date: str) -> float:
-        """CPI → inflation pressure [-1, +1]. High inflation = negative."""
+        """CPI → inflation score [-1, +1]. U-shaped: both high and low CPI are negative.
+
+        CPI < 0%   → negative (deflation risk)
+        0% ~ 1%    → weak positive (loose but deflation concern)
+        1% ~ 3%    → positive (healthy inflation)
+        3% ~ 4%    → weak negative (tightening expectation)
+        > 4%       → strong negative (overheating)
+        """
         try:
             cpi = pd.read_parquet(DATA_DIR / "st_cn_cpi.parquet")
             if "nt_yoy" not in cpi.columns:
@@ -377,8 +386,23 @@ class RegimeController:
             if cpi.empty:
                 return 0.0
             latest = cpi.iloc[-1]["nt_yoy"]
-            # CPI YoY ~2% is neutral; >4% is inflationary pressure; <0% is deflationary
-            return round(max(-1, min(1, -(latest - 2) / 2)), 3)
+
+            # U-shaped mapping: peak at CPI ~2%, negative on both extremes
+            if latest < 0:
+                # Deflation: the more negative, the worse
+                score = max(-1, latest / 2)       # CPI=-2% → -1.0
+            elif latest <= 1:
+                # Low inflation: mild positive, but not full
+                score = latest / 2                 # CPI=0% → 0, CPI=1% → 0.5
+            elif latest <= 3:
+                # Healthy range: positive
+                score = 1 - abs(latest - 2) / 2    # CPI=2% → 1.0, CPI=3% → 0.5
+            elif latest <= 5:
+                # Overheating: turning negative
+                score = -(latest - 3) / 2          # CPI=4% → -0.5, CPI=5% → -1.0
+            else:
+                score = -1.0
+            return round(max(-1, min(1, score)), 3)
         except Exception:
             pass
         return 0.0

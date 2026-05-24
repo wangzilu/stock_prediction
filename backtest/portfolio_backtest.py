@@ -534,10 +534,11 @@ class PortfolioBacktest:
         daily_ex = pd.Series(dtype=float)
 
         if benchmark_returns is not None and len(benchmark_returns) > 0:
-            # Align benchmark to backtest dates
-            bm_aligned = benchmark_returns.reindex(dates[:n_days]).fillna(0.0)
+            # PnL realized dates: portfolio formed on dates[i], return realized on dates[i+1]
+            realized_dates = dates[1:n_days+1] if len(dates) > n_days else dates[:n_days]
+            bm_aligned = benchmark_returns.reindex(realized_dates).fillna(0.0)
             daily_bm = bm_aligned
-            daily_ex = pd.Series(pnl_net, index=dates[:n_days]) - bm_aligned
+            daily_ex = pd.Series(pnl_net, index=realized_dates) - bm_aligned
 
             bm_total = float(np.prod(1 + bm_aligned.values) - 1)
             excess_ret = total_ret - bm_total
