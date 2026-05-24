@@ -43,6 +43,22 @@ UNSTABLE_TYPES = {"earnings_negative", "industry_trend_positive",
 UNSTABLE_WEIGHT = 0.2
 
 
+def _get_liquid_pool(top_n: int = 500) -> set:
+    """Get top N liquid stocks by average daily amount from feature cache."""
+    try:
+        cache = pd.read_parquet(DATA_DIR / "feature_cache_174_holder_regime_ma.parquet",
+                                columns=["amount_raw"])
+        # Use latest date
+        dates = cache.index.get_level_values(0)
+        latest = dates.max()
+        day_amount = cache.loc[latest, "amount_raw"].dropna()
+        top = day_amount.nlargest(top_n).index
+        return set(str(x) for x in top)
+    except Exception:
+        # Fallback: return empty (overlay all stocks)
+        return set()
+
+
 def load_events_for_date(date: str) -> dict[str, float]:
     """Load gated event alpha for a date.
 
@@ -94,9 +110,9 @@ def apply_overlay(xgb_predictions: dict, event_alphas: dict,
     if not event_alphas or alpha == 0:
         return dict(xgb_predictions)
 
-    # Determine liquid pool (top N by absolute XGB score as proxy)
-    sorted_by_score = sorted(xgb_predictions.items(), key=lambda x: abs(x[1]), reverse=True)
-    liquid_pool = set(code for code, _ in sorted_by_score[:top_n_liquid])
+    # Determine liquid pool by actual trading volume (not XGB score)
+    # CX fix: abs(xgb_score) is NOT liquidity
+    liquid_pool = _get_liquid_pool(top_n_liquid)
 
     # Z-score XGB predictions
     xgb_vals = np.array(list(xgb_predictions.values()))
@@ -115,10 +131,12 @@ def apply_overlay(xgb_predictions: dict, event_alphas: dict,
         xgb_z = (xgb_score - xgb_mean) / xgb_std
 
         # Only overlay if stock is in liquid pool AND has event
-        code_6 = code[2:] if len(code) > 2 else code  # SH600519 → 600519
+        code_lower = code.lower()  # sh600519
+        code_6 = code_lower[2:] if len(code_lower) > 2 else code_lower  # 600519
         event_impact = event_alphas.get(code_6, 0)
 
-        if event_impact != 0 and code_6 in [c for c in event_alphas] and code.lower() in liquid_pool or code.upper() in liquid_pool or code in liquid_pool:
+        in_pool = (not liquid_pool) or (code_lower in liquid_pool)
+        if event_impact != 0 and in_pool:
             evt_z = (event_impact - evt_mean) / evt_std
             result[code] = xgb_z + alpha * evt_z
             n_overlaid += 1

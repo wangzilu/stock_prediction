@@ -116,9 +116,31 @@ def build_factors(signal_date: str = None, lookback_days: int = 30) -> pd.DataFr
         return pd.DataFrame()
 
     # Parse publish date and enforce PIT constraint
+    # CX: must distinguish pre-close (before 15:00) vs post-close news
+    # Pre-close news: usable for same-day signal
+    # Post-close news: only usable for next-day signal
     df["publish_date"] = df["publish_time"].apply(parse_publish_date)
-    # Use file_date as fallback if publish_date can't be parsed
     df["event_date"] = df["publish_date"].fillna(df["file_date"])
+
+    # Parse publish hour for PIT boundary
+    def _get_publish_hour(pt):
+        if not pt or len(pt) < 13:
+            return 20  # unknown → treat as post-close (conservative)
+        try:
+            return int(pt[11:13])
+        except (ValueError, IndexError):
+            return 20
+
+    df["publish_hour"] = df["publish_time"].apply(_get_publish_hour)
+
+    # PIT rule: post-close news (>= 15:00) shifts signal_date to next day
+    # For signal_date computation: news published after 15:00 on date D
+    # can only be used for signal on date D+1
+    # Here we adjust event_date: if publish_hour >= 15, shift event_date +1 day
+    mask_postclose = (df["publish_hour"] >= 15) & (df["event_date"] == signal_date)
+    # Don't shift — just exclude same-day post-close news
+    # They'll be included when signal_date is tomorrow
+    df = df[~mask_postclose | (df["event_date"] < signal_date)].copy()
     df = df[df["event_date"] <= signal_date].copy()
 
     if df.empty:

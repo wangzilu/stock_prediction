@@ -143,24 +143,34 @@ class RegimeController:
         """Margin balance change → leverage unwind risk [-1, +1].
 
         Margin balance dropping fast = unwind risk.
+        CX fix: filter days with < 3000 stocks (incomplete data),
+        use 20-day EWMA instead of raw 5-day mean.
         """
         try:
             md = pd.read_parquet(DATA_DIR / "st_margin_detail.parquet")
             md["trade_date"] = pd.to_datetime(md["trade_date"], format="%Y%m%d", errors="coerce")
             md["rzye"] = pd.to_numeric(md["rzye"], errors="coerce")
 
-            # Aggregate daily total margin balance
-            daily = md.groupby("trade_date")["rzye"].sum().sort_index()
-            if len(daily) < 10:
+            # Per-day: count stocks and sum balance
+            daily_stats = md.groupby("trade_date").agg(
+                total_rzye=("rzye", "sum"),
+                n_stocks=("rzye", "count"),
+            ).sort_index()
+
+            # CX: discard days with < 3000 stocks (incomplete data)
+            daily_stats = daily_stats[daily_stats["n_stocks"] >= 3000]
+            if len(daily_stats) < 20:
                 return 0.0
 
-            # 5-day change rate
-            recent = daily.iloc[-5:]
-            older = daily.iloc[-10:-5]
-            if older.mean() > 0:
-                change_rate = (recent.mean() - older.mean()) / older.mean()
-                # -5% change → -0.5 (unwind), +5% → +0.5 (leveraging up)
-                return round(max(-1, min(1, change_rate / 0.10)), 3)
+            # CX: use 20-day EWMA, not raw 5-day mean
+            ewma = daily_stats["total_rzye"].ewm(span=20).mean()
+            if len(ewma) < 2:
+                return 0.0
+
+            # Change rate: latest EWMA vs 20 days ago
+            change_rate = (ewma.iloc[-1] - ewma.iloc[-20]) / ewma.iloc[-20]
+            # -5% → -0.5, +5% → +0.5, clamp to [-1, 1]
+            return round(max(-1, min(1, change_rate / 0.10)), 3)
         except Exception:
             pass
         return 0.0
