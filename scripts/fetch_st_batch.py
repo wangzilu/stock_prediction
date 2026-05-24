@@ -247,6 +247,18 @@ SOURCES = {
         "per_stock": False,
         "kwargs": lambda: {"start_date": "20210101", "end_date": "20261231"},
     },
+    "fund_portfolio": {
+        "desc": "基金持仓(机构重仓/抱团)",
+        "method": "fund_portfolio",
+        "per_stock": True,
+        "kwargs": lambda code: {"ts_code": code},
+    },
+    "fund_share": {
+        "desc": "基金份额变化(资金流入流出)",
+        "method": "fund_share",
+        "per_stock": True,
+        "kwargs": lambda code: {"ts_code": code, "start_date": "20240101", "end_date": "20261231"},
+    },
 }
 
 
