@@ -238,44 +238,75 @@ class PaperOMS:
         target = list(remaining | actual_buys)
         return target, list(actual_sells), list(actual_buys)
 
-    def _load_real_prices(self, date: str, extra_codes: list = None) -> dict:
-        """Load real closing prices for the given date from Qlib or cache."""
+    def _load_real_prices(self, date: str, extra_codes: list = None,
+                          use_next_open: bool = True) -> dict:
+        """Load execution prices from Qlib.
+
+        For realistic execution:
+        1. Try T+1 open price (next trading day's open) — realistic
+        2. Fall back to T close if T+1 open not available — optimistic
+
+        Args:
+            date: signal date (today)
+            extra_codes: additional stock codes to load
+            use_next_open: if True, try next day's open first
+        """
         prices = {}
         try:
             from qlib.data import D
             import pandas as pd
-            # Ensure Qlib is initialized
             try:
                 D.calendar(freq="day", start_time="2020-01-01", end_time="2020-01-02")
             except Exception:
                 from config.qlib_runtime import init_qlib
                 init_qlib(str(DATA_DIR / "qlib_data" / "cn_data"))
+
             insts = list(self.state.get("positions", {}).keys())
             if extra_codes:
                 insts = list(set(insts + extra_codes))
             if not insts:
                 return prices
-            # Normalize codes for Qlib
+
             qlib_insts = [c.lower() for c in insts]
+
+            if use_next_open:
+                # Try T+1 open: load open price for next trading day
+                # Qlib's Ref($open, -1) on date T gives T+1 open
+                df = D.features(qlib_insts, ["Ref($open, -1)"],
+                               start_time=date, end_time=date)
+                if df is not None and not df.empty:
+                    for idx, row in df.iterrows():
+                        inst = str(idx[0]).upper()
+                        price = float(row.iloc[0])
+                        if np.isfinite(price) and price > 0:
+                            prices[inst] = price
+                    if prices:
+                        logger.info(f"  Using T+1 open prices ({len(prices)} stocks)")
+                        return prices
+
+            # Fallback: today's close
             df = D.features(qlib_insts, ["$close"],
                            start_time=date, end_time=date)
             if df is not None and not df.empty:
                 for idx, row in df.iterrows():
-                    # Qlib returns MultiIndex (instrument, datetime)
-                    inst = str(idx[0]).upper() if isinstance(idx, tuple) else str(idx).upper()
+                    inst = str(idx[0]).upper()
                     price = float(row.iloc[0])
                     if np.isfinite(price) and price > 0:
                         prices[inst] = price
+                if prices:
+                    logger.info(f"  Using T close prices ({len(prices)} stocks, T+1 open unavailable)")
+
         except Exception as e:
-            logger.warning(f"Failed to load real prices: {e}")
+            logger.warning(f"Failed to load prices: {e}")
         return prices
 
     def execute_orders(self, sells: list, buys: list, date: str):
         """Simulate order execution with costs.
 
-        ASSUMPTION: Uses today's closing price as execution price.
-        This is optimistic — real execution would be at T+1 open/VWAP.
-        TODO: Record signal today, fill at T+1 open price tomorrow.
+        Execution price logic:
+        - If T+1 open price available (next trading day open): use it (realistic)
+        - Else fall back to today's close (optimistic but usable for live trading)
+        - Apply slippage on top of execution price
         """
         cash = self.state["cash"]
         positions = self.state["positions"]
