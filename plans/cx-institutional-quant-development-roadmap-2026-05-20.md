@@ -54,7 +54,8 @@
 | 4L | Weak Factor Factory v2 | 把失败因子做正交化/事件化/残差化 | 高优先级 |
 | 4M | Alpha360 & Model Diversity | 表格 + 深度模型分层验证 | 中高优先级 |
 | 4N | LLM Event Alpha | 新闻/公告/舆情结构化为 PIT 事件因子 | 中优先级 (B'+C' overlay 已做) |
-| **4S** | **实验治理 + 组合风险 + Alpha Factory** | **统一产物契约、ShrinkCov、Barra报告、regime-weighted sampler** | **当前最高优先级** |
+| 4S | 实验治理 + 组合风险 + Alpha Factory | 统一产物契约、ShrinkCov、Barra报告、regime-weighted sampler | ✅ 已完成 |
+| **4W** | **可信度收敛** | **数据时间字典、Paper OMS pending order、统一时间语义** | **当前最高优先级** |
 | 4T | LLM 结构化事件库 | 统一 JSON schema，PIT-safe 事件存储 | 4S 后 |
 | 4U | 事件研究校准 | 每类事件 1/3/5/10/20 日 CAR | 4T 事件库 60+ 天 |
 | 4V | 政策/情绪 overlay shadow | 不改 XGB，rerank 对照 30 天 | 4U 校准通过 |
@@ -1195,3 +1196,162 @@ LLM 只做结构化抽取，不做买卖判断。输出统一 JSON：
 - A-share sentiment and efficiency
 - Weibo mood and Chinese stock market
 - BERT sentiment + TVP-VAR
+
+---
+
+## 17. Phase 4W：可信度收敛（2026-05-24 CC 提出，基于 CX 总体评价）
+
+**背景**：CX 总体评价项目 5.5-7.5 分，核心短板是"时间语义不统一"。研究能力已经很强，工程可信度还没完全跟上。离"可信实盘系统"差的不是某个神奇模型，而是三个纪律：数据时点、研究晋级、实盘执行。
+
+**目标**：不再加新因子/模型，专注把已有系统的可信度从 5.5-6 分拉到 7.5-8 分。
+
+### 17.1 CX 评分基线（2026-05-24）
+
+| 维度 | 分数 | 评价 |
+|------|------|------|
+| 数据覆盖 | 7/10 | 已经很多，需要更严格的 availability date |
+| 因子研究 | 7.5/10 | 方向好，防止堆料 |
+| 模型训练 | 7/10 | XGB 主线正确，gate 口径要统一 |
+| 回测组合 | 6.5/10 | optimizer_v2 不错，执行/PnL 时序要修 |
+| 风控 | 6/10 | 有框架，阈值和实盘接入需谨慎 |
+| 生产调度 | 6.5/10 | crontab 可用，不是强一致生产系统 |
+| LLM/event | 5.5/10 | 有潜力，还在 shadow/calibration 阶段 |
+| 实盘可信度 | 5.5-6/10 | 可以 paper，暂不建议自动真金白银闭环 |
+
+### 17.2 已修的问题（2026-05-24 当天）
+
+| 问题 | 修复 |
+|------|------|
+| daily_basic / northbound 无 T+1 lag | ✅ BDay(1) |
+| ann_date 无可用性延迟 | ✅ BDay(1) |
+| 财报 fallback 过于乐观 | ✅ Q1/Q3 30→45d, H1 60→75d |
+| regime weights 和 1.11 | ✅ 归一化 |
+| inflation 不是 U 型 | ✅ U 型映射 |
+| promotion gate split 不 fail | ✅ hard failure |
+| MCTR sum≠1 | ✅ PCTR 除以 variance |
+| 回测 PnL 日期错位 | ✅ realized dates |
+| OMS T+1 open 语义混乱 | ✅ _price_type 标记 |
+| LLM JSON 解析脆弱 | ✅ first/last brace |
+| 两套 gate 口径 | ✅ 旧 gate 标 legacy |
+| event overlay 用 latest 回测历史 | ✅ WARNING + TODO |
+
+### 17.3 P0：全项目数据时间字典
+
+**问题**：同一个数据源在不同模块里的可用时间假设不同。
+
+**方案**：创建 `docs/data_time_dictionary.md`，为每个数据源定义 5 个时间点：
+
+```text
+| 数据源 | event_date | publish_time | available_time | signal_time | execution_time |
+|--------|------------|--------------|----------------|-------------|----------------|
+| Alpha158 (Qlib) | T 收盘 | T 收盘 | T 收盘 | T+1 信号 | T+1 open |
+| st_daily_basic | T 收盘 | T 17:00~ | T+1 BDay | T+1 信号 | T+1 open |
+| st_moneyflow | T 收盘 | T 17:00~ | T+1 BDay | T+1 信号 | T+1 open |
+| northbound HSGT | T 收盘 | T 17:00~ | T+1 BDay | T+1 信号 | T+1 open |
+| st_margin_detail | T 收盘 | T 18:00~ | T+1 BDay | T+1 信号 | T+1 open |
+| 财报 (有 ann_date) | 报告期末 | ann_date | ann_date+1 BDay | 下一交易日 | 下下交易日 open |
+| 财报 (无 ann_date) | 报告期末 | 未知 | 法定截止+N天 | 截止后首交易日 | 再下一交易日 |
+| LLM event | 新闻时间 | publish_time | >=15:00 → T+1 | T+1 信号 | T+1 open |
+| Shibor | T 11:00 | T 11:00 | T (盘中可用) | T 信号 | T 交易 |
+| CPI/PMI/M2 | 公布日 | 公布时间 | 公布日 | 下一交易日 | 下下交易日 |
+```
+
+**验收**：所有 `feature_merger._load_*` 和 `regime_controller._*` 方法的 lag 与字典一致。
+
+### 17.4 P0：Paper OMS 改 pending order 模式
+
+**问题**：当天运行 paper trading 时 `Ref($open, -1)` 拿的是未来价格（如果 Qlib 数据还没更新，会拿到 NaN 然后 fallback 到 close）。不同时间运行结果不同。
+
+**方案**：
+
+```text
+当前：signal(T) → 立即计算 fill price → 立即更新持仓
+改成：signal(T) → 生成 pending_orders → T+1 开盘后获取真实 open → 撮合 → 更新持仓
+```
+
+具体改动：
+1. `run_daily()` 拆成两步：`generate_orders(date)` 和 `reconcile(date)`
+2. `generate_orders` 只生成目标组合和订单列表，不执行
+3. `reconcile` 在 T+1 数据可用后执行，用真实 open 价格撮合
+4. 订单文件存 `data/storage/paper/pending_orders_{date}.json`
+5. RiskGuard 在 `generate_orders` 阶段用 T close 做初步检查，在 `reconcile` 阶段用真实 open 做最终检查
+
+**新增 crontab**：
+- 16:00 `generate_orders` → 生成订单
+- 次日 10:00 `reconcile` → 用真实 open 撮合
+
+### 17.5 P1：现有 event overlay 接入 Alpha Factory gate
+
+**问题**：B'+C' event overlay 在 shadow 中运行，但没有通过 Alpha Factory 的标准 gate 流程。
+
+**方案**：
+1. 把 `build_event_overlay.py` 的 `gated_event_score` 注册为 `CandidateFactor`
+2. 用 Alpha Factory 跑标准 tearsheet（IC/RankIC/spread/coverage/negative control）
+3. 结果写入 `data/storage/candidate_factors/event_overlay_bpc/tearsheet.json`
+4. 通过 gate → 保持 shadow；不通过 → 标记 fail 并停止 shadow
+
+### 17.6 P1：regime_controller 历史 replay PIT 审计
+
+**问题**：CX 指出 policy_support 和 theme_breadth 虽然加了文件名 PIT 过滤，但整个 replay 还没有系统审计过。
+
+**方案**：
+1. 写 `scripts/regime_pit_audit.py`
+2. 对每个分数，比较"当天 compute() 结果"和"用未来数据 compute() 结果"
+3. 差异 > 0 的分数标记为 PIT-unsafe，输出报告
+4. 报告格式：`data/storage/regime_pit_audit.json`
+
+### 17.7 P1：统一 rolling split 定义
+
+**问题**：`rolling_train.py`、`train_lgb.py`、`phase4_rolling_gate.py`、`fast_rolling_gate.py` 各自定义滚动窗口，参数硬编码，代码重复。
+
+**方案**：
+1. 创建 `config/rolling_splits.py`，定义标准 24-split 窗口配置
+2. 提供 `generate_splits(n_splits, train_days, valid_days, test_days, end_date)` 函数
+3. 所有滚动训练/评估脚本从这里读取窗口配置
+4. 不修改现有脚本的核心逻辑，只替换窗口定义部分
+
+### 17.8 P2：backtest engine 时间语义显式化
+
+**问题**：`portfolio_backtest.py` 的 PnL 日期虽然已修为 realized dates，但 signal date / formation date / return date 没有显式区分。
+
+**方案**：在 `PortfolioResult` 中增加字段：
+
+```python
+signal_dates: list      # 信号生成日期
+formation_dates: list   # 组合形成日期（= signal_dates for T+0）
+return_dates: list      # 收益实现日期（= signal_dates shifted by 1）
+```
+
+### 17.9 P2：生产调度健壮性
+
+**问题**：23 个 crontab 之间没有依赖管理。如果上游数据拉取失败，下游训练/推荐仍会运行。
+
+**方案**：
+1. 每个 crontab job 在完成后写 `data/storage/job_status/{job_name}_{date}.json`
+2. 下游 job 启动前检查上游 status 文件
+3. 如果上游失败或缺失 → 跳过执行 + 发送告警
+4. 不做复杂的 DAG 调度器，只做简单的文件锁检查
+
+### 17.10 Phase 4W 优先级总览
+
+| 优先级 | 任务 | 工作量 | 可信度提升 |
+|--------|------|--------|-----------|
+| **P0** | 全项目数据时间字典 | 小（文档） | 高 — 消除歧义 |
+| **P0** | Paper OMS pending order 模式 | 中 | 高 — live/backtest 语义统一 |
+| **P1** | event overlay 接入 Alpha Factory | 小 | 中 — 研究晋级纪律 |
+| **P1** | regime PIT 审计脚本 | 小 | 中 — 发现残留未来信息 |
+| **P1** | 统一 rolling split 定义 | 小 | 中 — 消除脚本分叉 |
+| **P2** | backtest 时间语义显式化 | 小 | 低 — 可读性 |
+| **P2** | 生产调度依赖检查 | 中 | 中 — 防止脏数据传播 |
+
+### 17.11 完成标准
+
+Phase 4W 完成时，项目应该满足：
+
+1. **任意数据源**都能在时间字典中查到 5 个时间点
+2. **Paper trading** 的 PnL 和 live 执行的 PnL 语义完全一致
+3. **任意因子/模型/overlay** 的晋级都通过 `tracker/promotion_gate.py`
+4. **regime controller** 的历史 replay 有 PIT 审计报告
+5. **所有滚动训练脚本** 共享同一套窗口配置
+
+达到这些标准后，CX 的"实盘可信度"评分应该从 5.5-6 提升到 7-7.5。
