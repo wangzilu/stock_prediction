@@ -67,7 +67,8 @@ class RiskGuard:
         self._state = self._load_state()
 
     def check(self, positions: dict, prices: dict, date: str,
-              xgb_ranks: dict = None, regime: dict = None) -> RiskConstraints:
+              xgb_ranks: dict = None, regime: dict = None,
+              events: dict = None) -> RiskConstraints:
         """Run all risk checks and return constraints.
 
         Args:
@@ -76,12 +77,14 @@ class RiskGuard:
             date: current date string
             xgb_ranks: {code: rank_in_universe} — for soft exit logic
             regime: regime controller output dict
+            events: {code: impact} — LLM event alphas for today
         """
         constraints = RiskConstraints()
 
         # === L1: Stock-level checks ===
         self._check_st_stocks(positions, constraints, date)
         self._check_hard_stop(positions, prices, constraints, date, xgb_ranks)
+        self._check_profit_giveback(positions, prices, constraints, date, xgb_ranks, events)
         self._check_limit_down(positions, prices, constraints)
         self._check_pending_exits(constraints, date)
         self._apply_cooldowns(constraints, date)
@@ -151,6 +154,80 @@ class RiskGuard:
                     cooldown_end = (datetime.strptime(date, "%Y-%m-%d") +
                                     timedelta(days=self.cooldown_price_days)).strftime("%Y-%m-%d")
                     self._state.setdefault("cooldowns", {})[code] = cooldown_end
+
+    def _check_profit_giveback(self, positions, prices, constraints, date,
+                               xgb_ranks, events):
+        """Soft trailing stop: profit giveback + weak signal → reduce weight.
+
+        Triggers when ALL three conditions met:
+          1. Current price dropped > 15% from holding-period high
+          2. XGB rank dropped below Top100
+          3. No positive LLM event
+
+        Action: not force sell, but mark for weight reduction (half weight).
+        If continues next day → force sell.
+        """
+        for code, pos in positions.items():
+            if code in constraints.force_sell:
+                continue
+
+            current_price = prices.get(code)
+            if not current_price or current_price <= 0:
+                continue
+
+            avg_price = pos.get("avg_price", current_price)
+            if avg_price <= 0:
+                continue
+
+            # Track holding-period high
+            peak_key = f"peak_{code}"
+            peak = self._state.get(peak_key, avg_price)
+            if current_price > peak:
+                peak = current_price
+                self._state[peak_key] = peak
+
+            # Condition 1: drawdown from peak > 15%
+            dd_from_peak = (current_price - peak) / peak
+            if dd_from_peak >= -0.15:
+                continue  # not enough drawdown
+
+            # Only trigger if was profitable (peak > avg_price * 1.05)
+            if peak <= avg_price * 1.05:
+                continue  # was never significantly profitable
+
+            # Condition 2: XGB rank weak
+            xgb_rank = (xgb_ranks or {}).get(code, 9999)
+            if xgb_rank <= 100:
+                continue  # XGB still likes it
+
+            # Condition 3: no positive event
+            event_impact = (events or {}).get(code, 0)
+            if event_impact > 0:
+                continue  # positive event, don't trigger
+
+            # All three conditions met → soft exit
+            profit_pct = (current_price - avg_price) / avg_price
+            constraints.pending_exit.append(code)
+            constraints.risk_reasons[code] = (
+                f"利润回吐: 高点{peak:.2f}→现价{current_price:.2f} "
+                f"(回撤{dd_from_peak:.1%}), XGB排名{xgb_rank}, "
+                f"仍盈利{profit_pct:.1%}"
+            )
+
+            # Check if this is second consecutive day of giveback trigger
+            prev_giveback = self._state.get(f"giveback_{code}")
+            if prev_giveback and prev_giveback == self._state.get("last_update"):
+                # Second day → force sell
+                constraints.force_sell.append(code)
+                constraints.risk_reasons[code] += " → 连续触发，强制卖出"
+                # Remove from pending
+                constraints.pending_exit = [c for c in constraints.pending_exit if c != code]
+                # Cooldown
+                cooldown_end = (datetime.strptime(date, "%Y-%m-%d") +
+                                timedelta(days=self.cooldown_price_days)).strftime("%Y-%m-%d")
+                self._state.setdefault("cooldowns", {})[code] = cooldown_end
+            else:
+                self._state[f"giveback_{code}"] = date
 
     def _check_limit_down(self, positions, prices, constraints):
         """Mark limit-down stocks as cannot_sell."""
