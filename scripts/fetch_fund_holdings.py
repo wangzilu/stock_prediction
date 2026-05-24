@@ -188,14 +188,89 @@ def fetch_fund_holdings(st):
         logger.info(f"  ✅ ETF shares: {len(df)} records → {out_path}")
 
 
+def fetch_regime_data(st):
+    """Fetch additional regime controller inputs."""
+    logger.info("=== Fetching regime data ===")
+
+    datasets = {
+        "cn_cpi": {"method": "cn_cpi", "kwargs": {"start_date": "20210101", "end_date": "20261231"}},
+        "cn_ppi": {"method": "cn_ppi", "kwargs": {"start_date": "20210101", "end_date": "20261231"}},
+        "fx_daily": {"method": "fx_daily", "kwargs": {"ts_code": "USDCNH.FXCM", "start_date": "20210101", "end_date": "20261231"}},
+        "us_tycr": {"method": "us_tycr", "kwargs": {"start_date": "20210101", "end_date": "20261231"}},
+    }
+
+    for name, cfg in datasets.items():
+        out_path = DATA_DIR / f"st_{name}.parquet"
+        if out_path.exists():
+            logger.info(f"  {name}: already exists, skip")
+            continue
+
+        logger.info(f"  Fetching {name}...")
+        try:
+            method = getattr(st, cfg["method"])
+            result = method(**cfg["kwargs"])
+            if isinstance(result, dict):
+                code = result.get("code")
+                msg = result.get("msg", "")[:50]
+                data = result.get("data")
+                if code == 1:
+                    logger.warning(f"  {name}: 需要升级 — {msg}")
+                    continue
+                if data and isinstance(data, list):
+                    df = pd.DataFrame(data)
+                    for col in df.columns:
+                        if df[col].dtype == object:
+                            df[col] = df[col].astype(str)
+                    df.to_parquet(str(out_path), index=False)
+                    logger.info(f"  ✅ {name}: {len(df)} records")
+                else:
+                    logger.warning(f"  {name}: empty")
+            elif isinstance(result, list) and result:
+                df = pd.DataFrame(result)
+                for col in df.columns:
+                    if df[col].dtype == object:
+                        df[col] = df[col].astype(str)
+                df.to_parquet(str(out_path), index=False)
+                logger.info(f"  ✅ {name}: {len(df)} records")
+        except Exception as e:
+            logger.error(f"  {name}: ERROR {e}")
+        time.sleep(0.5)
+
+    # IC/IM futures basis — use fut_daily for IF/IC/IM
+    for fut_code, fut_name in [("IF.CFX", "IF沪深300期货"), ("IC.CFX", "IC中证500期货"), ("IM.CFX", "IM中证1000期货")]:
+        out_name = f"fut_{fut_code.split('.')[0].lower()}"
+        out_path = DATA_DIR / f"st_{out_name}.parquet"
+        if out_path.exists():
+            logger.info(f"  {out_name}: already exists, skip")
+            continue
+        logger.info(f"  Fetching {fut_name}...")
+        try:
+            result = st.fut_daily(ts_code=fut_code, start_date="20240101", end_date="20261231")
+            if isinstance(result, dict):
+                data = result.get("data")
+                if data and isinstance(data, list):
+                    df = pd.DataFrame(data)
+                    for col in df.columns:
+                        if df[col].dtype == object:
+                            df[col] = df[col].astype(str)
+                    df.to_parquet(str(out_path), index=False)
+                    logger.info(f"  ✅ {out_name}: {len(df)} records")
+                else:
+                    logger.warning(f"  {out_name}: empty (code={result.get('code')}, msg={result.get('msg','')[:30]})")
+        except Exception as e:
+            logger.error(f"  {out_name}: ERROR {e}")
+        time.sleep(0.5)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Fetch fund holdings + macro data")
+    parser = argparse.ArgumentParser(description="Fetch fund holdings + macro + regime data")
     parser.add_argument("--macro", action="store_true", help="Fetch macro data only")
     parser.add_argument("--fund-holdings", action="store_true", help="Fetch fund holdings only")
+    parser.add_argument("--regime", action="store_true", help="Fetch regime controller data")
     parser.add_argument("--all", action="store_true", help="Fetch everything")
     args = parser.parse_args()
 
-    if not (args.macro or args.fund_holdings or args.all):
+    if not (args.macro or args.fund_holdings or args.regime or args.all):
         parser.print_help()
         return
 
@@ -203,6 +278,9 @@ def main():
 
     if args.macro or args.all:
         fetch_macro(st)
+
+    if args.regime or args.all:
+        fetch_regime_data(st)
 
     if args.fund_holdings or args.all:
         fetch_fund_holdings(st)
