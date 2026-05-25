@@ -58,12 +58,11 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         # --- Post-close: LLM / event collection ---
     ]
     if (scripts / "collect_global_industry_news.py").exists():
-        # NOTE: user's network can reach Google RSS directly without proxy.
-        # Using network=none to avoid proxy dependency. If this fails in future,
-        # change back to network=global.
+        # ShadowsocksX provides HTTP proxy on port 10818 via bridge.
+        # network=global sets http_proxy env var for the subprocess.
         jobs.append(CronJob("global_industry_news", "25 16 * * 1-5",
                 [py, str(scripts / "collect_global_industry_news.py")], "global_industry_news.log",
-                network="none", timeout_sec=600))
+                network="global", timeout_sec=600))
     if (scripts / "extract_global_supply_chain_events.py").exists():
         jobs.append(CronJob("global_chain_extract", "50 16 * * 1-5",
                 [py, str(scripts / "extract_global_supply_chain_events.py")], "global_chain_extract.log",
