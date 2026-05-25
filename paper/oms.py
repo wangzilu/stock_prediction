@@ -490,6 +490,35 @@ class PaperOMS:
                 logger.warning(f"  Universe filter failed (continuing unfiltered): {e}")
         return predictions or None
 
+    def _load_crash_predictions(self, date: str) -> dict | None:
+        """Try to load crash predictions from crash_predictions_latest.json.
+
+        Returns:
+            Dict {code: crash_prob} if available and date matches, else None.
+        """
+        crash_path = DATA_DIR / "crash_predictions_latest.json"
+        if not crash_path.exists():
+            return None
+        try:
+            payload = json.loads(crash_path.read_text())
+            pred_date = payload.get("date", "")
+            # Accept if prediction date is today or yesterday (stale by 1 day is OK)
+            if pred_date and pred_date < date[:10]:
+                # More than a day stale — check how old
+                from datetime import datetime as _dt
+                age = (_dt.strptime(date[:10], "%Y-%m-%d") -
+                       _dt.strptime(pred_date, "%Y-%m-%d")).days
+                if age > 2:
+                    logger.info(f"  Crash predictions stale ({pred_date}, {age}d old), skipping")
+                    return None
+            crash_probs = payload.get("predictions", {})
+            if crash_probs:
+                logger.info(f"  Loaded crash predictions: {len(crash_probs)} stocks (date={pred_date})")
+            return crash_probs if crash_probs else None
+        except Exception as e:
+            logger.warning(f"  Failed to load crash predictions: {e}")
+            return None
+
     def _apply_risk_guard(self, predictions: dict, date: str):
         """Run RiskGuard checks.  Returns (filtered_predictions, extra_sells, risk_info)."""
         extra_sells = []
@@ -502,10 +531,15 @@ class PaperOMS:
             guard = RiskGuard(state_dir=_sd)
             prices = self._load_real_prices(
                 date, extra_codes=list(self.state.get("positions", {}).keys()))
+
+            # Try to load crash predictions (Phase 4O)
+            crash_probs = self._load_crash_predictions(date)
+
             risk = guard.check(
                 positions=self.state.get("positions", {}),
                 prices=prices,
                 date=date,
+                crash_probs=crash_probs,
             )
             guard.update_portfolio_value(self.state.get("total_value", 1e6), date)
 
