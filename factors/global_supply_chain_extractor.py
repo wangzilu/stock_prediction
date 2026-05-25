@@ -86,8 +86,14 @@ _ENTITY_PATTERNS: list[tuple[str, str]] = [
     (r"\bMicron\b", "Micron"),
     (r"\bCATL\b", "CATL"),
     (r"\bBYD\b", "BYD"),
+    (r"\bQualcomm\b", "Qualcomm"),
+    (r"\bTexas\s+Instruments\b|\bTI\s+analog\b", "Texas_Instruments"),
+    (r"\bMediaTek\b", "MediaTek"),
     (r"\b(?:lithium)\b", "Lithium_Price"),
     (r"\b(?:polysilicon|poly-silicon)\b", "Polysilicon_Price"),
+    (r"\b(?:copper)\s+(?:price|futures|supply)\b", "Copper_Price"),
+    (r"\b(?:rare\s+earth)\b", "Rare_Earth_Price"),
+    (r"\b(?:oil\s+price|crude\s+oil|brent|WTI)\b", "Oil_Price"),
     (r"\bUS\s+(?:export|sanctions?|tariff|ban)\b", "US_Export_Control"),
 ]
 

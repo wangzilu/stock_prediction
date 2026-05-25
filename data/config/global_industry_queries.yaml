@@ -1,6 +1,6 @@
-# Global Industry News Queries — Phase 4U Day2
+# Global Industry News Queries — Phase 4U Extended
 # Each topic maps to supply_chain_edges.yaml topics
-# Updated: 2026-05-24
+# Updated: 2026-05-25 (added commodity + expanded queries)
 
 ai_server:
   label: "AI Server / 算力链"
@@ -70,3 +70,16 @@ ev_battery:
     - "electric vehicle sales global"
   gdelt_max: 50
   rss_max: 20
+
+commodity:
+  label: "Commodity / 大宗商品"
+  queries:
+    - "copper price futures supply"
+    - "rare earth price China export"
+    - "crude oil price brent WTI"
+    - "Qualcomm chip mobile earnings"
+    - "Texas Instruments analog demand"
+    - "Intel foundry IFS"
+    - "Amazon AWS cloud capex"
+  gdelt_max: 30
+  rss_max: 15
