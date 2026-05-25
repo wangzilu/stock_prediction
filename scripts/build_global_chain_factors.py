@@ -343,7 +343,42 @@ def build_factors(
         logger.warning("No events found — cannot build factors")
         return pd.DataFrame()
 
+    # Company-level propagation (high confidence)
     df = propagate_scores(events, edges, target_date)
+
+    # Industry-level propagation (wider coverage, lower weight)
+    try:
+        from factors.supply_chain_mapper import SupplyChainMapper
+        mapper = SupplyChainMapper()
+        industry_scores = mapper.get_all_affected_stocks(events)
+
+        if industry_scores:
+            dt = pd.Timestamp(target_date)
+            # Merge industry scores with company scores
+            company_stocks = set()
+            if not df.empty:
+                company_stocks = set(df.index.get_level_values("instrument"))
+
+            industry_rows = []
+            for stock, score in industry_scores.items():
+                if stock in company_stocks:
+                    continue  # company-level already covered
+                industry_rows.append({
+                    "datetime": dt,
+                    "instrument": stock,
+                    "global_chain_alpha": round(score, 4),
+                    "global_chain_event_count": 1,
+                    "global_chain_pos_score": round(max(0, score), 4),
+                    "global_chain_neg_score": round(min(0, score), 4),
+                })
+
+            if industry_rows:
+                ind_df = pd.DataFrame(industry_rows).set_index(["datetime", "instrument"])
+                df = pd.concat([df, ind_df])
+                logger.info(f"Industry-level: +{len(industry_rows)} stocks "
+                            f"(total {len(df)} stocks)")
+    except ImportError:
+        logger.warning("supply_chain_mapper not available — company-level only")
 
     if df.empty:
         logger.warning("No factor scores produced")
