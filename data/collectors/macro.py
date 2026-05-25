@@ -158,34 +158,62 @@ class MacroCollector:
         """Fetch China macro economy news."""
         return self.fetch_rss(RSS_FEEDS["china_economy"], max_items)
 
-    def fetch_all(self, max_per_source: int = 10, total_timeout: int = 60) -> list:
+    def fetch_all(self, max_per_source: int = 10, total_timeout: int = 60,
+                  skip_global: bool = False) -> list:
         """Fetch news from all sources with total time budget.
 
         Args:
             max_per_source: max items per RSS feed
             total_timeout: max total seconds for all feeds (default 60s).
                 If exceeded, returns whatever was collected so far.
-                This prevents blocking domestic cron jobs when proxy is unavailable.
+            skip_global: if True, skip feeds that require VPN (Google/BBC/Reuters/etc.)
+                Set True when running in domestic network profile.
 
         Returns:
             Combined list of news items, each with added 'source' key.
         """
+        import os
         import time
         start = time.time()
         all_news = []
         n_failed = 0
+        n_skipped = 0
+
+        # Auto-detect: if no proxy env set, skip global feeds to avoid timeouts
+        if skip_global is False:
+            proxy = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
+            if not proxy:
+                skip_global = True
+                logger.info("MacroCollector: no proxy detected, skipping global RSS feeds")
+
+        # ALL feeds in RSS_FEEDS are overseas sources requiring VPN.
+        # In domestic mode, skip all of them and return empty.
+        # Global news should be fetched by a separate global-network job.
+        if skip_global:
+            logger.info("MacroCollector: domestic mode, all RSS feeds are global — returning empty")
+            return []
+
+        GLOBAL_DOMAINS: set[str] = set()  # unused now but kept for future per-domain logic
 
         seen_titles = set()
         for source_name, url in RSS_FEEDS.items():
             # Check total time budget
             elapsed = time.time() - start
             if elapsed > total_timeout:
-                remaining = len(RSS_FEEDS) - (len(all_news) + n_failed)
+                remaining = len(RSS_FEEDS) - (len(all_news) + n_failed + n_skipped)
                 logger.warning(
                     f"MacroCollector total timeout ({total_timeout}s) exceeded after "
                     f"{elapsed:.0f}s, skipping {remaining} remaining feeds"
                 )
                 break
+
+            # Skip global feeds when no proxy
+            if skip_global:
+                from urllib.parse import urlparse
+                domain = urlparse(url).hostname or ""
+                if domain in GLOBAL_DOMAINS:
+                    n_skipped += 1
+                    continue
 
             items = self.fetch_rss(url, max_per_source, timeout=5)
             if not items:
@@ -199,7 +227,8 @@ class MacroCollector:
 
         logger.info(
             f"MacroCollector: {len(all_news)} headlines from "
-            f"{len(RSS_FEEDS) - n_failed}/{len(RSS_FEEDS)} feeds "
+            f"{len(RSS_FEEDS) - n_failed - n_skipped}/{len(RSS_FEEDS)} feeds "
+            f"({n_skipped} skipped, {n_failed} failed) "
             f"in {time.time() - start:.0f}s"
         )
         return all_news
