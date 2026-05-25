@@ -73,18 +73,21 @@ class MacroCollector:
             "User-Agent": "StockPrediction/1.0"
         })
 
-    def fetch_rss(self, url: str, max_items: int = 20) -> list:
+    def fetch_rss(self, url: str, max_items: int = 20, timeout: int = 5) -> list:
         """Fetch and parse an RSS feed.
 
         Args:
             url: RSS feed URL
             max_items: Maximum items to return
+            timeout: request timeout in seconds (default 5, reduced from 10
+                to avoid blocking domestic jobs when proxy is unavailable)
 
         Returns:
             List of dicts with keys: title, link, published, description
+            Returns [] on any failure (timeout, DNS, HTTP error).
         """
         try:
-            resp = self.session.get(url, timeout=10)
+            resp = self.session.get(url, timeout=timeout)
             if resp.status_code != 200:
                 logger.warning(f"RSS feed returned status {resp.status_code}: {url}")
                 return []
@@ -155,17 +158,38 @@ class MacroCollector:
         """Fetch China macro economy news."""
         return self.fetch_rss(RSS_FEEDS["china_economy"], max_items)
 
-    def fetch_all(self, max_per_source: int = 10) -> list:
-        """Fetch news from all sources.
+    def fetch_all(self, max_per_source: int = 10, total_timeout: int = 60) -> list:
+        """Fetch news from all sources with total time budget.
+
+        Args:
+            max_per_source: max items per RSS feed
+            total_timeout: max total seconds for all feeds (default 60s).
+                If exceeded, returns whatever was collected so far.
+                This prevents blocking domestic cron jobs when proxy is unavailable.
 
         Returns:
             Combined list of news items, each with added 'source' key.
         """
+        import time
+        start = time.time()
         all_news = []
+        n_failed = 0
 
         seen_titles = set()
         for source_name, url in RSS_FEEDS.items():
-            items = self.fetch_rss(url, max_per_source)
+            # Check total time budget
+            elapsed = time.time() - start
+            if elapsed > total_timeout:
+                remaining = len(RSS_FEEDS) - (len(all_news) + n_failed)
+                logger.warning(
+                    f"MacroCollector total timeout ({total_timeout}s) exceeded after "
+                    f"{elapsed:.0f}s, skipping {remaining} remaining feeds"
+                )
+                break
+
+            items = self.fetch_rss(url, max_per_source, timeout=5)
+            if not items:
+                n_failed += 1
             for item in items:
                 title = item.get("title", "").strip()
                 if title and title not in seen_titles:
@@ -173,4 +197,9 @@ class MacroCollector:
                     all_news.append(item)
                     seen_titles.add(title)
 
+        logger.info(
+            f"MacroCollector: {len(all_news)} headlines from "
+            f"{len(RSS_FEEDS) - n_failed}/{len(RSS_FEEDS)} feeds "
+            f"in {time.time() - start:.0f}s"
+        )
         return all_news
