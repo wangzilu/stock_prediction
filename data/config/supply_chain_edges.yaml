@@ -769,3 +769,33 @@
 - {src_entity: Rare_Earth_Price, dst_stock: sz300748, dst_name: 金力永磁, topic: commodity, product: permanent_magnet, relation_type: commodity_input, direction: -1, weight: 0.5, confidence: 0.6, source: 行业逻辑}
 - {src_entity: Oil_Price, dst_stock: sh601857, dst_name: 中国石油, topic: commodity, product: crude_oil, relation_type: commodity_output, direction: 1, weight: 0.7, confidence: 0.8, source: 行业常识}
 - {src_entity: Oil_Price, dst_stock: sh600028, dst_name: 中国石化, topic: commodity, product: refining, relation_type: commodity_output, direction: 1, weight: 0.6, confidence: 0.7, source: 行业常识}
+
+# ============================================================
+# Chain 6: 中国"卡脖子"优势 — 海外缺货/受限时A股受益
+# ============================================================
+
+# 稀土：中国出口管制 → 稀土企业受益
+- {src_entity: China_Export_Control, dst_stock: sh600111, dst_name: 北方稀土, topic: strategic_material, product: rare_earth, relation_type: policy_beneficiary, direction: 1, weight: 0.8, confidence: 0.9, source: 政策}
+- {src_entity: China_Export_Control, dst_stock: sz000831, dst_name: 中国稀土, topic: strategic_material, product: rare_earth, relation_type: policy_beneficiary, direction: 1, weight: 0.7, confidence: 0.8, source: 政策}
+- {src_entity: China_Export_Control, dst_stock: sh600392, dst_name: 盛和资源, topic: strategic_material, product: rare_earth, relation_type: policy_beneficiary, direction: 1, weight: 0.6, confidence: 0.7, source: 政策}
+
+# 锗/镓/钨：战略金属出口管制
+- {src_entity: China_Export_Control, dst_stock: sz000688, dst_name: 云南锗业, topic: strategic_material, product: germanium, relation_type: policy_beneficiary, direction: 1, weight: 0.7, confidence: 0.8, source: 政策}
+- {src_entity: China_Export_Control, dst_stock: sz000657, dst_name: 中钨高新, topic: strategic_material, product: tungsten, relation_type: policy_beneficiary, direction: 1, weight: 0.7, confidence: 0.8, source: 政策}
+- {src_entity: China_Export_Control, dst_stock: sh601600, dst_name: 中国铝业, topic: strategic_material, product: gallium, relation_type: policy_beneficiary, direction: 1, weight: 0.5, confidence: 0.6, source: 政策}
+
+# 石墨/负极材料：电池关键材料
+- {src_entity: China_Export_Control, dst_stock: sh603659, dst_name: 璞泰来, topic: strategic_material, product: graphite_anode, relation_type: policy_beneficiary, direction: 1, weight: 0.6, confidence: 0.7, source: 行业逻辑}
+- {src_entity: Graphite_Supply, dst_stock: sh603659, dst_name: 璞泰来, topic: strategic_material, product: anode_material, relation_type: commodity_output, direction: 1, weight: 0.6, confidence: 0.7, source: 行业常识}
+
+# 永磁材料：NdFeB 全球 90%+
+- {src_entity: Rare_Earth_Price, dst_stock: sz300748, dst_name: 金力永磁, topic: strategic_material, product: NdFeB_magnet, relation_type: commodity_output, direction: 1, weight: 0.6, confidence: 0.7, source: 行业常识}
+- {src_entity: Rare_Earth_Price, dst_stock: sz000970, dst_name: 中科三环, topic: strategic_material, product: NdFeB_magnet, relation_type: commodity_output, direction: 1, weight: 0.5, confidence: 0.6, source: 行业常识}
+
+# 华友钴业：钴精炼全球龙头
+- {src_entity: Cobalt_Price, dst_stock: sh603799, dst_name: 华友钴业, topic: strategic_material, product: cobalt, relation_type: commodity_output, direction: 1, weight: 0.7, confidence: 0.8, source: 行业常识}
+
+# 光伏"卡脖子"：海外反倾销/关税 → 短期负面但长期提升议价权
+- {src_entity: Solar_Tariff, dst_stock: sh601012, dst_name: 隆基绿能, topic: solar, product: wafer_module, relation_type: policy_exposure, direction: -1, weight: 0.5, confidence: 0.7, source: 政策}
+- {src_entity: Solar_Tariff, dst_stock: sh600438, dst_name: 通威股份, topic: solar, product: polysilicon_cell, relation_type: policy_exposure, direction: -1, weight: 0.5, confidence: 0.7, source: 政策}
+- {src_entity: Solar_Tariff, dst_stock: sz002129, dst_name: TCL中环, topic: solar, product: wafer, relation_type: policy_exposure, direction: -1, weight: 0.4, confidence: 0.6, source: 政策}

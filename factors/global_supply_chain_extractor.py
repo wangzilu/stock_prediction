@@ -95,6 +95,12 @@ _ENTITY_PATTERNS: list[tuple[str, str]] = [
     (r"\b(?:rare\s+earth)\b", "Rare_Earth_Price"),
     (r"\b(?:oil\s+price|crude\s+oil|brent|WTI)\b", "Oil_Price"),
     (r"\bUS\s+(?:export|sanctions?|tariff|ban)\b", "US_Export_Control"),
+    (r"\bChina\s+(?:export\s+(?:control|ban|restrict)|sanctions?)\b", "China_Export_Control"),
+    (r"\b(?:graphite)\s+(?:supply|export|shortage)\b", "Graphite_Supply"),
+    (r"\b(?:cobalt)\s+(?:price|supply|shortage)\b", "Cobalt_Price"),
+    (r"\b(?:solar)\s+(?:tariff|anti.?dumping|countervailing)\b", "Solar_Tariff"),
+    (r"\b(?:germanium|gallium)\s+(?:export|restrict|ban|control)\b", "China_Export_Control"),
+    (r"\b(?:rare\s+earth)\s+(?:export|restrict|ban|control)\b", "China_Export_Control"),
 ]
 
 
