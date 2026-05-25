@@ -152,19 +152,77 @@ def check_shadow(date: str) -> tuple[str, str]:
 
 
 def check_llm_events(date: str) -> tuple[str, str]:
-    """Check LLM event pipeline."""
-    events_path = DATA_DIR / "llm_events" / f"{date}.jsonl"
+    """Check LLM event pipeline.
+
+    Checks:
+      1. Unified events/ directory (primary)
+      2. Legacy llm_events/ directory (fallback)
+      3. job_status.json for llm_event_pipeline status
+    Reports: n events extracted, n stocks covered.
+    """
     news_path = DATA_DIR / "daily_news" / f"{date}.jsonl"
 
-    if not news_path.exists():
-        return "❌", "新闻未采集"
+    # Count news
+    n_news = 0
+    if news_path.exists():
+        n_news = sum(1 for _ in open(news_path))
 
-    n_news = sum(1 for _ in open(news_path))
-    if not events_path.exists():
-        return "⚠️", f"新闻{n_news}条 事件未提取"
+    # Check unified events/ directory (primary), then legacy llm_events/
+    events_path = DATA_DIR / "events" / f"{date}.jsonl"
+    legacy_path = DATA_DIR / "llm_events" / f"{date}.jsonl"
 
-    n_events = sum(1 for _ in open(events_path))
-    return "✅", f"新闻{n_news}条 事件{n_events}条"
+    n_events = 0
+    n_stocks = 0
+    events_found = False
+
+    for ep in [events_path, legacy_path]:
+        if ep.exists():
+            events_found = True
+            stocks = set()
+            count = 0
+            for line in open(ep):
+                count += 1
+                try:
+                    obj = json.loads(line)
+                    code = obj.get("stock_code", "")
+                    if code:
+                        stocks.add(code)
+                except Exception:
+                    pass
+            n_events = count
+            n_stocks = len(stocks)
+            break
+
+    # Also check job_status.json for pipeline status
+    job_status_msg = ""
+    try:
+        status_path = DATA_DIR / "job_status.json"
+        if status_path.exists():
+            d = json.loads(status_path.read_text())
+            job = d.get("jobs", {}).get("llm_event_pipeline", {})
+            started = job.get("started_at", "")
+            if date in started:
+                if job.get("status") == "success":
+                    dur = job.get("duration_seconds", 0)
+                    job_status_msg = f" pipeline成功({dur:.0f}s)"
+                elif job.get("status") == "failed":
+                    err = job.get("error", "")[:40]
+                    job_status_msg = f" pipeline失败:{err}"
+                elif job.get("status") == "running":
+                    job_status_msg = " pipeline运行中"
+    except Exception:
+        pass
+
+    if not news_path.exists() and not events_found:
+        return "❌", f"新闻未采集 事件未提取{job_status_msg}"
+
+    if not events_found:
+        return "⚠️", f"新闻{n_news}条 事件未提取{job_status_msg}"
+
+    if n_events == 0:
+        return "⚠️", f"新闻{n_news}条 事件文件为空{job_status_msg}"
+
+    return "✅", f"新闻{n_news}条 事件{n_events}条 覆盖{n_stocks}只{job_status_msg}"
 
 
 def check_guba(date: str) -> tuple[str, str]:
