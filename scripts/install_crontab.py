@@ -43,7 +43,7 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
     root = str(project_root)
     main_py = str(project_root / "main.py")
     scripts = project_root / "scripts"
-    return [
+    jobs = [
         # --- Market hours: domestic ---
         CronJob("morning_recommendation", "20 9 * * 1-5", [py, main_py, "--morning"], "cron_morning.log",
                 network="domestic", timeout_sec=300),
@@ -56,6 +56,12 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("evening_outlook", "0 22 * * 1-5", [py, main_py, "--evening-outlook"], "cron_evening_outlook.log",
                 network="domestic", timeout_sec=300),
         # --- Post-close: LLM / event collection ---
+    ]
+    if (scripts / "collect_global_industry_news.py").exists():
+        jobs.append(CronJob("global_industry_news", "25 16 * * 1-5",
+                [py, str(scripts / "collect_global_industry_news.py")], "global_industry_news.log",
+                network="global", timeout_sec=600))
+    jobs += [
         CronJob("llm_event_pipeline", "30 16 * * 1-5",
                 [py, str(scripts / "run_llm_event_pipeline.py")], "llm_event_pipeline.log",
                 network="llm", timeout_sec=7200),
@@ -97,6 +103,9 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("lgb_after_close_smoke", "35 18 * * 1-5",
                 [py, str(scripts / "smoke_lgb_predict.py")], "lgb_after_close_smoke.log",
                 network="none", timeout_sec=900, critical=True),
+        CronJob("predict_crash_daily", "37 18 * * 1-5",
+                [py, str(scripts / "predict_crash_daily.py")], "crash_predict.log",
+                network="none", timeout_sec=120),
         CronJob("shadow_optimizer", "40 18 * * 1-5",
                 [py, str(scripts / "run_shadow_optimizer.py")], "shadow_optimizer.log",
                 network="none", timeout_sec=600),
@@ -127,6 +136,7 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                 [py, str(scripts / "fetch_fund_holdings.py"), "--macro", "--regime"], "regime_data.log",
                 network="domestic", timeout_sec=3600),
     ]
+    return jobs
 
 
 def _quote_arg(arg: str) -> str:
