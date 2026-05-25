@@ -56,7 +56,7 @@
 | 4N | LLM Event Alpha | 新闻/公告/舆情结构化为 PIT 事件因子 | 中优先级 (B'+C' overlay 已做) |
 | 4S | 实验治理 + 组合风险 + Alpha Factory | 统一产物契约、ShrinkCov、Barra报告、regime-weighted sampler | ✅ 已完成 |
 | 4W | 可信度收敛 | 数据时间字典、Paper OMS pending order、统一时间语义 | ✅ 已完成 |
-| 4E | Model Ensemble 基建 | 模型 zoo artifact、rank/zscore fusion、rolling IC weighting、disagreement | ⚠️ 单 split 完成，24-split 待跑 |
+| 4E | Model Ensemble 基建 | 模型 zoo artifact、rank/zscore fusion、rolling IC weighting、disagreement | ✅ 24-split 完成: +5.3% IC, -22% spread |
 | 4G | Feature Path 统一 + Factor Inventory | 官方因子路径、自动清单、晋级流程 | ✅ 已完成 |
 | 4R | Meta-filter / Reranker | Top100 二阶段过滤、risk-aware rerank、optimizer_v2 shadow | 4E/4G 后 |
 | 4T | LLM 结构化事件库 | 统一 JSON schema，PIT-safe 事件存储 | ✅ EventStore 基础完成 |
@@ -64,11 +64,11 @@
 | 4N-2 | 事件 surprise 特征 | direction/confidence/novelty/attention | ✅ 初版完成（需更多数据） |
 | 4N-3 | 历史校准表 | event_type × 行业 × 市值 × regime | ⏳ 需 60+ 天事件数据 |
 | 4N-4 | overlay/reranker rolling PIT 验证 | 不改 XGB，rerank 对照 | ⏳ 需 rolling pred artifact |
-| 4O | Downside Risk Layer | crash label + 负面事件因子 + 踩踏/退潮因子 | ⚠️ crash labels 已建，模型待训练 |
+| 4O | Downside Risk Layer | crash label + 负面事件因子 + 踩踏/退潮因子 | ✅ AUC 0.78, 接入 RiskGuard+OMS |
 | 4P | RiskGuard 接入 | crash_prob → cannot_buy / reduce_weight / force_sell | 4O 后 |
-| 4T-1~7 | LLM pipeline 收敛 | V2 默认/EventStore 唯一/规则筛选/公告正文/校准表 | ⚠️ 4T-1/4T-2 已完成 |
-| 4U | Global Supply Chain Overlay | 全球产业事件 → 供应链映射 → A 股因子 | 设计完成，待实施 |
-| **4X** | **网络分层 + 数据稳定性** | **domestic/global/none profile, proxy wrapper, cron 分类** | **待实施** |
+| 4T-1~7 | LLM pipeline 收敛 | V2 默认/EventStore 唯一/规则筛选/公告正文/校准表 | ✅ 4T-1/2/3 完成, event_filter 接入 |
+| 4U | Global Supply Chain Overlay | 全球产业事件 → 供应链映射 → A 股因子 | ✅ 144 edges, 84 stocks, 全链路跑通, 每日积累中 |
+| 4X | 网络分层 + 数据稳定性 | domestic/global/none profile, proxy wrapper, cron 分类 | ✅ wrapper+cron+data_health+freshness gate |
 | 5A | Research Governance | 数据/实验/模型/报告治理 | 合并入 4S |
 | 5B | Deep Sequence Models | HIST/ALSTM/Transformer 类模型研究 | 4S 后 |
 | 5C | RL Portfolio Controller | RL 只做仓位/换手/风险预算控制 | 组合引擎稳定后 |
