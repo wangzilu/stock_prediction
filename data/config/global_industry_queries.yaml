@@ -83,3 +83,17 @@ commodity:
     - "Amazon AWS cloud capex"
   gdelt_max: 30
   rss_max: 15
+
+strategic_material:
+  label: "Strategic Material / 战略材料卡脖子"
+  queries:
+    - "China rare earth export control"
+    - "China germanium gallium export ban"
+    - "China graphite export restriction"
+    - "rare earth supply shortage"
+    - "cobalt price supply Congo"
+    - "tungsten supply China"
+    - "solar tariff anti-dumping China"
+    - "critical mineral supply chain"
+  gdelt_max: 30
+  rss_max: 15
