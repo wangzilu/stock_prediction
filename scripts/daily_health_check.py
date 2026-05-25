@@ -32,11 +32,36 @@ LOGS_DIR = PROJECT_ROOT / "logs"
 
 
 def check_log_for_today(log_name: str, date: str, success_keywords: list,
-                        fail_keywords: list = None) -> tuple[str, str]:
+                        fail_keywords: list = None,
+                        job_id: str = None) -> tuple[str, str]:
     """Check a log file for today's run status.
+
+    Also checks job_status.json as a secondary source (some scripts
+    like baostock don't write dated log lines).
 
     Returns (status, detail) where status is '✅', '⚠️', or '❌'.
     """
+    # First check job_status.json (most reliable — written by run_with_status)
+    if job_id:
+        try:
+            import json
+            status_path = PROJECT_ROOT / "data" / "storage" / "job_status.json"
+            if status_path.exists():
+                d = json.loads(status_path.read_text())
+                job = d.get("jobs", {}).get(job_id, {})
+                started = job.get("started_at", "")
+                if date in started:
+                    if job.get("status") == "success":
+                        duration = job.get("duration_seconds", 0)
+                        return "✅", f"成功 ({duration:.0f}s)"
+                    elif job.get("status") == "failed":
+                        error = job.get("error", "")[:60]
+                        return "⚠️", f"运行但有错误: {error}"
+                    elif job.get("status") == "running":
+                        return "⚠️", "仍在运行中"
+        except Exception:
+            pass
+
     log_path = LOGS_DIR / log_name
     if not log_path.exists():
         return "❌", "日志文件不存在"
@@ -195,7 +220,8 @@ def main():
     status, detail = check_log_for_today(
         "cron_morning.log", date,
         success_keywords=["recommendations"],
-        fail_keywords=["timed out", "failed", "0 recommendations"]
+        fail_keywords=["timed out", "failed", "0 recommendations"],
+        job_id="morning_recommendation",
     )
     checks.append(("早盘推荐", status, detail))
 
@@ -228,7 +254,8 @@ def main():
     status, detail = check_log_for_today(
         "data_update.log", date,
         success_keywords=["successfully", "instruments"],
-        fail_keywords=["failed", "error"]
+        fail_keywords=["failed", "error"],
+        job_id="qlib_data_update",
     )
     checks.append(("数据更新", status, detail))
 
