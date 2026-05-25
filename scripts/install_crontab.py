@@ -61,6 +61,14 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         jobs.append(CronJob("global_industry_news", "25 16 * * 1-5",
                 [py, str(scripts / "collect_global_industry_news.py")], "global_industry_news.log",
                 network="global", timeout_sec=600))
+    if (scripts / "extract_global_supply_chain_events.py").exists():
+        jobs.append(CronJob("global_chain_extract", "50 16 * * 1-5",
+                [py, str(scripts / "extract_global_supply_chain_events.py")], "global_chain_extract.log",
+                network="none", timeout_sec=600))
+    if (scripts / "build_global_chain_factors.py").exists():
+        jobs.append(CronJob("global_chain_factors", "10 17 * * 1-5",
+                [py, str(scripts / "build_global_chain_factors.py")], "global_chain_factors.log",
+                network="none", timeout_sec=600))
     jobs += [
         CronJob("llm_event_pipeline", "30 16 * * 1-5",
                 [py, str(scripts / "run_llm_event_pipeline.py")], "llm_event_pipeline.log",
