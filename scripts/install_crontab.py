@@ -45,24 +45,27 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
     scripts = project_root / "scripts"
     jobs = [
         # --- Market hours: domestic ---
+        # morning/sell/risk/evening need Qlib Alpha158 load (~300s) + predict + push
+        # Historical: morning took 840s on 5/22. Set 900s (15 min) to be safe.
         CronJob("morning_recommendation", "20 9 * * 1-5", [py, main_py, "--morning"], "cron_morning.log",
-                network="domestic", timeout_sec=300),
+                network="domestic", timeout_sec=900),
         CronJob("sell_check", "30 14 * * 1-5", [py, main_py, "--sell-check"], "cron_sell_check.log",
-                network="domestic", timeout_sec=300),
+                network="domestic", timeout_sec=900),
         CronJob("daily_summary", "30 15 * * 1-5", [py, main_py, "--daily-summary"], "cron_daily_summary.log",
-                network="domestic", timeout_sec=300),
+                network="domestic", timeout_sec=600),
         CronJob("risk_check", "35 9-15 * * 1-5", [py, main_py, "--risk-check"], "cron_risk_check.log",
-                network="domestic", timeout_sec=300),
+                network="domestic", timeout_sec=900),
         CronJob("evening_outlook", "0 22 * * 1-5", [py, main_py, "--evening-outlook"], "cron_evening_outlook.log",
-                network="domestic", timeout_sec=300),
+                network="domestic", timeout_sec=900),
         # --- Post-close: LLM / event collection ---
     ]
     if (scripts / "collect_global_industry_news.py").exists():
         # ShadowsocksX provides HTTP proxy on port 10818 via bridge.
         # network=global sets http_proxy env var for the subprocess.
+        # 7 topics × (GDELT + RSS) can take 10+ min. GDELT is slow/rate-limited.
         jobs.append(CronJob("global_industry_news", "25 16 * * 1-5",
                 [py, str(scripts / "collect_global_industry_news.py")], "global_industry_news.log",
-                network="global", timeout_sec=600))
+                network="global", timeout_sec=1200))
     if (scripts / "extract_global_supply_chain_events.py").exists():
         jobs.append(CronJob("global_chain_extract", "50 16 * * 1-5",
                 [py, str(scripts / "extract_global_supply_chain_events.py")], "global_chain_extract.log",
