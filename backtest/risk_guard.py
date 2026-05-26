@@ -83,7 +83,8 @@ class RiskGuard:
               xgb_ranks: dict = None, regime: dict = None,
               events: dict = None,
               prev_closes: dict = None,
-              crash_probs: dict = None) -> RiskConstraints:
+              crash_probs: dict = None,
+              chain_factors: dict = None) -> RiskConstraints:
         """Run all risk checks and return constraints.
 
         Args:
@@ -95,6 +96,7 @@ class RiskGuard:
             events: {code: impact} — LLM event alphas for today
             prev_closes: {code: prev_close_price} — for limit-down check
             crash_probs: {code: crash_prob_5d} — crash model output (optional)
+            chain_factors: {code: global_chain_alpha} — supply chain factors (optional)
         """
         constraints = RiskConstraints()
 
@@ -110,6 +112,10 @@ class RiskGuard:
         # === L1.5: Crash model checks ===
         if crash_probs is not None:
             self._check_crash_risk(positions, crash_probs, date, constraints)
+
+        # === L1.6: Supply chain risk checks ===
+        if chain_factors is not None:
+            self._check_supply_chain_risk(positions, chain_factors, date, constraints)
 
         # === L2: Portfolio drawdown state machine ===
         self._check_drawdown(constraints, date)
@@ -458,6 +464,63 @@ class RiskGuard:
                         code,
                         f"崩盘概率{prob:.1%}>65%，禁止买入"
                     )
+
+    # ---- L1.6: Supply chain risk ----
+
+    def check_supply_chain_risk(self, positions: dict, chain_factors: dict,
+                                date: str) -> list:
+        """Standalone supply chain risk check — returns list of flagged stocks.
+
+        Args:
+            positions: {code: pos_dict} — currently held positions
+            chain_factors: {code: global_chain_alpha} — supply chain factor scores
+            date: current date string
+
+        Returns:
+            List of dicts with flagged stock info:
+              [{"code": ..., "chain_alpha": ..., "action": "exit"/"warning",
+                "reason": ...}, ...]
+        """
+        flagged = []
+        for code, alpha in chain_factors.items():
+            if not np.isfinite(alpha):
+                continue
+            if alpha < -2.0 and code in positions:
+                flagged.append({
+                    "code": code,
+                    "chain_alpha": alpha,
+                    "action": "exit",
+                    "reason": f"供应链负面alpha={alpha:.2f}<-2.0，建议退出",
+                })
+            elif alpha < -1.0:
+                flagged.append({
+                    "code": code,
+                    "chain_alpha": alpha,
+                    "action": "warning",
+                    "reason": f"供应链风险alpha={alpha:.2f}<-1.0，关注",
+                })
+        return flagged
+
+    def _check_supply_chain_risk(self, positions: dict, chain_factors: dict,
+                                 date: str, constraints: RiskConstraints):
+        """Wire supply chain risk into RiskConstraints (called from check()).
+
+        - chain_alpha < -1.0 → add warning to risk_reasons
+        - chain_alpha < -2.0 and held → pending_exit with reason "supply chain negative"
+        """
+        for code, alpha in chain_factors.items():
+            if not np.isfinite(alpha):
+                continue
+            if alpha < -2.0 and code in positions:
+                constraints.pending_exit.append(code)
+                constraints.risk_reasons[code] = (
+                    f"supply chain negative: alpha={alpha:.2f}<-2.0"
+                )
+            elif alpha < -1.0:
+                constraints.risk_reasons.setdefault(
+                    code,
+                    f"supply chain warning: alpha={alpha:.2f}<-1.0"
+                )
 
     # ---- L2: Portfolio drawdown state machine ----
 

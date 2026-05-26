@@ -1,16 +1,21 @@
 """Shadow comparison: supply chain overlay vs pure XGB Top20.
 
 Daily script that compares Top20 stock picks with and without
-the global supply chain overlay. Shadow-only — does NOT change
-actual recommendations.
+the global supply chain overlay.  Now computes 3 separate shadows:
+
+  Shadow A (positive):     only events with direction > 0
+  Shadow B (negative/risk): only events with direction < 0
+  Shadow C (propagation):  full propagation including industry-level
+
+For each shadow, compares Top20 with vs without that overlay and
+saves results in the daily JSON.
 
 Pipeline:
   1. Load today's XGB predictions from lgb_latest_predictions.json
   2. Load global_chain_factors.parquet for today
-  3. Compute overlay: final_score = zscore(xgb) + 0.2 * zscore(chain_alpha)
-  4. Compare Top20 with vs without overlay
-  5. Save comparison to data/storage/shadow_chain_overlay/YYYY-MM-DD.json
-  6. Print which stocks moved in/out, chain alpha of affected stocks
+  3. For each shadow variant, compute overlay and compare Top20
+  4. Save comparison to data/storage/shadow_chain_overlay/YYYY-MM-DD.json
+  5. Print which stocks moved in/out per shadow
 
 Usage:
     python scripts/shadow_supply_chain_overlay.py
@@ -70,15 +75,20 @@ def load_xgb_predictions() -> pd.Series:
     return s
 
 
-def load_chain_factors(target_date: str) -> pd.Series:
-    """Load global_chain_alpha for target_date from parquet."""
+def load_chain_factors(target_date: str) -> pd.DataFrame:
+    """Load global_chain_factors for target_date from parquet.
+
+    Returns a DataFrame with columns:
+        global_chain_alpha, global_chain_pos_score, global_chain_neg_score, ...
+    Indexed by instrument.
+    """
     if not CHAIN_FACTORS_PATH.exists():
-        logger.warning("global_chain_factors.parquet not found — no overlay available")
-        return pd.Series(dtype=float)
+        logger.warning("global_chain_factors.parquet not found -- no overlay available")
+        return pd.DataFrame()
 
     df = pd.read_parquet(CHAIN_FACTORS_PATH)
     if df.empty:
-        return pd.Series(dtype=float)
+        return pd.DataFrame()
 
     dt = pd.Timestamp(target_date)
     dates = df.index.get_level_values("datetime")
@@ -91,68 +101,131 @@ def load_chain_factors(target_date: str) -> pd.Series:
         logger.warning("No chain factors for %s, using latest: %s", target_date, latest)
         chain_today = df.xs(latest, level="datetime")
 
-    alpha = chain_today["global_chain_alpha"]
-    alpha.index = alpha.index.str.upper()
-    logger.info("Loaded chain factors: %d stocks with alpha", len(alpha))
-    return alpha
+    chain_today.index = chain_today.index.str.upper()
+    logger.info("Loaded chain factors: %d stocks", len(chain_today))
+    return chain_today
 
 
 # ---------------------------------------------------------------------------
-# Core comparison
+# Single shadow comparison
 # ---------------------------------------------------------------------------
 
-def compare_top_n(xgb_preds: pd.Series, chain_alpha: pd.Series, target_date: str) -> dict:
-    """Compare Top-N with and without supply chain overlay."""
-    # --- Baseline: pure XGB Top-N ---
+def _compare_single_shadow(
+    xgb_preds: pd.Series,
+    shadow_alpha: pd.Series,
+    shadow_name: str,
+) -> dict:
+    """Compare Top-N with and without a single shadow overlay.
+
+    Args:
+        xgb_preds: XGB prediction scores (higher = better).
+        shadow_alpha: per-stock alpha for this shadow variant.
+        shadow_name: label for this shadow (e.g. "shadow_a_positive").
+
+    Returns:
+        Dict with top20_changed list and n_affected count.
+    """
     baseline_top = set(xgb_preds.nlargest(TOP_N).index)
 
-    # --- Overlay: zscore(xgb) + weight * zscore(chain_alpha) ---
     z_xgb = safe_zscore(xgb_preds)
     final_score = z_xgb.copy()
 
-    common = xgb_preds.index.intersection(chain_alpha.index)
+    common = xgb_preds.index.intersection(shadow_alpha.index)
     if len(common) > 0:
-        z_chain = safe_zscore(chain_alpha.reindex(xgb_preds.index).fillna(0.0))
-        final_score = z_xgb + OVERLAY_WEIGHT * z_chain
+        z_shadow = safe_zscore(shadow_alpha.reindex(xgb_preds.index).fillna(0.0))
+        final_score = z_xgb + OVERLAY_WEIGHT * z_shadow
     else:
-        logger.warning("No common stocks between XGB and chain — overlay is a no-op")
+        logger.warning("No common stocks for %s -- overlay is a no-op", shadow_name)
 
     overlay_top = set(final_score.nlargest(TOP_N).index)
 
-    # --- Diff ---
-    added = overlay_top - baseline_top       # moved IN by overlay
-    removed = baseline_top - overlay_top     # moved OUT by overlay
-    kept = baseline_top & overlay_top
+    added = overlay_top - baseline_top
+    removed = baseline_top - overlay_top
 
-    # Build detail records for added/removed stocks
     def stock_detail(code: str) -> dict:
-        d = {
+        return {
             "code": code,
             "xgb_pred": round(float(xgb_preds.get(code, 0)), 6),
             "xgb_zscore": round(float(z_xgb.get(code, 0)), 4),
             "final_score": round(float(final_score.get(code, 0)), 4),
-            "chain_alpha": round(float(chain_alpha.get(code, 0)), 6) if code in chain_alpha.index else None,
+            "shadow_alpha": round(float(shadow_alpha.get(code, 0)), 6) if code in shadow_alpha.index else None,
             "xgb_rank": int(xgb_preds.rank(ascending=False).get(code, 0)),
             "overlay_rank": int(final_score.rank(ascending=False).get(code, 0)),
         }
-        return d
 
-    added_details = sorted([stock_detail(c) for c in added], key=lambda x: x["overlay_rank"])
-    removed_details = sorted([stock_detail(c) for c in removed], key=lambda x: x["xgb_rank"])
+    top20_changed = []
+    for c in sorted(added):
+        d = stock_detail(c)
+        d["change"] = "added"
+        top20_changed.append(d)
+    for c in sorted(removed):
+        d = stock_detail(c)
+        d["change"] = "removed"
+        top20_changed.append(d)
+
+    return {
+        "top20_changed": top20_changed,
+        "n_affected": len(added) + len(removed),
+        "overlay_top": sorted(overlay_top),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Core: compute 3 shadows
+# ---------------------------------------------------------------------------
+
+def compute_three_shadows(
+    xgb_preds: pd.Series,
+    chain_df: pd.DataFrame,
+    target_date: str,
+) -> dict:
+    """Compute three shadow overlays and compare each to baseline Top20.
+
+    Shadow A (positive): only positive events (global_chain_pos_score)
+    Shadow B (negative): only negative events (global_chain_neg_score)
+    Shadow C (propagation): full alpha (global_chain_alpha, includes industry)
+
+    Returns:
+        Result dict ready for JSON serialization.
+    """
+    baseline_top = sorted(xgb_preds.nlargest(TOP_N).index)
+
+    # --- Build shadow alpha series ---
+    if chain_df.empty:
+        alpha_pos = pd.Series(dtype=float)
+        alpha_neg = pd.Series(dtype=float)
+        alpha_full = pd.Series(dtype=float)
+    else:
+        alpha_pos = chain_df.get("global_chain_pos_score", pd.Series(dtype=float))
+        # neg_score is stored as negative values; keep as-is so that stocks
+        # with large negative exposure get penalised in the overlay
+        alpha_neg = chain_df.get("global_chain_neg_score", pd.Series(dtype=float))
+        alpha_full = chain_df.get("global_chain_alpha", pd.Series(dtype=float))
+
+    shadow_a = _compare_single_shadow(xgb_preds, alpha_pos, "shadow_a_positive")
+    shadow_b = _compare_single_shadow(xgb_preds, alpha_neg, "shadow_b_negative")
+    shadow_c = _compare_single_shadow(xgb_preds, alpha_full, "shadow_c_propagation")
 
     result = {
         "date": target_date,
+        "shadow_a_positive": {
+            "top20_changed": shadow_a["top20_changed"],
+            "n_affected": shadow_a["n_affected"],
+        },
+        "shadow_b_negative": {
+            "top20_changed": shadow_b["top20_changed"],
+            "n_affected": shadow_b["n_affected"],
+        },
+        "shadow_c_propagation": {
+            "top20_changed": shadow_c["top20_changed"],
+            "n_affected": shadow_c["n_affected"],
+        },
+        "xgb_top20": baseline_top,
+        # Metadata
         "overlay_weight": OVERLAY_WEIGHT,
         "top_n": TOP_N,
         "n_xgb_stocks": len(xgb_preds),
-        "n_chain_stocks": len(chain_alpha),
-        "n_common": len(common),
-        "baseline_top": sorted(baseline_top),
-        "overlay_top": sorted(overlay_top),
-        "overlap_count": len(kept),
-        "added_by_overlay": added_details,
-        "removed_by_overlay": removed_details,
-        "turnover": len(added),
+        "n_chain_stocks": len(chain_df),
     }
     return result
 
@@ -172,32 +245,31 @@ def save_result(result: dict, target_date: str) -> Path:
 
 
 def print_summary(result: dict):
-    """Print human-readable summary."""
+    """Print human-readable summary for all 3 shadows."""
     print("\n" + "=" * 70)
-    print(f"Shadow Supply Chain Overlay — {result['date']}")
+    print(f"Shadow Supply Chain Overlay (3-way) -- {result['date']}")
     print("=" * 70)
     print(f"XGB stocks: {result['n_xgb_stocks']}  |  "
-          f"Chain stocks: {result['n_chain_stocks']}  |  "
-          f"Common: {result['n_common']}")
-    print(f"Top-{result['top_n']} overlap: {result['overlap_count']}/{result['top_n']}  |  "
-          f"Turnover: {result['turnover']} stocks")
+          f"Chain stocks: {result['n_chain_stocks']}")
+    print(f"XGB Top-{result['top_n']}: {', '.join(result['xgb_top20'][:5])} ...")
 
-    if result["added_by_overlay"]:
-        print(f"\n  ADDED by overlay ({len(result['added_by_overlay'])}):")
-        for s in result["added_by_overlay"]:
-            chain_str = f"chain_alpha={s['chain_alpha']:+.4f}" if s["chain_alpha"] is not None else "chain_alpha=N/A"
-            print(f"    {s['code']:12s}  xgb_rank={s['xgb_rank']:>5d} -> overlay_rank={s['overlay_rank']:>5d}  "
-                  f"{chain_str}")
+    for key, label in [
+        ("shadow_a_positive", "Shadow A (positive events)"),
+        ("shadow_b_negative", "Shadow B (negative/risk events)"),
+        ("shadow_c_propagation", "Shadow C (full propagation)"),
+    ]:
+        shadow = result[key]
+        print(f"\n  {label}:  n_affected={shadow['n_affected']}")
+        if shadow["top20_changed"]:
+            for s in shadow["top20_changed"]:
+                alpha_str = (f"alpha={s['shadow_alpha']:+.4f}"
+                             if s["shadow_alpha"] is not None else "alpha=N/A")
+                print(f"    {s['change']:>7s}  {s['code']:12s}  "
+                      f"xgb_rank={s['xgb_rank']:>5d} -> overlay_rank={s['overlay_rank']:>5d}  "
+                      f"{alpha_str}")
+        else:
+            print("    No changes -- overlay had no effect on Top-20.")
 
-    if result["removed_by_overlay"]:
-        print(f"\n  REMOVED by overlay ({len(result['removed_by_overlay'])}):")
-        for s in result["removed_by_overlay"]:
-            chain_str = f"chain_alpha={s['chain_alpha']:+.4f}" if s["chain_alpha"] is not None else "chain_alpha=N/A"
-            print(f"    {s['code']:12s}  xgb_rank={s['xgb_rank']:>5d} -> overlay_rank={s['overlay_rank']:>5d}  "
-                  f"{chain_str}")
-
-    if result["turnover"] == 0:
-        print("\n  No changes — overlay had no effect on Top-20.")
     print("=" * 70)
 
 
@@ -216,22 +288,22 @@ def main():
     # 1. Load predictions
     xgb_preds = load_xgb_predictions()
     if xgb_preds.empty:
-        logger.error("No XGB predictions — cannot compare")
+        logger.error("No XGB predictions -- cannot compare")
         sys.exit(1)
 
-    # 2. Load chain factors
-    chain_alpha = load_chain_factors(target_date)
-    if chain_alpha.empty:
-        logger.warning("No chain factors — saving baseline-only comparison")
-        chain_alpha = pd.Series(dtype=float)
+    # 2. Load chain factors (full DataFrame now, not just alpha series)
+    chain_df = load_chain_factors(target_date)
+    if chain_df.empty:
+        logger.warning("No chain factors -- saving baseline-only comparison")
+        chain_df = pd.DataFrame()
 
-    # 3-4. Compare
-    result = compare_top_n(xgb_preds, chain_alpha, target_date)
+    # 3. Compute 3 shadows
+    result = compute_three_shadows(xgb_preds, chain_df, target_date)
 
-    # 5. Save
+    # 4. Save
     save_result(result, target_date)
 
-    # 6. Print
+    # 5. Print
     print_summary(result)
 
 

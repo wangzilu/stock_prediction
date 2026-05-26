@@ -519,6 +519,48 @@ class PaperOMS:
             logger.warning(f"  Failed to load crash predictions: {e}")
             return None
 
+    def _load_chain_factors(self, date: str) -> dict | None:
+        """Try to load global supply chain factors from parquet.
+
+        Returns:
+            Dict {code: global_chain_alpha} if available, else None.
+        """
+        chain_path = DATA_DIR / "global_chain_factors.parquet"
+        if not chain_path.exists():
+            return None
+        try:
+            df = pd.read_parquet(chain_path)
+            if df.empty:
+                return None
+
+            dt = pd.Timestamp(date)
+            dates = df.index.get_level_values("datetime")
+
+            if dt in dates:
+                chain_today = df.xs(dt, level="datetime")
+            else:
+                # Fall back to the latest available date (max 2 days stale)
+                latest = dates.max()
+                age = (dt - latest).days
+                if age > 2:
+                    logger.info(f"  Chain factors stale ({latest.date()}, {age}d old), skipping")
+                    return None
+                chain_today = df.xs(latest, level="datetime")
+
+            if "global_chain_alpha" not in chain_today.columns:
+                return None
+
+            alpha = chain_today["global_chain_alpha"]
+            alpha.index = alpha.index.str.upper()
+            result = {code: float(val) for code, val in alpha.items()
+                      if np.isfinite(val)}
+            if result:
+                logger.info(f"  Loaded chain factors: {len(result)} stocks")
+            return result if result else None
+        except Exception as e:
+            logger.warning(f"  Failed to load chain factors: {e}")
+            return None
+
     def _apply_risk_guard(self, predictions: dict, date: str):
         """Run RiskGuard checks.  Returns (filtered_predictions, extra_sells, risk_info)."""
         extra_sells = []
@@ -535,11 +577,15 @@ class PaperOMS:
             # Try to load crash predictions (Phase 4O)
             crash_probs = self._load_crash_predictions(date)
 
+            # Try to load global supply chain factors
+            chain_factors = self._load_chain_factors(date)
+
             risk = guard.check(
                 positions=self.state.get("positions", {}),
                 prices=prices,
                 date=date,
                 crash_probs=crash_probs,
+                chain_factors=chain_factors,
             )
             guard.update_portfolio_value(self.state.get("total_value", 1e6), date)
 
