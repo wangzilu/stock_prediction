@@ -2198,8 +2198,46 @@ data/storage/supply_chain_edges.parquet
 
 - Cohen & Frazzini: Economic Links and Predictable Returns (AQR)
 - Herskovic et al.: Firm Volatility in Granular Networks
+- Funke/Gebken/Johanning/Michel: Supplier reactions post customer shocks (日频 1-5d)
+- News-driven stock prediction via noisy equity state representation
 - FinDKG: LLM + Dynamic Knowledge Graph (ICKG model)
 - Temporal Relational Ranking for Stock Prediction (RSR)
+
+### 26.12 CX 验证策略升级（2026-05-26）
+
+**不要只等 30 天自然积累。做 historical backfill。**
+
+```text
+回填 2024-01-01 至今全球产业新闻（高价值主题）
+  → 每个事件生成 5 个时间字段
+  → event study: T+1 / T+3 / T+5 / T+10
+  → negative control: 随机股票 / 随机日期 / 打乱行业映射
+  → liquidity split: 大票 / 中票 / 小票分开看
+```
+
+**三条 shadow，不是一条：**
+
+| Shadow | 方向 | 说明 |
+|--------|------|------|
+| A: 加分 overlay | 正面事件 | Nvidia 订单、AI 扩产、苹果补单 |
+| B: 减分/risk overlay | 负面事件 | 砍单、制裁、出口管制、价格战 |
+| C: 图传播 overlay | 边表传播 | 事件通过 supply chain edges 传到 A 股 |
+
+Shadow B（负面）可能比 A（正面）更有价值：A 股下跌催化更快更直接。
+
+**overlay 权重不要预设固定值：**
+
+```text
+final_score = zscore(xgb) + alpha * clipped_zscore(chain_alpha)
+
+alpha 网格搜索: 0.00, 0.03, 0.05, 0.10, 0.15
+单只股票最多移动 ±10~30 名
+只对高置信事件生效
+1/3/5 日指数衰减
+负面事件和正面事件分开处理
+```
+
+**供应链因子定位：event overlay + risk radar，不是 XGB175 的第 206 个输入。**
 
 ---
 
