@@ -354,13 +354,19 @@ def build_factors(
 
         if industry_scores:
             dt = pd.Timestamp(target_date)
-            # Merge industry scores with company scores
+            # Normalize company-level instruments to lowercase
+            if not df.empty:
+                df.index = pd.MultiIndex.from_tuples(
+                    [(d, inst.lower()) for d, inst in df.index],
+                    names=df.index.names,
+                )
             company_stocks = set()
             if not df.empty:
                 company_stocks = set(df.index.get_level_values("instrument"))
 
             industry_rows = []
             for stock, score in industry_scores.items():
+                stock = stock.lower()
                 if stock in company_stocks:
                     continue  # company-level already covered
                 industry_rows.append({
