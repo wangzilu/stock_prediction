@@ -281,13 +281,14 @@ def collect_global_industry_news(
             topic, gdelt_count, rss_count, len(dedup_items),
         )
 
-    # Write JSONL output
-    with open(output_path, "w", encoding="utf-8") as f:
-        for item in all_items:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        # Streaming write: save after EACH topic so timeout doesn't lose data
+        with open(output_path, "w", encoding="utf-8") as f:
+            for item in all_items:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        logger.info("  (saved %d items so far)", len(all_items))
 
     logger.info(
-        "Saved %d items to %s",
+        "Final: %d items to %s",
         len(all_items), output_path,
     )
 
