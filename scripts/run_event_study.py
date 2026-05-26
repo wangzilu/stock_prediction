@@ -110,7 +110,11 @@ def load_returns() -> pd.DataFrame:
         logger.warning(f"Feature cache not found at {cache_path}")
         return pd.DataFrame()
 
-    df = pd.read_parquet(cache_path, columns=["datetime", "instrument", "__pnl_return_1d"])
+    df = pd.read_parquet(cache_path, columns=["__pnl_return_1d"])
+    # MultiIndex (datetime, instrument) → reset to columns
+    df = df.reset_index()
+    if "level_0" in df.columns:
+        df = df.rename(columns={"level_0": "datetime", "level_1": "instrument"})
     df["datetime"] = pd.to_datetime(df["datetime"])
     df = df.sort_values(["instrument", "datetime"]).reset_index(drop=True)
     logger.info(f"Loaded returns: {len(df)} rows, {df['instrument'].nunique()} stocks, "
