@@ -312,6 +312,9 @@ def main():
             )
             art.save_metrics(metrics)
 
+            # Save model.pkl so predict_crash_daily.py can find it
+            art._write_pickle("model.pkl", model)
+
             validation = art.validate()
             print(f"\n  Artifact saved: {validation['artifact_dir']}")
             print(f"  Complete: {validation['complete']}")

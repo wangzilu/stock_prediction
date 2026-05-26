@@ -37,13 +37,21 @@ logger = logging.getLogger(__name__)
 
 
 def find_latest_crash_model() -> Path | None:
-    """Find the most recent crash_crash_5d experiment with a model.pkl."""
+    """Find the most recent crash_crash_5d experiment with a model.pkl.
+
+    Falls back to data/storage/crash_model/model.pkl if no experiment artifact
+    contains a model.
+    """
     pattern = str(EXPERIMENTS_DIR / "crash_crash_5d_*")
     candidates = sorted(glob.glob(pattern), reverse=True)
     for exp_dir in candidates:
         model_path = Path(exp_dir) / "model.pkl"
         if model_path.exists():
             return model_path
+    # Fallback: standalone crash model directory
+    fallback = DATA_DIR / "crash_model" / "model.pkl"
+    if fallback.exists():
+        return fallback
     return None
 
 
