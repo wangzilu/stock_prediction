@@ -74,6 +74,11 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         jobs.append(CronJob("global_chain_factors", "10 17 * * 1-5",
                 [py, str(scripts / "build_global_chain_factors.py")], "global_chain_factors.log",
                 network="none", timeout_sec=600))
+    # Sentiment: xueqiu + 同花顺 + 东财股吧
+    if (scripts / "collect_sentiment_daily.py").exists():
+        jobs.append(CronJob("sentiment_daily", "40 16 * * 1-5",
+                [py, str(scripts / "collect_sentiment_daily.py")], "sentiment_daily.log",
+                network="domestic", timeout_sec=600))
     jobs += [
         CronJob("llm_event_pipeline", "30 16 * * 1-5",
                 [py, str(scripts / "run_llm_event_pipeline.py")], "llm_event_pipeline.log",
