@@ -101,6 +101,20 @@ _ENTITY_PATTERNS: list[tuple[str, str]] = [
     (r"\b(?:solar)\s+(?:tariff|anti.?dumping|countervailing)\b", "Solar_Tariff"),
     (r"\b(?:germanium|gallium)\s+(?:export|restrict|ban|control)\b", "China_Export_Control"),
     (r"\b(?:rare\s+earth)\s+(?:export|restrict|ban|control)\b", "China_Export_Control"),
+    # Consumer / 家电
+    (r"\bLG\b", "LG"),
+    (r"\bWhirlpool\b", "Whirlpool"),
+    # Pharma / 创新药
+    (r"\bPfizer\b", "Pfizer"),
+    (r"\bRoche\b", "Roche"),
+    (r"\bNovartis\b", "Novartis"),
+    (r"\bAstraZeneca\b", "AstraZeneca"),
+    (r"\bModerna\b", "Moderna"),
+    (r"\bBioNTech\b", "BioNTech"),
+    # Defense / 军工
+    (r"\bLockheed\s*Martin\b", "Lockheed_Martin"),
+    (r"\bRaytheon\b", "Raytheon"),
+    (r"\bBAE\s*Systems?\b|\bBAE\b", "BAE"),
 ]
 
 

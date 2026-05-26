@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import sys
+from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -234,6 +235,52 @@ def check_guba(date: str) -> tuple[str, str]:
     return "✅", f"人气榜{n}只"
 
 
+def check_sentiment(date: str) -> tuple[str, str]:
+    """Check sentiment data collection status.
+
+    Checks:
+      1. data/storage/sentiment/YYYY-MM-DD.jsonl exists
+      2. Reports: n items, sources breakdown
+      3. Falls back to job_status.json for sentiment_daily
+    """
+    sentiment_path = DATA_DIR / "sentiment" / f"{date}.jsonl"
+
+    # Check job_status first
+    job_status, job_detail = check_log_for_today(
+        "sentiment_daily.log", date,
+        success_keywords=["saved", "collected", "items"],
+        fail_keywords=["failed", "error", "timeout"],
+        job_id="sentiment_daily",
+    )
+
+    if not sentiment_path.exists():
+        if job_status == "✅":
+            return "⚠️", f"job成功但文件不存在 {job_detail}"
+        return "❌", "情感数据文件不存在"
+
+    # Count items and sources
+    n_items = 0
+    sources = defaultdict(int)
+    with open(sentiment_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            n_items += 1
+            try:
+                obj = json.loads(line)
+                src = obj.get("source", "unknown")
+                sources[src] += 1
+            except json.JSONDecodeError:
+                pass
+
+    if n_items == 0:
+        return "⚠️", "情感数据文件为空"
+
+    src_breakdown = " ".join(f"{k}:{v}" for k, v in sorted(sources.items()))
+    return "✅", f"{n_items}条 {src_breakdown}"
+
+
 def check_promotion_eligibility() -> tuple[str, str]:
     """Check if shadow has enough data for promotion."""
     compare_path = DATA_DIR / "paper_shadow" / "daily_compare.jsonl"
@@ -308,7 +355,11 @@ def main():
     status, detail = check_guba(date)
     checks.append(("人气榜", status, detail))
 
-    # 7. Data update
+    # 7. Sentiment data
+    status, detail = check_sentiment(date)
+    checks.append(("情感数据", status, detail))
+
+    # 8. Data update
     status, detail = check_log_for_today(
         "data_update.log", date,
         success_keywords=["successfully", "instruments"],
@@ -317,11 +368,11 @@ def main():
     )
     checks.append(("数据更新", status, detail))
 
-    # 8. Shadow promotion eligibility
+    # 9. Shadow promotion eligibility
     status, detail = check_promotion_eligibility()
     checks.append(("Shadow晋升", status, detail))
 
-    # 9. Regime controller
+    # 10. Regime controller
     try:
         from signals.regime_controller import RegimeController
         rc = RegimeController()
@@ -337,7 +388,7 @@ def main():
     except Exception as e:
         checks.append(("Regime", "⚠️", f"计算失败: {e}"))
 
-    # 10. Registry status
+    # 11. Registry status
     try:
         from models.registry import ModelRegistry
         reg = ModelRegistry()

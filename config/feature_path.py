@@ -164,9 +164,11 @@ SUPPLEMENT_SOURCES = {
     "st_moneyflow": {
         "loader": "feature_merger._load_st_moneyflow",
         "parquet": "st_moneyflow.parquet",
-        "status": "available_not_promoted",
+        "status": "failed_gate",
         "pit_safe": True,
-        "notes": "Per-stock capital flow (buy/sell by size). BDay(1) lag enforced.",
+        "notes": ("Per-stock capital flow (buy/sell by size). BDay(1) lag enforced. "
+                  "All variants showed negative IC in tearsheet. Likely contrarian signal "
+                  "or size effect — retail buying = negative alpha. Not promoted."),
     },
     "northbound": {
         "loader": "feature_merger._load_northbound",
@@ -225,6 +227,12 @@ OVERLAY_SOURCES = {
         "usage": "overlay_gate",
         "notes": "Composite regime score from macro + micro signals. Used as position gate.",
     },
+    "holder_decrease": {
+        "status": "research_only",
+        "usage": "overlay_rerank",
+        "notes": ("24-split rolling gate PASS but marginal. Regime-weighted overlay FAIL. "
+                  "Keep as overlay candidate — do not promote to champion XGB features."),
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -248,12 +256,13 @@ PROMOTION_PIPELINE = [
 _CANDIDATE_STATUS: dict[str, int] = {
     # Supplement sources that have been through tearsheet but not further
     "st_daily_basic": 1,       # tearsheet done, residual IC pending
-    "st_moneyflow": 1,         # tearsheet done, residual IC pending
+    "st_moneyflow": -1,        # FAILED: all variants negative IC, contrarian/size effect
     "northbound": 1,           # tearsheet done, residual IC pending
     "fundamental_quality": 0,  # registered, tearsheet pending
     "fundamental_valuation": 0,  # registered, tearsheet pending
     "shareholder": 0,          # registered, tearsheet pending
     "macro": -1,               # PIT-unsafe, not registered
+    "holder_decrease": 4,      # 24-split marginal, overlay candidate only (research_only)
 }
 
 

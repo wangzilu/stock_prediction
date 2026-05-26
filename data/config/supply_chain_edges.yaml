@@ -799,3 +799,53 @@
 - {src_entity: Solar_Tariff, dst_stock: sh601012, dst_name: 隆基绿能, topic: solar, product: wafer_module, relation_type: policy_exposure, direction: -1, weight: 0.5, confidence: 0.7, source: 政策}
 - {src_entity: Solar_Tariff, dst_stock: sh600438, dst_name: 通威股份, topic: solar, product: polysilicon_cell, relation_type: policy_exposure, direction: -1, weight: 0.5, confidence: 0.7, source: 政策}
 - {src_entity: Solar_Tariff, dst_stock: sz002129, dst_name: TCL中环, topic: solar, product: wafer, relation_type: policy_exposure, direction: -1, weight: 0.4, confidence: 0.6, source: 政策}
+
+# ============================================================
+# Chain 7: Consumer / 家电链 (~10 edges)
+# peer_readthrough: 海外龙头业绩/趋势 → A股家电龙头
+# ============================================================
+
+- {src_entity: Samsung, dst_stock: sz000333, dst_name: 美的集团, topic: consumer_appliance, product: home_appliance, relation_type: peer_readthrough, direction: 1, weight: 0.4, confidence: 0.5, source: 行业逻辑}
+- {src_entity: Samsung, dst_stock: sh600690, dst_name: 海尔智家, topic: consumer_appliance, product: home_appliance, relation_type: peer_readthrough, direction: 1, weight: 0.4, confidence: 0.5, source: 行业逻辑}
+- {src_entity: Samsung, dst_stock: sz000651, dst_name: 格力电器, topic: consumer_appliance, product: air_conditioner, relation_type: peer_readthrough, direction: 1, weight: 0.3, confidence: 0.4, source: 行业逻辑}
+- {src_entity: Samsung, dst_stock: sz000100, dst_name: TCL科技, topic: consumer_appliance, product: display_panel, relation_type: peer_readthrough, direction: 1, weight: 0.5, confidence: 0.6, source: 行业逻辑}
+- {src_entity: LG, dst_stock: sz000333, dst_name: 美的集团, topic: consumer_appliance, product: home_appliance, relation_type: peer_readthrough, direction: 1, weight: 0.4, confidence: 0.5, source: 行业逻辑}
+- {src_entity: LG, dst_stock: sh600690, dst_name: 海尔智家, topic: consumer_appliance, product: home_appliance, relation_type: peer_readthrough, direction: 1, weight: 0.4, confidence: 0.5, source: 行业逻辑}
+- {src_entity: LG, dst_stock: sz000100, dst_name: TCL科技, topic: consumer_appliance, product: display_panel, relation_type: peer_readthrough, direction: 1, weight: 0.5, confidence: 0.6, source: 行业逻辑}
+- {src_entity: Whirlpool, dst_stock: sz000333, dst_name: 美的集团, topic: consumer_appliance, product: home_appliance, relation_type: peer_readthrough, direction: 1, weight: 0.5, confidence: 0.6, source: 行业逻辑}
+- {src_entity: Whirlpool, dst_stock: sh600690, dst_name: 海尔智家, topic: consumer_appliance, product: home_appliance, relation_type: peer_readthrough, direction: 1, weight: 0.5, confidence: 0.6, source: 行业逻辑}
+- {src_entity: Whirlpool, dst_stock: sz000651, dst_name: 格力电器, topic: consumer_appliance, product: air_conditioner, relation_type: peer_readthrough, direction: 1, weight: 0.4, confidence: 0.5, source: 行业逻辑}
+
+# ============================================================
+# Chain 8: 医药/创新药链 (~10 edges)
+# peer_readthrough + customer_supplier (CRO)
+# ============================================================
+
+- {src_entity: Pfizer, dst_stock: sh600276, dst_name: 恒瑞医药, topic: pharma, product: innovative_drug, relation_type: peer_readthrough, direction: 1, weight: 0.4, confidence: 0.5, source: 行业逻辑}
+- {src_entity: Roche, dst_stock: sh600276, dst_name: 恒瑞医药, topic: pharma, product: oncology_drug, relation_type: peer_readthrough, direction: 1, weight: 0.4, confidence: 0.5, source: 行业逻辑}
+- {src_entity: Novartis, dst_stock: sh600276, dst_name: 恒瑞医药, topic: pharma, product: innovative_drug, relation_type: peer_readthrough, direction: 1, weight: 0.3, confidence: 0.4, source: 行业逻辑}
+- {src_entity: Pfizer, dst_stock: sh603259, dst_name: 药明康德, topic: pharma, product: CRO_CDMO, relation_type: customer_supplier, direction: 1, weight: 0.6, confidence: 0.7, source: 公开信息}
+- {src_entity: Roche, dst_stock: sh603259, dst_name: 药明康德, topic: pharma, product: CRO_CDMO, relation_type: customer_supplier, direction: 1, weight: 0.6, confidence: 0.7, source: 公开信息}
+- {src_entity: AstraZeneca, dst_stock: sh603259, dst_name: 药明康德, topic: pharma, product: CRO_CDMO, relation_type: customer_supplier, direction: 1, weight: 0.5, confidence: 0.6, source: 公开信息}
+- {src_entity: Novartis, dst_stock: sh688235, dst_name: 百济神州, topic: pharma, product: oncology_license, relation_type: peer_readthrough, direction: 1, weight: 0.4, confidence: 0.5, source: 行业逻辑}
+- {src_entity: Moderna, dst_stock: sz300122, dst_name: 智飞生物, topic: pharma, product: vaccine, relation_type: peer_readthrough, direction: 1, weight: 0.4, confidence: 0.5, source: 行业逻辑}
+- {src_entity: BioNTech, dst_stock: sz300122, dst_name: 智飞生物, topic: pharma, product: mRNA_vaccine, relation_type: peer_readthrough, direction: 1, weight: 0.4, confidence: 0.5, source: 行业逻辑}
+- {src_entity: Moderna, dst_stock: sh688185, dst_name: 康希诺, topic: pharma, product: mRNA_platform, relation_type: peer_readthrough, direction: 1, weight: 0.5, confidence: 0.5, source: 行业逻辑}
+- {src_entity: BioNTech, dst_stock: sh688185, dst_name: 康希诺, topic: pharma, product: mRNA_platform, relation_type: peer_readthrough, direction: 1, weight: 0.5, confidence: 0.5, source: 行业逻辑}
+
+# ============================================================
+# Chain 9: 军工/国产替代链 (~10 edges)
+# policy_beneficiary: 制裁/出口管制反而利好国产替代
+# ============================================================
+
+- {src_entity: Lockheed_Martin, dst_stock: sh600760, dst_name: 中航沈飞, topic: defense, product: fighter_jet, relation_type: peer_readthrough, direction: 1, weight: 0.4, confidence: 0.5, source: 行业逻辑}
+- {src_entity: Lockheed_Martin, dst_stock: sh600893, dst_name: 航发动力, topic: defense, product: aero_engine, relation_type: peer_readthrough, direction: 1, weight: 0.4, confidence: 0.5, source: 行业逻辑}
+- {src_entity: Raytheon, dst_stock: sh600760, dst_name: 中航沈飞, topic: defense, product: military_aircraft, relation_type: peer_readthrough, direction: 1, weight: 0.3, confidence: 0.4, source: 行业逻辑}
+- {src_entity: Raytheon, dst_stock: sz002179, dst_name: 中航光电, topic: defense, product: military_connector, relation_type: peer_readthrough, direction: 1, weight: 0.4, confidence: 0.5, source: 行业逻辑}
+- {src_entity: BAE, dst_stock: sh600893, dst_name: 航发动力, topic: defense, product: aero_engine, relation_type: peer_readthrough, direction: 1, weight: 0.3, confidence: 0.4, source: 行业逻辑}
+- {src_entity: BAE, dst_stock: sz002179, dst_name: 中航光电, topic: defense, product: military_connector, relation_type: peer_readthrough, direction: 1, weight: 0.3, confidence: 0.4, source: 行业逻辑}
+- {src_entity: US_Export_Control, dst_stock: sz002025, dst_name: 航天电器, topic: defense, product: military_connector, relation_type: policy_beneficiary, direction: 1, weight: 0.6, confidence: 0.7, source: 政策}
+- {src_entity: US_Export_Control, dst_stock: sh600372, dst_name: 中航电子, topic: defense, product: avionics, relation_type: policy_beneficiary, direction: 1, weight: 0.6, confidence: 0.7, source: 政策}
+- {src_entity: US_Export_Control, dst_stock: sh600760, dst_name: 中航沈飞, topic: defense, product: fighter_jet, relation_type: policy_beneficiary, direction: 1, weight: 0.7, confidence: 0.8, source: 政策}
+- {src_entity: US_Export_Control, dst_stock: sh600893, dst_name: 航发动力, topic: defense, product: aero_engine, relation_type: policy_beneficiary, direction: 1, weight: 0.7, confidence: 0.8, source: 政策}
+- {src_entity: US_Export_Control, dst_stock: sz002179, dst_name: 中航光电, topic: defense, product: military_connector, relation_type: policy_beneficiary, direction: 1, weight: 0.6, confidence: 0.7, source: 政策}
