@@ -133,6 +133,9 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("shadow_chain_overlay", "45 18 * * 1-5",
                 [py, str(scripts / "shadow_supply_chain_overlay.py")], "shadow_chain_overlay.log",
                 network="none", timeout_sec=120),
+        CronJob("shadow_klen_overlay", "46 18 * * 1-5",
+                [py, str(scripts / "shadow_klen_overlay.py")], "shadow_klen_overlay.log",
+                network="none", timeout_sec=120),
         # --- Monitoring (none) ---
         CronJob("factor_decay_monitor", "47 18 * * 1-5",
                 [py, str(scripts / "monitor_factor_decay.py")], "factor_decay.log",
