@@ -475,20 +475,31 @@ class PaperOMS:
         return self._state_dir / f"filled_orders_{date}.json"
 
     def _load_and_filter_predictions(self, date: str):
-        """Load predictions, apply universe filter, return dict or None."""
+        """Load predictions, apply unified candidate sanitizer, return dict or None.
+
+        Previously called models.universe_filter.UniverseFilter which only
+        excluded ST + BJ — narrower than the training-time tradable_mask
+        (which also handles IPO<60d, 一字板, suspended, low liquidity). The
+        unified CandidateSanitizer brings inference-side filtering in line.
+        Quote data isn't reliably available at OMS load time (before market
+        open in some paths), so require_quote=False.
+        """
         predictions = self.load_predictions()
-        if predictions:
-            try:
-                from models.universe_filter import UniverseFilter
-                uf = UniverseFilter()
-                n_before = len(predictions)
-                predictions = uf.filter_predictions(predictions)
-                n_after = len(predictions)
-                if n_before != n_after:
-                    logger.info(f"  Universe filter: {n_before} -> {n_after} predictions")
-            except Exception as e:
-                logger.warning(f"  Universe filter failed (continuing unfiltered): {e}")
-        return predictions or None
+        if not predictions:
+            return None
+        try:
+            from factors.candidate_sanitizer import CandidateSanitizer
+            sanitizer = CandidateSanitizer(today=date, require_quote=False)
+            filtered = {}
+            for code, score in predictions.items():
+                ok, _reason = sanitizer.check(code, None)
+                if ok:
+                    filtered[code] = score
+            sanitizer.log_summary(label=f"paper_oms[{date}]")
+            return filtered or None
+        except Exception as e:
+            logger.warning(f"  Candidate sanitizer failed (continuing unfiltered): {e}")
+            return predictions or None
 
     def _load_crash_predictions(self, date: str) -> dict | None:
         """Try to load crash predictions from crash_predictions_latest.json.

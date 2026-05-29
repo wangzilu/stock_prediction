@@ -37,6 +37,8 @@ def main():
     group.add_argument("--reset", action="store_true", help="Reset paper trading")
     parser.add_argument("--date", type=str, default=None)
     parser.add_argument("--capital", type=float, default=1_000_000)
+    parser.add_argument("--force-stale", action="store_true",
+                        help="Run even if prediction freshness check fails (default: abort)")
     args = parser.parse_args()
 
     oms = PaperOMS(initial_capital=args.capital, mode="pending")
@@ -84,13 +86,21 @@ def main():
     date = args.date or datetime.now().strftime("%Y-%m-%d")
     logger.info(f"=== Paper Trading: {date} ===")
 
-    # --- Freshness check: warn if predictions are stale ---
+    # --- Freshness check: abort if predictions are stale ---
+    # Previously this only logged a warning and continued, generating fresh
+    # orders against an old signal. For live paper trading, that's the same
+    # silent-degradation pattern as the ST-leak / frozen-state bugs — looks
+    # successful while quietly bad. Hard-abort unless the user passes --force-stale.
     from scheduler.data_health import is_fresh
-    pred_fresh = (
-        is_fresh("lgb_after_close_smoke")
-    )
+    pred_fresh = is_fresh("lgb_after_close_smoke")
     if not pred_fresh:
-        logger.warning("Using stale predictions — no fresh prediction health found for today")
+        if not getattr(args, "force_stale", False):
+            logger.error(
+                "Refusing to run paper trading: no fresh prediction health for today "
+                "(lgb_after_close_smoke). Pass --force-stale to override."
+            )
+            sys.exit(2)
+        logger.warning("Continuing on stale predictions — --force-stale set")
 
     pnl = oms.run_daily(date)
 

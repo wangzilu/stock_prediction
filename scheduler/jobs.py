@@ -13,6 +13,7 @@ from data.collectors.gold import GoldCollector
 from data.collectors.sentiment import SentimentCollector
 from data.collectors.macro import MacroCollector
 from data.collectors.global_indices import GlobalIndicesCollector
+from factors.candidate_sanitizer import CandidateSanitizer
 from factors.sentiment import SentimentScorer
 from signals.scorer import SignalScorer
 from signals.risk_monitor import RiskMonitor
@@ -535,6 +536,9 @@ class DailyPipeline:
     def _build_evening_stock_forecasts(self, lgb_preds: dict, limit: int = 10) -> dict[str, list[dict]]:
         """Build short/mid/long/composite stock forecast lists for evening report."""
         spot = self._spot_lookup()
+        # Quote may be None when spot collector failed; require_quote=False
+        # lets the ST/code rules still apply while skipping suspended/一字板.
+        sanitizer = self._make_sanitizer(require_quote=False)
         rows = []
         if spot:
             universe = [(code, quote) for code, quote in spot.items()]
@@ -542,6 +546,10 @@ class DailyPipeline:
             universe = [(code, None) for code in lgb_preds]
 
         for code, quote in universe:
+            name = str(quote.get("名称", "")) if quote is not None else ""
+            ok, _reason = sanitizer.check(code, name, quote=quote)
+            if not ok:
+                continue
             has_lgb = code in lgb_preds
             change_pct = _finite_float(quote.get("涨跌幅")) if quote is not None else 0.0
             volume = _finite_float(quote.get("成交量")) if quote is not None else 0.0
@@ -553,7 +561,6 @@ class DailyPipeline:
             )
             if model_score <= 0:
                 continue
-            name = str(quote.get("名称", "")) if quote is not None else ""
             price = _finite_float(quote.get("最新价")) if quote is not None else 0.0
             liquidity_score = min(volume / 1_000_000.0, 1.0)
             short_expected = round(
@@ -581,6 +588,7 @@ class DailyPipeline:
                 }
             )
 
+        sanitizer.log_summary(label="evening_stock_forecasts")
         return {
             "短线": sorted(rows, key=lambda item: (item["has_lgb"], item["short_expected"], item["model_score"]), reverse=True)[:limit],
             "中线": sorted(rows, key=lambda item: (item["has_lgb"], item["mid_score"]), reverse=True)[:limit],
@@ -730,33 +738,19 @@ class DailyPipeline:
             return None
         return payload
 
-    def _is_st_or_excluded(self, name: str, code: str) -> bool:
-        """Return True if this stock should be excluded from recommendations.
+    def _make_sanitizer(self, *, require_quote: bool = True,
+                        max_prediction_age_days: int = 3) -> CandidateSanitizer:
+        """Build a CandidateSanitizer for the current pipeline call.
 
-        Mirrors the training-time tradable_mask filter (which excludes ST /
-        *ST / 退市整理), so that recommendation inference doesn't surface
-        stocks the model was never trained to score safely. The previous
-        implementation only enforced this in training, leaving inference to
-        push ST names whenever their model score happened to be high.
+        Per-call instance so reject reasons / counts are scoped to this
+        recommendation cycle and logged in summary form.
         """
-        nm = (name or "").strip()
-        if nm.startswith("ST") or nm.startswith("*ST") or "退" in nm:
-            return True
-        # Membership in st_stock_list.json (refreshed weekly via fetch_st_list.py).
-        # Cache the set on first call.
-        if getattr(self, "_st_set_cache", None) is None:
-            try:
-                import json as _json_st
-                from config.settings import DATA_DIR
-                st_path = DATA_DIR / "st_stock_list.json"
-                self._st_set_cache = (
-                    set(s.upper() for s in _json_st.loads(st_path.read_text()))
-                    if st_path.exists() else set()
-                )
-            except Exception as e:
-                logger.warning("ST list load failed (filter degrades open): %s", e)
-                self._st_set_cache = set()
-        return (code or "").upper() in self._st_set_cache
+        today = datetime.now().strftime("%Y-%m-%d")
+        return CandidateSanitizer(
+            today=today,
+            require_quote=require_quote,
+            max_prediction_age_days=max_prediction_age_days,
+        )
 
     def _candidates_from_stock_snapshot(
         self,
@@ -766,7 +760,7 @@ class DailyPipeline:
     ) -> list[dict]:
         """Convert a persisted 22:00 stock snapshot into morning candidates."""
         candidates = []
-        n_st_skipped = 0
+        sanitizer = self._make_sanitizer(require_quote=False)
         for item in snapshot.get("items", []):
             if not isinstance(item, dict):
                 continue
@@ -774,8 +768,8 @@ class DailyPipeline:
             if code[:2] not in ("SH", "SZ", "BJ"):
                 continue
             name = str(item.get("name") or code[-6:])
-            if self._is_st_or_excluded(name, code):
-                n_st_skipped += 1
+            ok, _reason = sanitizer.check(code, name)
+            if not ok:
                 continue
             short_score = _finite_float(item.get("model_score", item.get("lgb_score")))
             if short_score <= 0:
@@ -801,14 +795,13 @@ class DailyPipeline:
                 candidate["next_day_change_pct"] = self._estimate_next_day_change_pct(candidate)
             candidates.append(candidate)
 
-        if n_st_skipped:
-            logger.info("Snapshot candidates: filtered %d ST/excluded stocks", n_st_skipped)
+        sanitizer.log_summary(label="snapshot_candidates")
         return candidates
 
     def _build_stock_candidates(self, lgb_preds: dict, stock_macro: float) -> list[dict]:
         """Build A-share candidates with model-covered stocks preferred when available."""
         candidates = []
-        n_st_skipped = 0
+        sanitizer = self._make_sanitizer(require_quote=True)
         self.market_collector._load_spot_cache()
         spot = self.market_collector._spot_cache
         lgb_available = bool(lgb_preds) and getattr(self, "_lgb_status", {}).get("status") == "ok"
@@ -818,11 +811,11 @@ class DailyPipeline:
             for code, name, market in WATCHLIST:
                 if market != MARKET_STOCK:
                     continue
-                if self._is_st_or_excluded(name, code):
-                    n_st_skipped += 1
-                    continue
                 quote = self._get_quote(code, market)
                 if not quote:
+                    continue
+                ok, _reason = sanitizer.check(code, name, quote=quote)
+                if not ok:
                     continue
                 has_lgb = code in lgb_preds
                 change_pct = _finite_float(quote.get("change_pct"))
@@ -865,8 +858,8 @@ class DailyPipeline:
 
                 qlib_code = self._qlib_code_from_spot_code(code_num)
                 name = str(row.get("名称", code_num))
-                if self._is_st_or_excluded(name, qlib_code):
-                    n_st_skipped += 1
+                ok, _reason = sanitizer.check(qlib_code, name, quote=row.to_dict())
+                if not ok:
                     continue
                 has_lgb = qlib_code in lgb_preds
 
@@ -906,12 +899,12 @@ class DailyPipeline:
             reverse=True,
         )
         logger.info(
-            "Screened %s A-share candidates from spot (%s model scores, lgb_available=%s, st_skipped=%d)",
+            "Screened %s A-share candidates from spot (%s model scores, lgb_available=%s)",
             len(candidates),
             len(lgb_preds),
             lgb_available,
-            n_st_skipped,
         )
+        sanitizer.log_summary(label="build_stock_candidates")
         return candidates
 
     def _fallback_quant_score(self, *, change_pct: float, volume: float = 0.0, macro_score: float = 0.0) -> float:
@@ -934,13 +927,22 @@ class DailyPipeline:
     ) -> tuple[object, str]:
         """Build the 14:30 next-open forecast for the requested A-share indices."""
         sorted_preds = sorted(lgb_preds.items(), key=lambda item: item[1], reverse=True)
+        # Sanitize before slicing — index sentiment shouldn't be contaminated by
+        # ST/BJ/suspended/一字板 tickers even though they're not user-pushed.
+        spot = self._spot_lookup()
+        sanitizer = self._make_sanitizer(require_quote=False)
+        sanitized_preds = [
+            (code, score) for code, score in sorted_preds
+            if sanitizer.check(code, str((spot.get(code) or {}).get("名称", "")), quote=spot.get(code))[0]
+        ]
+        sanitizer.log_summary(label="intraday_index_forecast")
         market_prediction = self.index_predictor.predict(
             global_indices=global_index_data,
             geo_factors=geo_factors,
             crypto_data=crypto_data,
             gold_data=gold_data,
-            top_bullish=[{"code": code, "score": score} for code, score in sorted_preds[:10]],
-            top_bearish=[{"code": code, "score": score} for code, score in sorted_preds[-5:]],
+            top_bullish=[{"code": code, "score": score} for code, score in sanitized_preds[:10]],
+            top_bearish=[{"code": code, "score": score} for code, score in sanitized_preds[-5:]],
             lgb_status=getattr(self, "_lgb_status", {}),
         )
         segments = self.index_predictor.predict_a_share_segments(
@@ -1011,6 +1013,13 @@ class DailyPipeline:
         now = datetime.now()
         global_index_data = global_index_data if isinstance(global_index_data, dict) else {}
         sorted_preds = sorted(lgb_preds.items(), key=lambda item: item[1], reverse=True)
+        spot = self._spot_lookup()
+        sanitizer = self._make_sanitizer(require_quote=False)
+        sanitized_preds = [
+            (code, score) for code, score in sorted_preds
+            if sanitizer.check(code, str((spot.get(code) or {}).get("名称", "")), quote=spot.get(code))[0]
+        ]
+        sanitizer.log_summary(label="morning_final_index_forecast")
         market_prediction = self.index_predictor.predict(
             as_of=now,
             target_date=now.strftime("%Y-%m-%d"),
@@ -1018,8 +1027,8 @@ class DailyPipeline:
             geo_factors=geo_factors,
             crypto_data=crypto_data,
             gold_data=gold_data,
-            top_bullish=[{"code": code, "score": score} for code, score in sorted_preds[:10]],
-            top_bearish=[{"code": code, "score": score} for code, score in sorted_preds[-5:]],
+            top_bullish=[{"code": code, "score": score} for code, score in sanitized_preds[:10]],
+            top_bearish=[{"code": code, "score": score} for code, score in sanitized_preds[-5:]],
             lgb_status=getattr(self, "_lgb_status", {}),
         )
         segments = self.index_predictor.predict_a_share_segments(
@@ -1043,6 +1052,7 @@ class DailyPipeline:
     def _build_intraday_buy_candidates(self, lgb_preds: dict, limit: int = 10) -> list[dict]:
         """Build 14:30 strong-buy candidates from model scores plus live tape."""
         spot = self._spot_lookup()
+        sanitizer = self._make_sanitizer(require_quote=True)
         rows = []
         for code, score in lgb_preds.items():
             short_score = _finite_float(score)
@@ -1051,6 +1061,9 @@ class DailyPipeline:
 
             quote = spot.get(code)
             if quote is None:
+                continue
+            ok, _reason = sanitizer.check(code, str(quote.get("名称", "")), quote=quote)
+            if not ok:
                 continue
 
             change_pct = _finite_float(quote.get("涨跌幅"))
@@ -1086,6 +1099,7 @@ class DailyPipeline:
                 }
             )
 
+        sanitizer.log_summary(label="intraday_buy_candidates")
         return sorted(
             rows,
             key=lambda item: (
@@ -2031,10 +2045,17 @@ class DailyPipeline:
         geo = self._fetch_geo_factors()
         lgb_preds = self._load_lgb_predictions()
 
-        # Top bullish and bearish from LGB
+        # Top bullish and bearish from LGB — sanitized for ST/BJ/suspended
         sorted_preds = sorted(lgb_preds.items(), key=lambda x: x[1], reverse=True)
-        top_bull = sorted_preds[:10]
-        top_bear = sorted_preds[-5:]
+        spot = self._spot_lookup()
+        idx_sanitizer = self._make_sanitizer(require_quote=False)
+        sanitized_preds = [
+            (code, score) for code, score in sorted_preds
+            if idx_sanitizer.check(code, str((spot.get(code) or {}).get("名称", "")), quote=spot.get(code))[0]
+        ]
+        idx_sanitizer.log_summary(label="evening_index_top_bull_bear")
+        top_bull = sanitized_preds[:10]
+        top_bear = sanitized_preds[-5:]
         stock_forecast_groups = self._build_evening_stock_forecasts(lgb_preds, limit=10)
         stock_forecast_block = self._format_evening_stock_forecasts(stock_forecast_groups)
 

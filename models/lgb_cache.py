@@ -94,7 +94,16 @@ def load_prediction_cache(
 
     latest_date = str(payload.get("latest_date", ""))
     age_days = _date_age_days(latest_date)
-    if age_days is not None and age_days > max_age_days:
+    if age_days is None:
+        # Fail-closed: an unparseable / empty latest_date used to be accepted
+        # silently (research-time leniency). For live recommendation + paper
+        # OMS that meant cache of unknown age could drive trading decisions
+        # whenever live inference failed. Reject explicitly.
+        raise RuntimeError(
+            f"LGB prediction cache latest_date={latest_date!r} unparseable — "
+            f"refusing to use a prediction file with no provenance date"
+        )
+    if age_days > max_age_days:
         raise RuntimeError(
             f"LGB prediction cache latest_date={latest_date} is {age_days} days old "
             f"(max={max_age_days})"
