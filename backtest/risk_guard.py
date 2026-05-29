@@ -21,6 +21,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -70,6 +71,10 @@ class RiskGuard:
         self.cooldown_st_until_clear = cooldown_st_until_clear
         self.drawdown_recovery_days = drawdown_recovery_days
 
+        # Cached RL stop-loss agent (lazy-loaded on first use)
+        self._rl_agent: Optional[object] = None
+        self._rl_agent_checked: bool = False
+
         # Persistent state — isolated per state_dir to prevent
         # champion/shadow/backtest from polluting each other
         if state_dir:
@@ -117,6 +122,9 @@ class RiskGuard:
         # === L1.6: Supply chain risk checks ===
         if chain_factors is not None:
             self._check_supply_chain_risk(positions, chain_factors, date, constraints)
+
+        # === L1.7: RL adaptive stop ===
+        self._check_rl_stop_loss(positions, prices, date, constraints)
 
         # === L2: Portfolio drawdown state machine ===
         self._check_drawdown(constraints, date)
@@ -521,6 +529,120 @@ class RiskGuard:
                 constraints.risk_reasons.setdefault(
                     code,
                     f"崩盘概率{prob:.1%}>30%，关注风险"
+                )
+
+    # ---- L1.7: RL adaptive stop ----
+
+    def _load_rl_agent(self):
+        """Lazy-load the DQN stop-loss agent. Returns None if unavailable."""
+        if self._rl_agent_checked:
+            return self._rl_agent
+        self._rl_agent_checked = True
+
+        model_path = DATA_DIR.parent / "models" / "rl_stop_loss_dqn.pt"
+        if not model_path.exists():
+            logger.debug("RL stop-loss model not found at %s — skipping", model_path)
+            return None
+
+        try:
+            from models.rl_stop_loss import StopLossAgent
+            agent = StopLossAgent()
+            agent.load(str(model_path))
+            self._rl_agent = agent
+            logger.info("RL stop-loss agent loaded from %s", model_path)
+            return agent
+        except Exception as e:
+            logger.warning("Failed to load RL stop-loss agent: %s", e)
+            return None
+
+    def _check_rl_stop_loss(self, positions: dict, prices: dict,
+                            date: str, constraints: RiskConstraints):
+        """Use RL agent to suggest exits for held positions.
+
+        For each held position, builds the 8-dim state vector and queries
+        the trained DQN agent. If the agent recommends exit, the stock is
+        added to pending_exit (soft exit, not force sell).
+
+        Only runs if the model file exists at data/models/rl_stop_loss_dqn.pt.
+        """
+        agent = self._load_rl_agent()
+        if agent is None:
+            return
+
+        try:
+            from models.rl_stop_loss import should_exit
+        except ImportError:
+            return
+
+        for code, pos in positions.items():
+            # Skip stocks already flagged
+            if code in constraints.force_sell or code in constraints.pending_exit:
+                continue
+
+            current_price = prices.get(code)
+            if not current_price or current_price <= 0:
+                continue
+
+            avg_price = pos.get("avg_price", current_price)
+            if avg_price <= 0:
+                continue
+
+            pnl_pct = (current_price - avg_price) / avg_price
+            holding_days = pos.get("holding_days", 1)
+
+            # Track peak for drawdown_from_peak
+            peak_key = f"peak_{code}"
+            peak = self._state.get(peak_key, avg_price)
+            if current_price > peak:
+                peak = current_price
+                self._state[peak_key] = peak
+            max_profit_pct = (peak - avg_price) / avg_price if avg_price > 0 else 0.0
+            drawdown_from_peak = pnl_pct - max_profit_pct if max_profit_pct > 0 else min(0.0, pnl_pct)
+
+            # Build 8-dim state dict
+            state = {
+                "unrealized_pnl_pct": pnl_pct,
+                "holding_days": holding_days / 60.0,  # normalized same as env
+                "volatility_20d": 0.02,   # default; ideally from feature cache
+                "momentum_5d": 0.0,       # default
+                "volume_ratio": 0.0,      # centered at 0
+                "regime_risk": self._state.get("drawdown_pct", 0.0) * -1.0,  # proxy
+                "max_profit_pct": max_profit_pct,
+                "drawdown_from_peak": drawdown_from_peak,
+            }
+
+            # Try to enrich volatility from feature cache
+            try:
+                cache = pd.read_parquet(
+                    DATA_DIR / "feature_cache_174_holder_regime_ma.parquet",
+                    columns=["STD20", "MOM5"],
+                )
+                code_lower = code.lower()
+                target = pd.Timestamp(date)
+                dates = cache.index.get_level_values(0)
+                avail = dates[dates <= target]
+                if not avail.empty:
+                    use_date = avail.max()
+                    if (use_date, code_lower) in cache.index:
+                        row = cache.loc[(use_date, code_lower)]
+                        v = float(row.get("STD20", np.nan))
+                        m = float(row.get("MOM5", np.nan))
+                        if np.isfinite(v):
+                            state["volatility_20d"] = v
+                        if np.isfinite(m):
+                            state["momentum_5d"] = m
+            except Exception:
+                pass  # use defaults
+
+            if should_exit(agent, state):
+                constraints.pending_exit.append(code)
+                constraints.risk_reasons[code] = (
+                    f"RL止损: pnl={pnl_pct:.1%}, 持仓{holding_days}天, "
+                    f"峰值利润{max_profit_pct:.1%}, 回撤{drawdown_from_peak:.1%}"
+                )
+                logger.info(
+                    "RL stop-loss suggests exit for %s (pnl=%.1f%%, days=%d)",
+                    code, pnl_pct * 100, holding_days,
                 )
 
     # ---- L1.6: Supply chain risk ----
