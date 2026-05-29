@@ -23,7 +23,7 @@ import requests
 logger = logging.getLogger(__name__)
 
 # LLM config — uses MiniMax (domestic, cheap)
-MINIMAX_API_URL = "https://api.minimax.chat/v1/text/chatcompletion_v2"
+MINIMAX_API_URL = "https://api.minimaxi.chat/v1/text/chatcompletion_v2"
 
 SYSTEM_PROMPT = """You are a supply chain analyst. Given a news headline, determine if it describes a supply chain event that could affect A-share companies.
 
