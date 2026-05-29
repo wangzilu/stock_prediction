@@ -65,10 +65,18 @@ class SignalScorer:
         # source (guba heat contrarian overlay) after 60+ day accumulation.
         weight_macro: float = 0.0,  # Demoted: LLM geo 33% accuracy, worse than random
     ):
-        self.weight_short = weight_short
-        self.weight_mid = weight_mid
-        self.weight_sentiment = weight_sentiment
-        self.weight_macro = weight_macro
+        # Normalize so the weighted sum maps a unit-strength stock to a
+        # unit-magnitude final score. Without normalization, weights summing
+        # to 0.7 (current default: short=0.4 mid=0.3 sent=0 macro=0) shrink
+        # every score by 30%, systematically pushing strong-bull picks
+        # under the "强烈推荐 >= 0.7" threshold.
+        total = float(weight_short) + float(weight_mid) + float(weight_sentiment) + float(weight_macro)
+        if total <= 0:
+            raise ValueError("SignalScorer requires at least one non-zero weight")
+        self.weight_short = weight_short / total
+        self.weight_mid = weight_mid / total
+        self.weight_sentiment = weight_sentiment / total
+        self.weight_macro = weight_macro / total
 
     def score_stock(
         self,

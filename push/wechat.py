@@ -1,6 +1,9 @@
+import logging
 import os
 import requests
 from config.settings import PUSHPLUS_TOKEN
+
+logger = logging.getLogger(__name__)
 
 
 class WeChatPusher:
@@ -35,19 +38,34 @@ class WeChatPusher:
             title: Message title
 
         Returns:
-            True if sent successfully, False otherwise
+            True if sent successfully, False otherwise.
+
+        Failure modes are now LOGGED at WARNING/ERROR rather than swallowed
+        silently — callers (daily_health_check etc.) historically logged
+        "Push sent" without checking the return value, so a 24-hour push
+        outage was invisible to ops.
         """
         try:
             payload = self._build_payload(content, title)
             resp = requests.post(self.url, json=payload, timeout=10)
 
-            if resp.status_code == 200:
-                data = resp.json()
-                return data.get("code", -1) == 200
+            if resp.status_code != 200:
+                logger.warning(
+                    "WeChat push HTTP %s: %s", resp.status_code, resp.text[:200]
+                )
+                return False
 
-            return False
+            data = resp.json()
+            code = data.get("code", -1)
+            if code != 200:
+                logger.warning(
+                    "WeChat push API error code=%s msg=%s", code, data.get("msg", "")
+                )
+                return False
+            return True
 
-        except Exception:
+        except Exception as e:
+            logger.error("WeChat push exception: %r", e)
             return False
 
     def send_recommendation(self, report: str) -> bool:

@@ -32,6 +32,16 @@ DATA_DIR = PROJECT_ROOT / "data" / "storage"
 LOGS_DIR = PROJECT_ROOT / "logs"
 
 
+def _date_gap_days(check_date: str, last_date: str) -> int | None:
+    """Calendar-day gap between two YYYY-MM-DD strings, or None on parse error."""
+    try:
+        c = datetime.strptime(str(check_date)[:10], "%Y-%m-%d")
+        l = datetime.strptime(str(last_date)[:10], "%Y-%m-%d")
+        return (c - l).days
+    except (ValueError, TypeError):
+        return None
+
+
 def check_log_for_today(log_name: str, date: str, success_keywords: list,
                         fail_keywords: list = None,
                         job_id: str = None) -> tuple[str, str]:
@@ -129,6 +139,11 @@ def check_paper_trading(date: str) -> tuple[str, str]:
         last = history[-1]
         last_date = last.get("date", "")
         ret = last.get("daily_return", 0)
+        # Freshness gate: PnL history older than 3 calendar days from the
+        # check date is the stagnation pattern we hit 5/22→5/29.
+        gap = _date_gap_days(date, last_date)
+        if gap is not None and gap > 3:
+            return "⚠️", f"持仓{n_pos}只 市值{value:,.0f} {last_date}收益{ret:+.2%} 已 {gap} 天未更新"
         return "✅", f"持仓{n_pos}只 市值{value:,.0f} {last_date}收益{ret:+.2%}"
     return "⚠️", f"持仓{n_pos}只 市值{value:,.0f} 无历史记录"
 
@@ -426,8 +441,11 @@ def main():
     if not args.no_push:
         try:
             from push.wechat import WeChatPusher
-            WeChatPusher().send(msg, title="系统健康检查")
-            logger.info("  Push sent")
+            ok = WeChatPusher().send(msg, title="系统健康检查")
+            if ok:
+                logger.info("  Push sent")
+            else:
+                logger.error("  Push send returned False — message not delivered")
         except Exception as e:
             logger.warning(f"  Push failed: {e}")
 

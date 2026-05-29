@@ -5,7 +5,7 @@ import json
 import logging
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -53,6 +53,33 @@ class JobStatusStore:
         self.save(payload)
 
 
+def _reap_orphaned_running(payload: dict, max_age_hours: int = 24) -> int:
+    """Mark any 'running' entries older than max_age_hours as 'orphaned'.
+
+    Prevents the 21-day 'running' phantoms we saw in job_status.json — long-
+    dead processes whose status was never updated because they exited via
+    SIGKILL / Ctrl-C / OOM. Subsequent runs (including this one) discover
+    them on load and replace the row.
+    """
+    jobs = payload.get("jobs", {})
+    n = 0
+    cutoff = datetime.now() - timedelta(hours=max_age_hours)
+    for jid, info in jobs.items():
+        if info.get("status") != "running":
+            continue
+        started_iso = info.get("started_at", "")
+        try:
+            started_dt = datetime.fromisoformat(started_iso[:19])
+        except (ValueError, TypeError):
+            continue
+        if started_dt < cutoff:
+            info["status"] = "orphaned"
+            info["finished_at"] = _now()
+            info["error"] = f"reaped after {max_age_hours}h with no terminal update"
+            n += 1
+    return n
+
+
 def run_with_status(
     job_id: str,
     func: Callable[[], Any],
@@ -64,6 +91,11 @@ def run_with_status(
     started = time.time()
     started_at = _now()
     payload = store.load()
+    reaped = _reap_orphaned_running(payload)
+    if reaped:
+        store.save(payload)
+        logger.warning("job_status: reaped %d orphaned 'running' entry(ies)", reaped)
+        payload = store.load()
     previous = payload.setdefault("jobs", {}).get(job_id, {})
     run_count = int(previous.get("run_count", 0)) + 1
     store.update_job(
