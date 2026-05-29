@@ -169,7 +169,10 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
         return False
 
     # Step 1.5: Filter news through event_filter (Phase 4T-3)
+    # Writes filtered output to a SEPARATE file; the raw daily_news/ file is
+    # preserved untouched (downstream backfill + health_check depend on it).
     logger.info("[Step 1.5/3] Filtering news via event_filter...")
+    filtered_path = news_path  # fallback if filter is unavailable
     try:
         from factors.event_filter import filter_candidates, select_for_llm
         import json as _json_filter
@@ -195,10 +198,11 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
                     f"  Filtered {total_before} items -> {total_after} for LLM extraction"
                 )
 
-                # Overwrite news file with filtered items only
-                with open(news_path, "w", encoding="utf-8") as f:
+                filtered_dir = news_path.parent.parent / "daily_news_filtered"
+                filtered_dir.mkdir(parents=True, exist_ok=True)
+                filtered_path = filtered_dir / news_path.name
+                with open(filtered_path, "w", encoding="utf-8") as f:
                     for item in selected:
-                        # Remove internal scoring fields before writing
                         item.pop("priority_score", None)
                         item.pop("must_send", None)
                         f.write(_json_filter.dumps(item, ensure_ascii=False) + "\n")
@@ -215,6 +219,10 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
         logger.warning(
             "  event_filter failed (non-fatal, using unfiltered news): %s", e
         )
+
+    # From here on, downstream LLM extraction reads the filtered file (or raw
+    # if the filter step bailed out).
+    news_path = filtered_path
 
     # Step 2: Extract events via LLM (120-min timeout for full-A 5000 stocks)
     logger.info("[Step 2/3] Extracting events via MiniMax LLM...")
