@@ -96,9 +96,21 @@ def load_chain_factors(target_date: str) -> pd.DataFrame:
     if dt in dates:
         chain_today = df.xs(dt, level="datetime")
     else:
-        # Fall back to the latest available date
+        # Fall back to latest available date — but enforce a 5-business-day
+        # staleness cap. Beyond that, chain events stop describing the current
+        # tape (e.g. relevant export-control headlines age out within a week),
+        # so silently riding a 10+ day-old factor poisons shadow comparisons.
         latest = dates.max()
-        logger.warning("No chain factors for %s, using latest: %s", target_date, latest)
+        gap = (dt - latest).days
+        if gap > 5:
+            logger.error(
+                "Chain factors for %s missing AND latest available (%s) is %d days stale "
+                "(cap=5) — returning empty overlay so shadow doesn't ride dead headlines.",
+                target_date, latest, gap,
+            )
+            return pd.DataFrame()
+        logger.warning("No chain factors for %s, using latest: %s (gap=%d days)",
+                       target_date, latest, gap)
         chain_today = df.xs(latest, level="datetime")
 
     chain_today.index = chain_today.index.str.upper()
