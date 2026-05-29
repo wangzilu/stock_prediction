@@ -4,14 +4,16 @@ Usage:
     python scripts/run_with_status.py --job-id morning -- python main.py --morning
 
 Cron-time upstream gate: if --enforce-deps is set, looks up the job's upstream
-dependencies in scheduler.job_deps.JOB_DEPS and refuses to run when any
-upstream hasn't successfully completed for today. Exits with code 75
-(EX_TEMPFAIL) so cron retries later or the next-day pass picks it up cleanly.
+dependencies in scheduler.job_deps.JOB_DEPS and POLLS them until ready or the
+wait budget expires. Standard crontab does NOT retry on non-zero exit codes,
+so a single short-circuit check would leave downstream jobs unrun for the
+entire day if an upstream is merely slow. The polling loop sleeps in 60s
+increments up to --dep-wait-seconds (default 1800 = 30 min).
 
-mark_complete is called on every exit path so check_upstream sees a clean
-DAG state — previously the per-job status files in data/storage/job_status/
-were never written by this wrapper, so check_upstream always returned ready
-when the daily files were missing.
+After ready, runs the wrapped command and writes mark_complete on every
+exit path so check_upstream sees a clean DAG state — previously the per-job
+status files in data/storage/job_status/ were never written by this wrapper,
+so check_upstream always returned ready when the daily files were missing.
 """
 from __future__ import annotations
 
@@ -19,6 +21,7 @@ import argparse
 import logging
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -43,6 +46,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--enforce-deps", action="store_true",
         help="Refuse to run when upstream deps are missing for today (cron use)",
     )
+    parser.add_argument(
+        "--dep-wait-seconds", type=int, default=1800,
+        help="When --enforce-deps is set, max wall-clock seconds to wait for "
+             "upstream to complete before giving up (default 1800 = 30 min). "
+             "Polls every 60s.",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     if args.command and args.command[0] == "--":
@@ -52,18 +61,38 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _wait_for_upstream(job_id: str, today: str, max_wait_sec: int) -> bool:
+    """Poll upstream readiness up to max_wait_sec, returning True when ready."""
+    deadline = time.time() + max_wait_sec
+    poll_interval = 60
+    last_logged_missing: tuple = ()
+    while True:
+        deps = check_upstream(job_id, today)
+        if deps["ready"]:
+            return True
+        missing = tuple(deps["missing"])
+        if missing != last_logged_missing:
+            logger.warning(
+                "Upstream not ready for %s on %s: missing=%s completed=%s — waiting",
+                job_id, today, list(missing), deps["completed"],
+            )
+            last_logged_missing = missing
+        if time.time() >= deadline:
+            logger.error(
+                "Upstream wait budget (%ds) exhausted for %s on %s, missing=%s — refusing to run",
+                max_wait_sec, job_id, today, list(missing),
+            )
+            return False
+        time.sleep(poll_interval)
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
     today = datetime.now().strftime("%Y-%m-%d")
 
     if args.enforce_deps:
-        deps = check_upstream(args.job_id, today)
-        if not deps["ready"]:
-            logger.error(
-                "Upstream gate blocked %s on %s: missing=%s completed=%s",
-                args.job_id, today, deps["missing"], deps["completed"],
-            )
-            return 75  # EX_TEMPFAIL — cron will retry next minute
+        if not _wait_for_upstream(args.job_id, today, args.dep_wait_seconds):
+            return 75  # EX_TEMPFAIL — semantically "try again later"
 
     def _run() -> None:
         result = subprocess.run(

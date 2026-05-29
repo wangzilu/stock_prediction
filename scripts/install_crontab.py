@@ -124,9 +124,14 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                 [py, str(scripts / "train_lgb.py")], "lgb_after_close_train.log",
                 network="none", timeout_sec=7200),
         # --- Feature cache rebuild (depends on qlib_data_update + fund_flow_update) ---
+        # qlib_data_update 17:45 + fund_flow_update 17:55 (timeout 1800s).
+        # In the worst case fund_flow runs until ~18:25, so the cache rebuild
+        # must wait for it via the upstream gate or it'll build on stale flows.
+        # enforce_deps=True makes run_with_status poll until both upstreams have
+        # successfully completed (up to 30 min by default).
         CronJob("feature_cache_rebuild", "25 18 * * 1-5",
                 [py, str(scripts / "build_feature_cache.py"), "--all"], "feature_cache_rebuild.log",
-                network="domestic", timeout_sec=1800, critical=True),
+                network="domestic", timeout_sec=1800, critical=True, enforce_deps=True),
         # --- Prediction + Paper (none, critical) ---
         # Smoke depends on feature_cache_rebuild; downstream paper/shadow
         # opt into --enforce-deps so stale upstream blocks rather than

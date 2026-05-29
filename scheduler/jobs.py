@@ -839,8 +839,11 @@ class DailyPipeline:
     def _load_crash_probs_for_sanitizer(self) -> dict | None:
         """Read crash_predictions_latest.json and return {code_upper: prob}.
 
-        Cached on the instance; mtime-checked. Returns None if file missing
-        or older than 3 days (sanitizer treats None as 'no filter applied').
+        Cached on the instance; staleness measured against the pipeline's
+        target_date (set by run_daily_recommendation) so backfill / shadow
+        replay correctly disables crash hard-block when the prediction file
+        is from a different epoch than the signal date. Falls back to
+        wall-clock today only when no target_date is recorded.
         """
         from config.settings import DATA_DIR
         cached = getattr(self, "_crash_probs_cache", None)
@@ -853,12 +856,6 @@ class DailyPipeline:
         try:
             payload = json.loads(path.read_text())
             pred_date = payload.get("date", "")
-            # Fail-CLOSED on bad/missing date: crash hard-block is a
-            # safety signal, so an unverifiable provenance date means we
-            # disable it rather than silently apply predictions from an
-            # unknown vintage. (Previous behaviour: pass-through and
-            # apply anyway, which could mis-reject candidates from a
-            # week-old file.)
             try:
                 pd_dt = datetime.strptime(str(pred_date)[:10], "%Y-%m-%d")
             except (ValueError, TypeError):
@@ -868,11 +865,16 @@ class DailyPipeline:
                 )
                 self._crash_probs_cache = None
                 return None
-            age = (datetime.now() - pd_dt).days
+            ref = getattr(self, "_pipeline_target_date", None) or datetime.now().strftime("%Y-%m-%d")
+            try:
+                ref_dt = datetime.strptime(str(ref)[:10], "%Y-%m-%d")
+            except (ValueError, TypeError):
+                ref_dt = datetime.now()
+            age = (ref_dt - pd_dt).days
             if age > 3:
                 logger.warning(
-                    "crash_predictions_latest.json is %d days stale (date=%s) — skipping crash hard-block",
-                    age, pred_date,
+                    "crash_predictions_latest.json is %d days stale (file=%s vs signal=%s) — skipping crash hard-block",
+                    age, pred_date, ref_dt.strftime("%Y-%m-%d"),
                 )
                 self._crash_probs_cache = None
                 return None

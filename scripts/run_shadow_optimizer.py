@@ -98,16 +98,27 @@ def main():
     # champion refuses to act on stale predictions but shadow keeps riding
     # them, poisoning the comparison the whole shadow experiment is supposed
     # to provide. Pass --force-stale to override.
+    # If the gate module itself fails to import, fail CLOSED to match champion
+    # — shadow comparison integrity matters more than degraded uptime here.
     try:
         from scheduler.data_health import is_fresh
+    except ImportError as e:
+        if getattr(args, "force_stale", False):
+            logger.warning("Freshness gate unavailable (%s); proceeding due to --force-stale", e)
+        else:
+            logger.error(
+                "Freshness gate module unavailable (%s) and --force-stale not set — "
+                "refusing to run shadow optimizer to avoid poisoning the comparison",
+                e,
+            )
+            sys.exit(2)
+    else:
         if not is_fresh("lgb_after_close_smoke") and not getattr(args, "force_stale", False):
             logger.error(
                 "Refusing to run shadow optimizer: no fresh prediction health for today "
                 "(lgb_after_close_smoke). Pass --force-stale to override."
             )
             sys.exit(2)
-    except ImportError:
-        logger.warning("Freshness gate unavailable (scheduler.data_health) — proceeding without it")
 
     pnl = oms.run_daily(date)
 
