@@ -353,6 +353,30 @@ def main():
     _save_artifacts_atomically(model, dataset)
     print(f"Model saved to {MODEL_PATH}")
 
+    # Save feature contract to experiment artifact
+    try:
+        from tracker.artifact_contract import ExperimentArtifact
+        exp_id = f"train_lgb_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        art = ExperimentArtifact.create(
+            experiment_id=exp_id,
+            model_name="xgb_174",
+            feature_set="FS-174",
+            description="Production LGB training run",
+            feature_list=feature_cols if 'feature_cols' in dir() else [],
+            label_column=LABEL_EXPR,
+            data_asof_date=train_end,
+            n_features=n_features,
+            train_start=train_start,
+            train_end=train_end,
+        )
+        art.save_metrics({
+            "rank_ic_mean": train_report.get("rank_ic"),
+            "prediction_count": stats.get("latest_finite_prediction_count", 0),
+        })
+        print(f"Artifact saved: {exp_id}")
+    except Exception as e:
+        print(f"Artifact save failed (non-fatal): {e}")
+
     # Update registry — keep production artifact path in sync with research
     try:
         from models.registry import ModelRegistry

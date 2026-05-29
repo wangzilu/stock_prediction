@@ -139,6 +139,9 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("shadow_vol_compression", "47 18 * * 1-5",
                 [py, str(scripts / "shadow_vol_compression.py")], "shadow_vol_compression.log",
                 network="none", timeout_sec=120),
+        CronJob("shadow_roc5_tsmin10", "48 18 * * 1-5",
+                [py, str(scripts / "shadow_roc5_tsmin10.py")], "shadow_roc5_tsmin10.log",
+                network="none", timeout_sec=120),
         # --- Monitoring (none) ---
         CronJob("factor_decay_monitor", "49 18 * * 1-5",
                 [py, str(scripts / "monitor_factor_decay.py")], "factor_decay.log",
