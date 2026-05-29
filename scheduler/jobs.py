@@ -419,12 +419,15 @@ class DailyPipeline:
             groups["中线"].append(replace(rec, horizon="中线", horizon_score=score))
             selected.add(rec.code)
 
+        # Sentiment weight zeroed: SnowNLP has no backtest evidence.
+        # Redistributed to final_score (model signal).
+        # Will re-enable with validated contrarian overlay after 60d accumulation.
         long_ranked = sorted(
             bullish,
             key=lambda rec: (
-                _finite_float(getattr(rec, "final_score", 0)) * 0.45
+                _finite_float(getattr(rec, "final_score", 0)) * 0.70
                 + _finite_float(getattr(rec, "macro_score", 0)) * 0.30
-                + _finite_float(getattr(rec, "sentiment_score", 0)) * 0.25
+                + _finite_float(getattr(rec, "sentiment_score", 0)) * 0.00
             ),
             reverse=True,
         )
@@ -434,9 +437,9 @@ class DailyPipeline:
             if rec.code in selected:
                 continue
             score = (
-                _finite_float(getattr(rec, "final_score", 0)) * 0.45
+                _finite_float(getattr(rec, "final_score", 0)) * 0.70
                 + _finite_float(getattr(rec, "macro_score", 0)) * 0.30
-                + _finite_float(getattr(rec, "sentiment_score", 0)) * 0.25
+                + _finite_float(getattr(rec, "sentiment_score", 0)) * 0.00
             )
             groups["长线"].append(replace(rec, horizon="长线", horizon_score=round(score, 2)))
             selected.add(rec.code)
