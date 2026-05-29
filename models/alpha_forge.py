@@ -42,6 +42,11 @@ logger = logging.getLogger(__name__)
 # Unary operators take a single Series; binary take two.
 # Window operators also carry a default window parameter.
 
+# ---------------------------------------------------------------------------
+# 1a. Operator Library (expanded from 14→38 ops, inspired by QuantaAlpha's 54)
+# ---------------------------------------------------------------------------
+
+# === Unary operators (cross-sectional, per date) ===
 UNARY_OPS: dict[str, dict[str, Any]] = {
     "rank": {
         "fn": lambda x: x.groupby(level=0).rank(pct=True),
@@ -63,8 +68,32 @@ UNARY_OPS: dict[str, dict[str, Any]] = {
         "fn": lambda x: np.sign(x),
         "desc": "sign({x})",
     },
+    # QuantaAlpha-inspired additions
+    "inv": {
+        "fn": lambda x: 1.0 / x.replace(0, np.nan),
+        "desc": "inv({x})",
+    },
+    "square": {
+        "fn": lambda x: x ** 2,
+        "desc": "square({x})",
+    },
+    "sqrt": {
+        "fn": lambda x: np.sqrt(x.abs()),
+        "desc": "sqrt({x})",
+    },
+    "cs_zscore": {
+        "fn": lambda x: x.groupby(level=0).transform(
+            lambda g: (g - g.mean()) / (g.std() + 1e-8)
+        ),
+        "desc": "cs_zscore({x})",
+    },
+    "cs_demean": {
+        "fn": lambda x: x.groupby(level=0).transform(lambda g: g - g.mean()),
+        "desc": "cs_demean({x})",
+    },
 }
 
+# === Window (time-series) operators ===
 WINDOW_OPS: dict[str, dict[str, Any]] = {
     "delta": {
         "fn": lambda x, d: x.groupby(level=1).diff(d),
@@ -99,8 +128,66 @@ WINDOW_OPS: dict[str, dict[str, Any]] = {
         "windows": [5, 10, 20],
         "desc": "ts_min({x},{d})",
     },
+    # QuantaAlpha-inspired additions
+    "ts_rank": {
+        "fn": lambda x, d: x.groupby(level=1).transform(
+            lambda g: g.rolling(d, min_periods=max(1, d // 2)).apply(
+                lambda s: pd.Series(s).rank(pct=True).iloc[-1], raw=False
+            )
+        ),
+        "windows": [5, 10, 20],
+        "desc": "ts_rank({x},{d})",
+    },
+    "ts_skew": {
+        "fn": lambda x, d: x.groupby(level=1).transform(
+            lambda g: g.rolling(d, min_periods=max(3, d // 2)).skew()
+        ),
+        "windows": [10, 20],
+        "desc": "ts_skew({x},{d})",
+    },
+    "ts_kurt": {
+        "fn": lambda x, d: x.groupby(level=1).transform(
+            lambda g: g.rolling(d, min_periods=max(4, d // 2)).kurt()
+        ),
+        "windows": [20],
+        "desc": "ts_kurt({x},{d})",
+    },
+    "ts_decay": {
+        "fn": lambda x, d: x.groupby(level=1).transform(
+            lambda g: g.rolling(d, min_periods=max(1, d // 2)).apply(
+                lambda s: np.average(s, weights=np.arange(1, len(s) + 1)), raw=True
+            )
+        ),
+        "windows": [5, 10, 20],
+        "desc": "ts_decay({x},{d})",
+    },
+    "ts_delay": {
+        "fn": lambda x, d: x.groupby(level=1).shift(d),
+        "windows": [1, 3, 5, 10],
+        "desc": "ts_delay({x},{d})",
+    },
+    "ts_pctchange": {
+        "fn": lambda x, d: x.groupby(level=1).pct_change(d),
+        "windows": [1, 3, 5, 10, 20],
+        "desc": "ts_pctchange({x},{d})",
+    },
+    "ts_sum": {
+        "fn": lambda x, d: x.groupby(level=1).transform(
+            lambda g: g.rolling(d, min_periods=max(1, d // 2)).sum()
+        ),
+        "windows": [5, 10, 20],
+        "desc": "ts_sum({x},{d})",
+    },
+    "ts_median": {
+        "fn": lambda x, d: x.groupby(level=1).transform(
+            lambda g: g.rolling(d, min_periods=max(1, d // 2)).median()
+        ),
+        "windows": [5, 10, 20],
+        "desc": "ts_median({x},{d})",
+    },
 }
 
+# === Binary operators ===
 BINARY_OPS: dict[str, dict[str, Any]] = {
     "add": {
         "fn": lambda a, b: a + b,
@@ -118,7 +205,74 @@ BINARY_OPS: dict[str, dict[str, Any]] = {
         "fn": lambda a, b: a / b.replace(0, np.nan),
         "desc": "({a}/{b})",
     },
+    # QuantaAlpha-inspired additions
+    "max2": {
+        "fn": lambda a, b: pd.DataFrame({"a": a, "b": b}).max(axis=1),
+        "desc": "max({a},{b})",
+    },
+    "min2": {
+        "fn": lambda a, b: pd.DataFrame({"a": a, "b": b}).min(axis=1),
+        "desc": "min({a},{b})",
+    },
+    "gt": {
+        "fn": lambda a, b: (a > b).astype(float),
+        "desc": "gt({a},{b})",
+    },
+    "lt": {
+        "fn": lambda a, b: (a < b).astype(float),
+        "desc": "lt({a},{b})",
+    },
 }
+
+# ---------------------------------------------------------------------------
+# 1b. AST Constraints (inspired by QuantaAlpha's semantic consistency)
+# ---------------------------------------------------------------------------
+
+MAX_DEPTH = 4             # prevent runaway nesting
+MAX_NODES = 15            # limit total expression complexity
+MAX_SAME_OP_CHAIN = 2     # prevent rank(rank(rank(...)))
+
+# Banned compositions: applying these ops in sequence is meaningless
+BANNED_CHAINS = {
+    ("rank", "rank"),
+    ("abs", "abs"),
+    ("sign", "sign"),
+    ("neg", "neg"),
+    ("log", "log"),       # log(log(x)) produces extreme NaN/values
+    ("sqrt", "sqrt"),
+    ("cs_zscore", "cs_zscore"),
+    ("cs_zscore", "rank"),  # both normalize → redundant
+    ("rank", "cs_zscore"),
+}
+
+def _count_nodes(expr) -> int:
+    """Count total nodes in expression tree."""
+    if not expr.children:
+        return 1
+    return 1 + sum(_count_nodes(c) for c in expr.children)
+
+def _check_banned_chain(expr) -> bool:
+    """Return True if expression contains a banned operator chain."""
+    if expr.node_type in ("unary", "window") and expr.children:
+        child = expr.children[0]
+        if child.node_type in ("unary", "window"):
+            pair = (expr.operator, child.operator)
+            if pair in BANNED_CHAINS:
+                return True
+    for c in expr.children:
+        if _check_banned_chain(c):
+            return True
+    return False
+
+def validate_expression(expr) -> bool:
+    """Validate expression against AST constraints. Returns True if valid."""
+    if expr.depth() > MAX_DEPTH:
+        return False
+    if _count_nodes(expr) > MAX_NODES:
+        return False
+    if _check_banned_chain(expr):
+        return False
+    return True
 
 # Base features — Alpha158 columns available in the cache.
 # We pick a representative subset that covers price, volume, momentum, etc.
@@ -220,38 +374,48 @@ def _make_leaf() -> AlphaExpression:
 
 
 def random_expression(max_depth: int = 3) -> AlphaExpression:
-    """Generate a random expression tree up to *max_depth* levels."""
+    """Generate a random expression tree up to *max_depth* levels.
+
+    Applies AST constraints (QuantaAlpha-inspired):
+    - Validates against banned chains, max depth/nodes
+    - Retries up to 10 times if constraints violated
+    """
+    for _ in range(10):
+        expr = _random_expression_inner(max_depth)
+        if validate_expression(expr):
+            return expr
+    # Fallback: simple expression
+    return _make_leaf()
+
+
+def _random_expression_inner(max_depth: int) -> AlphaExpression:
+    """Internal random expression generator (no validation)."""
     if max_depth <= 0:
         return _make_leaf()
 
-    # At intermediate levels: 30% leaf, 30% unary/window, 20% binary, 20% window
     r = random.random()
 
     if r < 0.25:
-        # leaf
         return _make_leaf()
 
     if r < 0.50:
-        # unary op
         op = random.choice(list(UNARY_OPS))
-        child = random_expression(max_depth - 1)
+        child = _random_expression_inner(max_depth - 1)
         return AlphaExpression(
             node_type="unary", operator=op, children=[child]
         )
 
     if r < 0.75:
-        # window op
         op = random.choice(list(WINDOW_OPS))
         win = random.choice(WINDOW_OPS[op]["windows"])
-        child = random_expression(max_depth - 1)
+        child = _random_expression_inner(max_depth - 1)
         return AlphaExpression(
             node_type="window", operator=op, window=win, children=[child]
         )
 
-    # binary op
     op = random.choice(list(BINARY_OPS))
-    left = random_expression(max_depth - 1)
-    right = random_expression(max_depth - 1)
+    left = _random_expression_inner(max_depth - 1)
+    right = _random_expression_inner(max_depth - 1)
     return AlphaExpression(
         node_type="binary", operator=op, children=[left, right]
     )
@@ -262,16 +426,22 @@ def random_expression(max_depth: int = 3) -> AlphaExpression:
 # ---------------------------------------------------------------------------
 
 def mutate(expr: AlphaExpression, p: float = 0.3) -> AlphaExpression:
-    """Return a mutated copy of *expr*.
+    """Return a mutated copy of *expr* that satisfies AST constraints.
 
     With probability *p* at each node, apply one of:
       - swap leaf feature
       - change operator (same arity)
       - change window parameter
       - wrap in a new unary/window op
+
+    Retries up to 5 times if mutation violates constraints.
     """
-    expr = copy.deepcopy(expr)
-    return _mutate_node(expr, p)
+    for _ in range(5):
+        candidate = copy.deepcopy(expr)
+        candidate = _mutate_node(candidate, p)
+        if validate_expression(candidate):
+            return candidate
+    return copy.deepcopy(expr)  # return original if can't find valid mutation
 
 
 def _mutate_node(node: AlphaExpression, p: float) -> AlphaExpression:
