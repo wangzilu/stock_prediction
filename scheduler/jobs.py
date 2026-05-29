@@ -1461,6 +1461,43 @@ class DailyPipeline:
         logger.info("Fetching global news from RSS...")
         all_news = self.macro_collector.fetch_all(max_per_source=15)
         headlines = [item.get("title", "") for item in all_news if item.get("title")]
+
+        # MacroCollector returns [] in domestic profile (proxy unavailable). Fall back
+        # to the daily global_industry_news collection (cron 16:25, --network global).
+        if not headlines:
+            from pathlib import Path
+            from config.settings import DATA_DIR
+            import json as _json_gn
+            gn_dir = DATA_DIR / "global_industry_news"
+            if gn_dir.exists():
+                candidates = sorted(gn_dir.glob("*.jsonl"), reverse=True)[:3]
+                for gn_path in candidates:
+                    try:
+                        items = []
+                        with open(gn_path, encoding="utf-8") as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    items.append(_json_gn.loads(line))
+                                except _json_gn.JSONDecodeError:
+                                    continue
+                        gn_headlines = [it.get("title", "") for it in items if it.get("title")]
+                        if gn_headlines:
+                            headlines = gn_headlines[:120]
+                            logger.info(
+                                "MacroCollector returned 0; using cached global_industry_news %s (%d headlines)",
+                                gn_path.name, len(headlines),
+                            )
+                            break
+                    except Exception as e:
+                        logger.warning("Failed to read cached global news %s: %s", gn_path.name, e)
+            if not headlines:
+                logger.warning(
+                    "No global news available — geo factors will be default zeros (silent fallback)"
+                )
+
         self._headlines = headlines
         logger.info(f"Fetched {len(headlines)} headlines from {len(all_news)} news items")
 

@@ -123,6 +123,10 @@ class LLMAnalyst:
             safe_haven_signal, market_direction, reasoning
         """
         if not headlines:
+            logger.warning(
+                "analyze_geopolitics: no headlines passed in — returning default zero result "
+                "(check upstream news fetch in domestic mode)"
+            )
             return self._default_geo_result()
 
         # Limit headlines to fit within model context (estimate ~4 chars per token)
