@@ -2719,3 +2719,82 @@ LLM 事件 latest_date < today → LLM overlay 降权或关闭
 - A-share turnover anomaly: -1.87% monthly spread between top/bottom deciles
 - Chinese stock forum direct sentiment: contrarian at 5d+, momentum at 1d
 - T+1 rule: only short-term reversal exists in A-shares
+
+---
+
+## 30. 方法论收敛：证据强度必须匹配系统权力（2026-05-29 CX 评估）
+
+**核心判断**：项目最危险的地方不是"没想法"，而是想法太多后，有些模块的证据强度还没跟上它们在系统里的权力。
+
+### 30.1 九个方法论问题
+
+| # | 问题 | 严重度 | 状态 |
+|---|------|--------|------|
+| 1 | 研究指标(IC/RankIC)和实盘目标(可执行PnL)没对齐 | 高 | ⬜ 需要统一 |
+| 2 | Champion 特征命名(174/175/205/206)和实际维度混乱 | 高 | ⬜ 需要 artifact feature_list.json |
+| 3 | Overlay 权重手工定死(0.2)没有校准 | 高 | ⬜ 改 shadow grid |
+| 4 | RiskGuard 阈值偏经验化(crash>0.65/chain<-2) | 中 | ⬜ 改 soft penalty |
+| 5 | 供应链因子缺收入暴露/客户占比/订单弹性 | 中 | ⬜ 补权重层 |
+| 6 | Cross-market regime 广播给所有股票 | 中 | ⬜ 改行业交互 |
+| 7 | Shadow 20天晋升太松 | 高 | ⬜ 改 60天+bootstrap |
+| 8 | AlphaForge 复杂表达式过拟合风险 | 高 | ✅ 已验证(2月IC缩水78%) |
+| 9 | RL 不适合承担选股主线 | 低 | ✅ 已定位为 execution/risk |
+
+### 30.2 CX 三层优先级
+
+**第一优先级：统一三个 contract**
+
+```text
+1. Feature Contract:
+   每个模型 artifact 必须存 feature_list.json + feature_hash + label_hash
+   不再用"174"口头名字，以 artifact contract 为准
+
+2. Label/Execution Contract:
+   promotion gate 必须包含：
+   - T+1 open execution price
+   - 手续费 + 滑点
+   - 涨跌停不可成交
+   - 最大换手
+   - 行业/市值暴露
+   RankIC 只是入门指标，不是晋级标准
+
+3. Promotion Gate 收紧:
+   - Shadow 20天 → 60天
+   - 必须 rolling OOS 先过关
+   - 看日胜率、最大回撤、换手、替换股票收益
+   - Bootstrap 显著性检验
+```
+
+**第二优先级：所有 overlay 去掉手工阈值**
+
+```text
+供应链: shadow grid 权重 0/0.02/0.05/0.10/0.20
+crash_prob: 改 soft penalty（position sizing），不 hard block
+event overlay: 同样 shadow grid
+RiskGuard: calibration curve 确定每个 crash_prob 分桶的真实概率
+```
+
+**第三优先级：因子只晋升朴素稳定版本**
+
+```text
+KLEN反转: -ts_max(rank(KLEN),5) → 已 24-split PASS → 可进 shadow overlay
+vol_compression: cs_rank(-ts_std(ROC20,20)) → 24-split PASS → 同上
+AlphaForge 复杂表达式: 只提炼成可解释名字，不直接进 champion
+供应链因子: 先补 收入暴露 × 事件冲击 × source reliability 三层权重
+```
+
+### 30.3 已修复的生产问题（2026-05-29 当天）
+
+| 修复 | 文件 |
+|------|------|
+| RiskGuard 动态止损 as-of 泄漏 | risk_guard.py: _get_dynamic_stop(code, date) |
+| RiskGuard 异常后 fail-closed | oms.py: 阻止所有新买 |
+| job id / health source 不一致 | smoke_lgb_predict.py + run_paper_trading.py |
+| chain builder 不读 pre-extracted events | build_global_chain_factors.py |
+| global news health 不统一 | collect_global_industry_news.py → write_health() |
+| timeout 不杀进程组 | run_network_job.py → killpg() |
+| 情绪权重残留 | scheduler/jobs.py: 长线排序 0.25→0.00 |
+
+### 30.4 一句话
+
+**把晋级纪律收紧，整体会更像专业私募。** 不是没有好想法，是好想法的证据强度必须匹配它在系统里的权力。
