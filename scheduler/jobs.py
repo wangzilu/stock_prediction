@@ -1741,15 +1741,27 @@ class DailyPipeline:
             logger.warning(f"Morning final prediction verification failed: {e}")
             return ""
 
-    def run_daily_recommendation(self, use_overnight_snapshot: bool = False):
+    def run_daily_recommendation(self, use_overnight_snapshot: bool = False,
+                                 target_date: str | None = None):
         """Run the full daily recommendation pipeline.
 
         Two-stage approach:
         1. Fast screen: reuse 22:00 candidates or rank model-covered stocks
         2. Deep analysis: sentiment + mid-term model for top-N candidates
+
+        target_date overrides system today for backfill / shadow replay; all
+        downstream sanitizers will pick it up via _pipeline_target_date so
+        IPO-age / chain-stale / cooldown checks use the SIGNAL date, not
+        wall-clock today.
         """
         logger.info("Starting daily recommendation pipeline...")
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = target_date or datetime.now().strftime("%Y-%m-%d")
+        self._pipeline_target_date = today
+        # Per-call caches that depend on date — clear them so a second run
+        # for a different date doesn't reuse the previous date's snapshot.
+        self._crash_probs_cache = None
+        self._chain_alpha_cache = None
+        self._cooldown_cache = None
         self._geo_factors = None  # Reset cache
         self._headlines = None  # Reset cache
         self.market_collector.invalidate_cache()  # Fresh spot data
