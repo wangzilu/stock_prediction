@@ -72,39 +72,45 @@ SOURCE_TIERS = {
     "股吧": {"tier": "social", "quality": 0.2},
 }
 
-SYSTEM_PROMPT_V2 = """你是A股事件结构化助手。从新闻/公告中提取事实信息，不预测股价。
+SYSTEM_PROMPT_V2 = """从A股新闻/公告提取结构化事实。
 
-输出严格JSON格式：
-{
-  "event_type": "从以下选择: earnings_beat, earnings_miss, earnings_inline, revenue_growth, revenue_decline, order_win, major_contract, product_launch, tech_breakthrough, market_share_gain, share_buyback, dividend_increase, insider_buy, insider_sell, share_placement, share_unlock, analyst_upgrade, analyst_downgrade, regulatory_approval, regulatory_penalty, lawsuit_filed, management_change, restructuring, strategic_cooperation, government_subsidy, routine_announcement, other",
-  "direction": 1或-1或0,
-  "is_official_disclosure": true或false,
-  "is_new_information": true或false,
-  "is_repeated_news": true或false,
-  "is_price_sensitive": true或false,
-  "magnitude_description": "金额或规模的文字描述，如'合同金额3.2亿元'，无则为空",
-  "magnitude_value_wan": 提到的金额(万元)，无则为0,
-  "confidence": 0到1之间的数字,
-  "summary": "一句话概括事实（不超过50字）"
+只输出JSON，禁止解释、思考、前后缀文字。第一个字符必须是 { 。
+direction 必须是整数 1/-1/0（不是字符串）。
+event_type 必须从枚举中选一个。
+
+Schema:
+{"event_type": "<one of: earnings_beat|earnings_miss|earnings_inline|revenue_growth|revenue_decline|order_win|major_contract|product_launch|tech_breakthrough|market_share_gain|market_share_loss|share_buyback|dividend_increase|insider_buy|insider_sell|share_placement|share_unlock|analyst_upgrade|analyst_downgrade|regulatory_approval|regulatory_penalty|lawsuit_filed|lawsuit_settled|management_change|restructuring|strategic_cooperation|joint_venture|government_subsidy|tax_benefit|debt_issue|credit_rating_change|routine_announcement|other>",
+"direction": 1|-1|0,
+"is_official_disclosure": true|false,
+"is_new_information": true|false,
+"is_repeated_news": true|false,
+"is_price_sensitive": true|false,
+"magnitude_description": "<≤30字, 无则空字符串>",
+"magnitude_value_wan": <number 万元, 无则0>,
+"confidence": <0-1: 交易所公告 0.9+, 权威媒体 0.7, 传闻 0.3-0.5>,
+"summary": "<≤30字事实概述, 不要分析>"}
+
+只提取明示事实, 不推断。无法判断时 confidence 设低。"""
+
+
+_DIRECTION_STR_MAP = {
+    "positive": 1, "up": 1, "bullish": 1, "bull": 1, "+1": 1, "1": 1,
+    "negative": -1, "down": -1, "bearish": -1, "bear": -1, "-1": -1,
+    "neutral": 0, "flat": 0, "0": 0, "": 0,
 }
-
-规则：
-- 只提取新闻中明确陈述的事实，不推断
-- is_official_disclosure: 来自交易所公告为true，媒体报道为false
-- is_new_information: 首次披露为true，已知信息重复报道为false
-- is_price_sensitive: 可能引起显著股价反应为true
-- magnitude_value_wan: 提到具体金额就转换成万元填入，没提到就填0
-- routine_announcement: 常规信息披露（独董声明、日常关联交易等）
-- confidence: 信息确定性，公告=0.9+，权威媒体=0.7-0.8，传闻=0.3-0.5
-- 无法判断时 confidence 设低，不要编造"""
 
 
 class LLMEventExtractorV2:
-    """V2: Extract structured FACTS from news, not impact predictions."""
+    """V2: Extract structured FACTS from news, not impact predictions.
+
+    Uses MiniMax-Text-01 (non-reasoning) by default — extraction is not a
+    reasoning task, and reasoning models burn 95% of completion_tokens on
+    <think> blocks. See memory/feedback_llm_pipeline_arch.md.
+    """
 
     def __init__(self,
                  api_key: str = None,
-                 model: str = "minimax-m2.5-highspeed",
+                 model: str = "MiniMax-Text-01",
                  max_calls_per_minute: int = 60):
         self.api_key = api_key or MINIMAX_API_KEY
         if not self.api_key:
@@ -114,6 +120,23 @@ class LLMEventExtractorV2:
         self.max_calls_per_minute = max_calls_per_minute
         self._call_timestamps = []
         self._rate_lock = threading.Lock()
+        # Accounting (thread-safe via _stats_lock)
+        self._stats_lock = threading.Lock()
+        self._stats = {
+            "calls": 0, "http_fail": 0, "parse_fail": 0,
+            "prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0,
+        }
+
+    def _record_stats(self, http_ok: bool, parse_ok: bool, usage: dict):
+        with self._stats_lock:
+            self._stats["calls"] += 1
+            if not http_ok:
+                self._stats["http_fail"] += 1
+            elif not parse_ok:
+                self._stats["parse_fail"] += 1
+            self._stats["prompt_tokens"] += usage.get("prompt_tokens", 0)
+            self._stats["completion_tokens"] += usage.get("completion_tokens", 0)
+            self._stats["reasoning_tokens"] += usage.get("reasoning_tokens", 0)
 
     def _rate_limit(self):
         with self._rate_lock:
@@ -125,8 +148,10 @@ class LLMEventExtractorV2:
                     time.sleep(wait)
             self._call_timestamps.append(time.time())
 
-    def _call_llm(self, user_prompt: str) -> str:
+    def _call_llm(self, user_prompt: str) -> tuple[str, dict]:
+        """Returns (text, usage). usage has http_ok + token counts."""
         self._rate_limit()
+        last_err = None
         for attempt in range(2):
             try:
                 resp = requests.post(
@@ -137,20 +162,33 @@ class LLMEventExtractorV2:
                           "messages": [{"role": "system", "content": SYSTEM_PROMPT_V2},
                                        {"role": "user", "content": user_prompt}],
                           "max_tokens": 512},
-                    timeout=(5, 15),
+                    timeout=(5, 20),
                 )
                 if resp.status_code != 200:
+                    last_err = f"HTTP {resp.status_code} {resp.text[:200]}"
                     if attempt == 0:
                         time.sleep(3)
                         continue
-                    return ""
-                text = resp.json()["choices"][0]["message"]["content"]
+                    logger.warning("V2 LLM call failed: %s", last_err)
+                    return "", {"http_ok": False}
+                body = resp.json()
+                text = body["choices"][0]["message"]["content"]
                 text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-                return text
+                u = body.get("usage", {}) or {}
+                details = u.get("completion_tokens_details", {}) or {}
+                return text, {
+                    "http_ok": True,
+                    "prompt_tokens": u.get("prompt_tokens", 0),
+                    "completion_tokens": u.get("completion_tokens", 0),
+                    "reasoning_tokens": details.get("reasoning_tokens", 0),
+                }
             except Exception as e:
+                last_err = repr(e)
                 if attempt == 0:
                     time.sleep(3)
-        return ""
+        if last_err:
+            logger.warning("V2 LLM exception: %s", last_err)
+        return "", {"http_ok": False}
 
     def _parse_response(self, text: str) -> dict | None:
         if not text:
@@ -186,16 +224,35 @@ class LLMEventExtractorV2:
         if event_type not in EVENT_TYPES:
             event_type = "other"
 
+        # direction may arrive as int, float, or string ("positive"/"+1"/etc.)
+        d_raw = data.get("direction", 0)
+        if isinstance(d_raw, str):
+            direction = _DIRECTION_STR_MAP.get(d_raw.strip().lower(), 0)
+        else:
+            try:
+                direction = max(-1, min(1, int(d_raw)))
+            except (TypeError, ValueError):
+                direction = 0
+
+        try:
+            mag = float(data.get("magnitude_value_wan", 0) or 0)
+        except (TypeError, ValueError):
+            mag = 0.0
+        try:
+            conf = max(0.0, min(1.0, float(data.get("confidence", 0.5))))
+        except (TypeError, ValueError):
+            conf = 0.5
+
         return {
             "event_type": event_type,
-            "direction": int(data.get("direction", 0)),
+            "direction": direction,
             "is_official_disclosure": bool(data.get("is_official_disclosure", False)),
             "is_new_information": bool(data.get("is_new_information", True)),
             "is_repeated_news": bool(data.get("is_repeated_news", False)),
             "is_price_sensitive": bool(data.get("is_price_sensitive", False)),
-            "magnitude_description": str(data.get("magnitude_description", "")),
-            "magnitude_value_wan": float(data.get("magnitude_value_wan", 0)),
-            "confidence": max(0, min(1, float(data.get("confidence", 0.5)))),
+            "magnitude_description": str(data.get("magnitude_description", ""))[:60],
+            "magnitude_value_wan": mag,
+            "confidence": conf,
             "summary": str(data.get("summary", ""))[:100],
         }
 
@@ -203,8 +260,10 @@ class LLMEventExtractorV2:
         prompt = f"股票: {code} {name}\n标题: {title}"
         if content and content != title:
             prompt += f"\n内容: {content[:300]}"
-        text = self._call_llm(prompt)
-        return self._parse_response(text)
+        text, usage = self._call_llm(prompt)
+        event = self._parse_response(text)
+        self._record_stats(usage.get("http_ok", False), event is not None, usage)
+        return event
 
     def extract_from_news_file(self, news_path: Path, max_news_per_stock: int = 1,
                                 target_date: str = None) -> Path:
@@ -293,4 +352,14 @@ class LLMEventExtractorV2:
                         logger.info(f"  V2 progress: {done}/{len(tasks)}, {total_ok} ok, {total_fail} fail")
 
         logger.info(f"V2 extraction: {total_ok} events, {total_fail} failed -> {output_path}")
+
+        s = self._stats
+        if s["calls"]:
+            avg_tok = (s["prompt_tokens"] + s["completion_tokens"]) / s["calls"]
+            logger.info(
+                "V2 LLM stats: model=%s calls=%d http_fail=%d parse_fail=%d "
+                "prompt_tok=%d completion_tok=%d reason_tok=%d avg_tok/call=%.0f",
+                self.model, s["calls"], s["http_fail"], s["parse_fail"],
+                s["prompt_tokens"], s["completion_tokens"], s["reasoning_tokens"], avg_tok,
+            )
         return output_path
