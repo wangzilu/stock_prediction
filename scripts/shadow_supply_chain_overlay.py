@@ -45,7 +45,7 @@ PREDICTIONS_PATH = DATA_DIR / "lgb_latest_predictions.json"
 CHAIN_FACTORS_PATH = DATA_DIR / "global_chain_factors.parquet"
 OUTPUT_DIR = DATA_DIR / "shadow_chain_overlay"
 
-OVERLAY_WEIGHT = 0.2
+WEIGHT_GRID = [0.0, 0.02, 0.05, 0.10, 0.20]
 TOP_N = 20
 
 
@@ -114,6 +114,7 @@ def _compare_single_shadow(
     xgb_preds: pd.Series,
     shadow_alpha: pd.Series,
     shadow_name: str,
+    overlay_weight: float,
 ) -> dict:
     """Compare Top-N with and without a single shadow overlay.
 
@@ -121,9 +122,10 @@ def _compare_single_shadow(
         xgb_preds: XGB prediction scores (higher = better).
         shadow_alpha: per-stock alpha for this shadow variant.
         shadow_name: label for this shadow (e.g. "shadow_a_positive").
+        overlay_weight: weight to apply to the shadow alpha z-score.
 
     Returns:
-        Dict with top20_changed list and n_affected count.
+        Dict with top20_changed list, n_affected count, and overlay_top.
     """
     baseline_top = set(xgb_preds.nlargest(TOP_N).index)
 
@@ -133,7 +135,7 @@ def _compare_single_shadow(
     common = xgb_preds.index.intersection(shadow_alpha.index)
     if len(common) > 0:
         z_shadow = safe_zscore(shadow_alpha.reindex(xgb_preds.index).fillna(0.0))
-        final_score = z_xgb + OVERLAY_WEIGHT * z_shadow
+        final_score = z_xgb + overlay_weight * z_shadow
     else:
         logger.warning("No common stocks for %s -- overlay is a no-op", shadow_name)
 
@@ -179,14 +181,15 @@ def compute_three_shadows(
     chain_df: pd.DataFrame,
     target_date: str,
 ) -> dict:
-    """Compute three shadow overlays and compare each to baseline Top20.
+    """Compute three shadow overlays across a weight grid.
 
-    Shadow A (positive): only positive events (global_chain_pos_score)
-    Shadow B (negative): only negative events (global_chain_neg_score)
-    Shadow C (propagation): full alpha (global_chain_alpha, includes industry)
+    For each weight in WEIGHT_GRID, computes all 3 shadows:
+      Shadow A (positive): only positive events (global_chain_pos_score)
+      Shadow B (negative): only negative events (global_chain_neg_score)
+      Shadow C (propagation): full alpha (global_chain_alpha, includes industry)
 
     Returns:
-        Result dict ready for JSON serialization.
+        Result dict ready for JSON serialization, with per-weight variants.
     """
     baseline_top = sorted(xgb_preds.nlargest(TOP_N).index)
 
@@ -202,27 +205,34 @@ def compute_three_shadows(
         alpha_neg = chain_df.get("global_chain_neg_score", pd.Series(dtype=float))
         alpha_full = chain_df.get("global_chain_alpha", pd.Series(dtype=float))
 
-    shadow_a = _compare_single_shadow(xgb_preds, alpha_pos, "shadow_a_positive")
-    shadow_b = _compare_single_shadow(xgb_preds, alpha_neg, "shadow_b_negative")
-    shadow_c = _compare_single_shadow(xgb_preds, alpha_full, "shadow_c_propagation")
+    shadow_variants = ("shadow_a_positive", "shadow_b_negative", "shadow_c_propagation")
+    alpha_map = {
+        "shadow_a_positive": alpha_pos,
+        "shadow_b_negative": alpha_neg,
+        "shadow_c_propagation": alpha_full,
+    }
+
+    # Compute each shadow x each weight
+    weight_results = {}
+    for w in WEIGHT_GRID:
+        w_key = f"w_{w:.2f}"
+        w_entry = {}
+        for sname in shadow_variants:
+            res = _compare_single_shadow(xgb_preds, alpha_map[sname], sname,
+                                         overlay_weight=w)
+            w_entry[sname] = {
+                "top20_changed": res["top20_changed"],
+                "n_affected": res["n_affected"],
+                "overlay_top20": res["overlay_top"],
+            }
+        weight_results[w_key] = w_entry
 
     result = {
         "date": target_date,
-        "shadow_a_positive": {
-            "top20_changed": shadow_a["top20_changed"],
-            "n_affected": shadow_a["n_affected"],
-        },
-        "shadow_b_negative": {
-            "top20_changed": shadow_b["top20_changed"],
-            "n_affected": shadow_b["n_affected"],
-        },
-        "shadow_c_propagation": {
-            "top20_changed": shadow_c["top20_changed"],
-            "n_affected": shadow_c["n_affected"],
-        },
         "xgb_top20": baseline_top,
+        "weight_grid": WEIGHT_GRID,
+        "variants": weight_results,
         # Metadata
-        "overlay_weight": OVERLAY_WEIGHT,
         "top_n": TOP_N,
         "n_xgb_stocks": len(xgb_preds),
         "n_chain_stocks": len(chain_df),
@@ -245,30 +255,36 @@ def save_result(result: dict, target_date: str) -> Path:
 
 
 def print_summary(result: dict):
-    """Print human-readable summary for all 3 shadows."""
+    """Print human-readable summary for all weight x shadow variants."""
     print("\n" + "=" * 70)
-    print(f"Shadow Supply Chain Overlay (3-way) -- {result['date']}")
+    print(f"Shadow Supply Chain Overlay (weight grid) -- {result['date']}")
     print("=" * 70)
     print(f"XGB stocks: {result['n_xgb_stocks']}  |  "
           f"Chain stocks: {result['n_chain_stocks']}")
+    print(f"Weight grid: {result['weight_grid']}")
     print(f"XGB Top-{result['top_n']}: {', '.join(result['xgb_top20'][:5])} ...")
 
-    for key, label in [
+    shadow_labels = [
         ("shadow_a_positive", "Shadow A (positive events)"),
         ("shadow_b_negative", "Shadow B (negative/risk events)"),
         ("shadow_c_propagation", "Shadow C (full propagation)"),
-    ]:
-        shadow = result[key]
-        print(f"\n  {label}:  n_affected={shadow['n_affected']}")
-        if shadow["top20_changed"]:
-            for s in shadow["top20_changed"]:
-                alpha_str = (f"alpha={s['shadow_alpha']:+.4f}"
-                             if s["shadow_alpha"] is not None else "alpha=N/A")
-                print(f"    {s['change']:>7s}  {s['code']:12s}  "
-                      f"xgb_rank={s['xgb_rank']:>5d} -> overlay_rank={s['overlay_rank']:>5d}  "
-                      f"{alpha_str}")
-        else:
-            print("    No changes -- overlay had no effect on Top-20.")
+    ]
+
+    for w_key, w_entry in result.get("variants", {}).items():
+        print(f"\n--- Weight: {w_key} ---")
+        for key, label in shadow_labels:
+            shadow = w_entry.get(key, {})
+            n_aff = shadow.get("n_affected", 0)
+            print(f"  {label}:  n_affected={n_aff}")
+            if shadow.get("top20_changed"):
+                for s in shadow["top20_changed"]:
+                    alpha_str = (f"alpha={s['shadow_alpha']:+.4f}"
+                                 if s["shadow_alpha"] is not None else "alpha=N/A")
+                    print(f"    {s['change']:>7s}  {s['code']:12s}  "
+                          f"xgb_rank={s['xgb_rank']:>5d} -> overlay_rank={s['overlay_rank']:>5d}  "
+                          f"{alpha_str}")
+            else:
+                print("    No changes -- overlay had no effect on Top-20.")
 
     print("=" * 70)
 

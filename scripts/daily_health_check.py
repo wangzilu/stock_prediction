@@ -300,10 +300,14 @@ def check_promotion_eligibility() -> tuple[str, str]:
     ch_ret = champion.get("total_value", 1e6) / 1e6 - 1
     excess = sh_ret - ch_ret
 
-    if sh_days < 20:
-        return "⏳", f"观察{sh_days}/20天 shadow{sh_ret:+.2%} vs champion{ch_ret:+.2%} excess{excess:+.2%}"
+    # Require 60 trading days of shadow observation before promotion eligibility.
+    # TODO: add bootstrap significance test (p < 0.05 on excess return) before auto-promote.
+    min_shadow_days = 60
 
-    # 20+ days: check if shadow beats champion
+    if sh_days < min_shadow_days:
+        return "⏳", f"观察{sh_days}/{min_shadow_days}天 shadow{sh_ret:+.2%} vs champion{ch_ret:+.2%} excess{excess:+.2%}"
+
+    # 60+ days: check if shadow beats champion
     if excess > 0:
         return "🟢", f"可晋升！{sh_days}天 shadow{sh_ret:+.2%} > champion{ch_ret:+.2%} excess{excess:+.2%}"
     else:

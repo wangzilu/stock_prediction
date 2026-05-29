@@ -34,6 +34,7 @@ Usage:
     print(report["complete"])  # True/False
     print(report["missing"])   # list of missing artifacts
 """
+import hashlib
 import json
 import logging
 import pickle
@@ -92,6 +93,12 @@ def _git_hash() -> str:
         return "unknown"
 
 
+def compute_feature_hash(feature_list: list[str]) -> str:
+    """Compute MD5 hash of a sorted feature list for reproducibility tracking."""
+    canonical = ",".join(sorted(feature_list))
+    return hashlib.md5(canonical.encode()).hexdigest()
+
+
 class ExperimentArtifact:
     """Manages artifacts for a single experiment run."""
 
@@ -108,9 +115,23 @@ class ExperimentArtifact:
         model_name: str,
         feature_set: str,
         description: str = "",
+        feature_list: list[str] = None,
+        label_column: str = None,
+        data_asof_date: str = None,
         **extra_config,
     ) -> "ExperimentArtifact":
-        """Create a new experiment with initial config."""
+        """Create a new experiment with initial config.
+
+        Args:
+            experiment_id: Unique ID for this experiment run.
+            model_name: Model identifier (e.g. "xgb_174").
+            feature_set: Feature set name (e.g. "FS-174").
+            description: Free-text description.
+            feature_list: List of feature column names used in training.
+            label_column: Name of the label column (e.g. "Ref($close,−5)/$close−1").
+            data_asof_date: Latest date in training data (YYYY-MM-DD).
+            **extra_config: Additional config entries.
+        """
         art = cls(experiment_id)
         config = {
             "experiment_id": experiment_id,
@@ -121,6 +142,15 @@ class ExperimentArtifact:
             "code_version": _git_hash(),
             **extra_config,
         }
+        # Feature lineage fields
+        if feature_list is not None:
+            config["feature_list"] = feature_list
+            config["feature_hash"] = compute_feature_hash(feature_list)
+        if label_column is not None:
+            config["label_column"] = label_column
+            config["label_hash"] = hashlib.md5(label_column.encode()).hexdigest()
+        if data_asof_date is not None:
+            config["data_asof_date"] = data_asof_date
         art.save_config(config)
         return art
 
@@ -145,6 +175,19 @@ class ExperimentArtifact:
     # --- Save methods ---
 
     def save_config(self, config: dict):
+        """Save config with auto-computed feature/label hashes.
+
+        If config contains ``feature_list`` but not ``feature_hash``, the hash
+        is computed automatically.  Same for ``label_column`` / ``label_hash``.
+        """
+        # Auto-compute feature_hash if feature_list present but hash missing
+        if "feature_list" in config and "feature_hash" not in config:
+            config["feature_hash"] = compute_feature_hash(config["feature_list"])
+        # Auto-compute label_hash if label_column present but hash missing
+        if "label_column" in config and "label_hash" not in config:
+            config["label_hash"] = hashlib.md5(
+                config["label_column"].encode()
+            ).hexdigest()
         self._write_json("config.json", config)
 
     def save_predictions(self, pred: pd.DataFrame, label: pd.DataFrame = None):

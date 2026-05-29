@@ -41,6 +41,7 @@ class RiskConstraints:
     max_gross_position: float = 1.0                      # max % invested (1.0 = fully invested)
     cooldown_until: dict = field(default_factory=dict)   # {code: date_str} — cannot buy until
     risk_reasons: dict = field(default_factory=dict)     # {code: reason}
+    reduce_weight: dict = field(default_factory=dict)    # {code: multiplier} — soft position sizing
     drawdown_state: str = "normal"                       # normal/watch/derisk/emergency
     drawdown_pct: float = 0.0
 
@@ -422,33 +423,54 @@ class RiskGuard:
                          date: str) -> list:
         """Standalone crash risk check — returns list of flagged stocks.
 
+        Soft penalty thresholds (matches _check_crash_risk):
+        - >0.30: info/watch
+        - >0.50: reduce_weight 0.5x
+        - >0.70: reduce_weight 0.25x
+        - >0.85: hard block / exit
+
         Args:
             positions: {code: pos_dict} — currently held positions
             crash_probs: {code: crash_prob_5d} — crash model output
             date: current date string
 
         Returns:
-            List of dicts with flagged stock info:
-              [{"code": ..., "crash_prob": ..., "action": "block"/"exit",
-                "reason": ...}, ...]
+            List of dicts with flagged stock info.
         """
         flagged = []
         for code, prob in crash_probs.items():
             if not np.isfinite(prob):
                 continue
-            if prob > 0.80 and code in positions:
+            if prob > 0.85:
+                if code in positions:
+                    flagged.append({
+                        "code": code, "crash_prob": prob,
+                        "action": "exit",
+                        "reason": f"崩盘概率{prob:.1%}>85%，建议退出",
+                    })
+                else:
+                    flagged.append({
+                        "code": code, "crash_prob": prob,
+                        "action": "block",
+                        "reason": f"崩盘概率{prob:.1%}>85%，禁止买入",
+                    })
+            elif prob > 0.70:
                 flagged.append({
-                    "code": code,
-                    "crash_prob": prob,
-                    "action": "exit",
-                    "reason": f"崩盘概率{prob:.1%}>80%，建议退出",
+                    "code": code, "crash_prob": prob,
+                    "action": "reduce_0.25x",
+                    "reason": f"崩盘概率{prob:.1%}>70%，建议仓位0.25x",
                 })
-            elif prob > 0.65:
+            elif prob > 0.50:
                 flagged.append({
-                    "code": code,
-                    "crash_prob": prob,
-                    "action": "block",
-                    "reason": f"崩盘概率{prob:.1%}>65%，禁止买入",
+                    "code": code, "crash_prob": prob,
+                    "action": "reduce_0.5x",
+                    "reason": f"崩盘概率{prob:.1%}>50%，建议仓位0.5x",
+                })
+            elif prob > 0.30:
+                flagged.append({
+                    "code": code, "crash_prob": prob,
+                    "action": "watch",
+                    "reason": f"崩盘概率{prob:.1%}>30%，关注",
                 })
         return flagged
 
@@ -456,24 +478,50 @@ class RiskGuard:
                           date: str, constraints: RiskConstraints):
         """Wire crash model into RiskConstraints (called from check()).
 
-        - crash_prob > 0.65 → cannot_buy
-        - crash_prob > 0.80 and held → pending_exit
+        Soft penalty approach — moderate crash risk reduces position size
+        instead of hard blocking:
+
+        - crash_prob > 0.30 → add to risk_reasons (info only)
+        - crash_prob > 0.50 → reduce_weight 0.5x
+        - crash_prob > 0.70 → reduce_weight 0.25x
+        - crash_prob > 0.85 → cannot_buy (only extreme tail)
         """
         for code, prob in crash_probs.items():
             if not np.isfinite(prob):
                 continue
-            if prob > 0.65:
+            if prob > 0.85:
+                # Extreme tail — hard block buy + pending exit if held
                 constraints.cannot_buy.add(code)
-                if prob > 0.80 and code in positions:
+                if code in positions:
                     constraints.pending_exit.append(code)
                     constraints.risk_reasons[code] = (
-                        f"崩盘概率{prob:.1%}>80%，标记退出"
+                        f"崩盘概率{prob:.1%}>85%，极端风险标记退出"
                     )
                 else:
                     constraints.risk_reasons.setdefault(
                         code,
-                        f"崩盘概率{prob:.1%}>65%，禁止买入"
+                        f"崩盘概率{prob:.1%}>85%，禁止买入"
                     )
+            elif prob > 0.70:
+                # High risk — reduce to 0.25x position
+                constraints.reduce_weight[code] = 0.25
+                constraints.risk_reasons.setdefault(
+                    code,
+                    f"崩盘概率{prob:.1%}>70%，仓位降至0.25x"
+                )
+            elif prob > 0.50:
+                # Moderate risk — reduce to 0.5x position
+                constraints.reduce_weight[code] = 0.5
+                constraints.risk_reasons.setdefault(
+                    code,
+                    f"崩盘概率{prob:.1%}>50%，仓位降至0.5x"
+                )
+            elif prob > 0.30:
+                # Low-moderate risk — info only, no position change
+                constraints.risk_reasons.setdefault(
+                    code,
+                    f"崩盘概率{prob:.1%}>30%，关注风险"
+                )
 
     # ---- L1.6: Supply chain risk ----
 

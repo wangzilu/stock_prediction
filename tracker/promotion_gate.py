@@ -36,6 +36,10 @@ DEFAULT_THRESHOLDS = {
     "min_splits": 12,                   # minimum splits to evaluate
     "max_industry_deviation": 0.15,     # max single-industry active weight
     "negative_control_ic_threshold": 0.01,  # shuffled IC must be < this
+    # --- Executable PnL criteria (WARNINGS for now) ---
+    "min_cost_adjusted_spread": 0.001,  # must be positive after costs
+    "max_turnover_increase": 0.20,      # overlay can't increase turnover >20%
+    "max_single_industry_weight": 0.15, # industry concentration limit
 }
 
 
@@ -130,6 +134,42 @@ class PromotionGate:
                     )
         else:
             failures.append("No backtest.json — portfolio-level validation required for shadow")
+
+        # 3b. Executable PnL criteria (WARNINGS only — most experiments don't have these yet)
+        if bt:
+            cost_adj_spread = bt.get("cost_adjusted_spread")
+            if cost_adj_spread is not None:
+                checks["cost_adjusted_spread"] = cost_adj_spread
+                if cost_adj_spread < self.thresholds["min_cost_adjusted_spread"]:
+                    warnings.append(
+                        f"cost_adjusted_spread={cost_adj_spread:.4f} < "
+                        f"threshold={self.thresholds['min_cost_adjusted_spread']} "
+                        f"(negative after-cost spread)"
+                    )
+
+            avg_turnover = bt.get("avg_turnover")
+            if avg_turnover is not None:
+                # Flag unreasonably high turnover as a warning
+                if avg_turnover > self.thresholds["max_turnover_increase"] + self.thresholds["max_turnover"]:
+                    warnings.append(
+                        f"avg_turnover={avg_turnover:.2f} exceeds max_turnover + "
+                        f"max_turnover_increase={self.thresholds['max_turnover'] + self.thresholds['max_turnover_increase']:.2f} "
+                        f"(wildly high turnover)"
+                    )
+
+        # 3c. Industry concentration (WARNING)
+        exposure_for_concentration = art.load_exposure()
+        if exposure_for_concentration:
+            ind_weights = exposure_for_concentration.get("industry_active_weights", {})
+            if ind_weights:
+                max_abs_weight = max(abs(v) for v in ind_weights.values())
+                checks["max_single_industry_weight"] = max_abs_weight
+                if max_abs_weight > self.thresholds["max_single_industry_weight"]:
+                    warnings.append(
+                        f"max_single_industry_weight={max_abs_weight:.2f} > "
+                        f"threshold={self.thresholds['max_single_industry_weight']} "
+                        f"(industry concentration risk)"
+                    )
 
         # 4. Exposure checks
         exposure = art.load_exposure()
