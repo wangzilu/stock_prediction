@@ -1842,6 +1842,33 @@ class DailyPipeline:
             ),
             reverse=True,
         )
+
+        # Cross-sectional rank normalization for the signal_scorer input.
+        # LGB raw scores are O(1e-3) (next-day return prediction), so the
+        # downstream MID_THRESHOLD=0.3 / HIGH_THRESHOLD=0.7 thresholds in
+        # signals.scorer would never be reached and every stock degraded to
+        # "观望", emptying the horizon classifier. Rank-normalize within the
+        # has_lgb subset so top-half stocks register as 看多 and the top
+        # decile clears the 强烈看多 bar. Raw "short_score" is left intact —
+        # the new "ranked_score" feeds signal_scorer; ranking-vs-magnitude
+        # decoupling preserves the strength/expected calculations elsewhere
+        # that depend on the raw scale.
+        lgb_pool = [c for c in candidates if c.get("has_lgb")]
+        n = len(lgb_pool)
+        if n > 0:
+            scored = sorted(
+                lgb_pool,
+                key=lambda c: _finite_float(c.get("short_score")),
+                reverse=True,
+            )
+            for rank, cand in enumerate(scored):
+                # rank 0 → +1, rank N-1 → -1, linear interpolation
+                normalized = 1.0 - 2.0 * (rank / max(n - 1, 1))
+                cand["ranked_score"] = round(normalized, 4)
+        # Non-LGB candidates (crypto / gold) keep raw short_score as ranked
+        for cand in candidates:
+            cand.setdefault("ranked_score", _finite_float(cand.get("short_score")))
+
         top_candidates = candidates[:SENTIMENT_TOP_N]
         logger.info(f"Stage 1 done: {len(candidates)} total, top {len(top_candidates)} selected for deep analysis")
 
@@ -1875,7 +1902,10 @@ class DailyPipeline:
                 rec = self.signal_scorer.score_stock(
                     code=code,
                     name=display_name,
-                    model_score=cand["short_score"],
+                    # Use ranked_score (cross-sectional [-1, 1]) instead of raw
+                    # LGB output so the 0.3/0.7 thresholds in signals.scorer
+                    # can actually be reached. See Stage 1 ranking comment above.
+                    model_score=_finite_float(cand.get("ranked_score", cand.get("short_score"))),
                     sentiment_score=_finite_float(sentiment["sentiment_score"]),
                     sentiment_heat=_finite_float(sentiment["heat"]),
                     mid_term_score=mid_score,
