@@ -141,7 +141,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             "Training gate FAILED — skipping prediction. Reason: %s",
             gate_result.get("reason", "unknown"),
         )
-        write_health("lgb_smoke_predict", HealthStatus(
+        write_health("lgb_after_close_smoke", HealthStatus(
             success=False,
             error_type="GateFail",
             error_message=gate_result.get("reason", "upstream data stale")[:200],
@@ -180,14 +180,14 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     # Write health status
     if result["ok"]:
-        write_health("lgb_smoke_predict", HealthStatus(
+        write_health("lgb_after_close_smoke", HealthStatus(
             success=True,
             n_items=result.get("finite_prediction_count", 0),
             latest_date=result.get("cache_latest_date", ""),
             network_profile="domestic",
         ))
     else:
-        write_health("lgb_smoke_predict", HealthStatus(
+        write_health("lgb_after_close_smoke", HealthStatus(
             success=False,
             error_type="PredictionFailure",
             error_message=str(result.get("error", ""))[:200],

@@ -87,7 +87,7 @@ def main():
     # --- Freshness check: warn if predictions are stale ---
     from scheduler.data_health import is_fresh
     pred_fresh = (
-        is_fresh("lgb_smoke_predict") or is_fresh("lgb_after_close_smoke")
+        is_fresh("lgb_after_close_smoke")
     )
     if not pred_fresh:
         logger.warning("Using stale predictions — no fresh prediction health found for today")

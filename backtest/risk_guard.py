@@ -147,23 +147,33 @@ class RiskGuard:
         except Exception:
             pass
 
-    def _get_dynamic_stop(self, code: str) -> float:
+    def _get_dynamic_stop(self, code: str, date: str = None) -> float:
         """CX: ATR/vol dynamic threshold with clip(0.12, 0.25).
 
-        Uses vol20 from feature cache if available, else hard_stop_pct.
+        Uses vol20 from feature cache as-of `date` (PIT-safe).
+        Falls back to hard_stop_pct if data unavailable.
         """
         try:
             cache = pd.read_parquet(
                 DATA_DIR / "feature_cache_174_holder_regime_ma.parquet",
                 columns=["STD20"],
             )
-            dates = cache.index.get_level_values(0)
-            latest = dates.max()
             code_lower = code.lower()
-            if (latest, code_lower) in cache.index:
-                vol20 = float(cache.loc[(latest, code_lower), "STD20"])
+            dates = cache.index.get_level_values(0)
+
+            if date:
+                # PIT-safe: use latest date <= target date
+                target = pd.Timestamp(date)
+                avail = dates[dates <= target]
+                if avail.empty:
+                    return self.hard_stop_pct
+                use_date = avail.max()
+            else:
+                use_date = dates.max()
+
+            if (use_date, code_lower) in cache.index:
+                vol20 = float(cache.loc[(use_date, code_lower), "STD20"])
                 if np.isfinite(vol20) and vol20 > 0:
-                    # CX formula: -clip(4 * vol20, 0.12, 0.25)
                     return -max(0.12, min(0.25, self.vol_stop_multiplier * vol20))
         except Exception:
             pass
@@ -184,7 +194,7 @@ class RiskGuard:
                 continue
 
             pnl_pct = (current_price - avg_price) / avg_price
-            threshold = self._get_dynamic_stop(code)
+            threshold = self._get_dynamic_stop(code, date)
 
             if pnl_pct < threshold:
                 xgb_rank = (xgb_ranks or {}).get(code, 9999)

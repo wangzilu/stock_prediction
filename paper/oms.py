@@ -604,7 +604,14 @@ class PaperOMS:
             extra_sells = [code for code in risk.force_sell
                            if code in self.state.get("positions", {})]
         except Exception as e:
-            logger.warning(f"  RiskGuard failed (continuing without): {e}")
+            logger.warning(f"  RiskGuard FAILED: {e}")
+            # Fail-closed: if RiskGuard crashes, block all new buys.
+            # Existing positions can still be reconciled/sold.
+            risk_info["alert_level"] = "riskguard_error"
+            risk_info["error"] = str(e)[:200]
+            # Clear all predictions → no new buys
+            predictions = {}
+            logger.warning("  Fail-closed: blocked all new buys due to RiskGuard error")
 
         return predictions, extra_sells, risk_info
 
