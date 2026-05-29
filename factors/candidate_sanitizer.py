@@ -76,6 +76,9 @@ class CandidateSanitizer:
         min_listing_days: int = 60,
         crash_probs: dict | None = None,
         crash_threshold: float = 0.65,
+        chain_alpha: dict | None = None,
+        min_chain_alpha: float = -2.0,
+        cooldown_set: set | None = None,
     ):
         self.today = today or datetime.now().strftime("%Y-%m-%d")
         self.min_volume = float(min_volume)
@@ -89,6 +92,17 @@ class CandidateSanitizer:
         # 0.65 matches OMS RiskGuard's "cannot_buy" tier.
         self.crash_probs = {k.upper(): float(v) for k, v in (crash_probs or {}).items()}
         self.crash_threshold = float(crash_threshold)
+        # Supply-chain alpha negative-event filter (matches RiskGuard's
+        # _check_supply_chain_risk): alpha < -2.0 = pending_exit reason.
+        # For recommendation: never start a position in a "supply chain
+        # negative" stock even before any open position triggers force-sell.
+        self.chain_alpha = {k.upper(): float(v) for k, v in (chain_alpha or {}).items()}
+        self.min_chain_alpha = float(min_chain_alpha)
+        # Codes currently in RiskGuard cooldown (from risk_guard_state.json).
+        # Cooldown rules: stop-loss=10 calendar days, event=30, ST=until clear.
+        # The set is precomputed for today's date by the caller so the
+        # sanitizer doesn't need to read state files itself.
+        self.cooldown_set = set(c.upper() for c in (cooldown_set or set()))
         self._st_list_path = st_list_path
         self._st_set: set[str] | None = None
         self._st_load_failed = False
@@ -254,6 +268,18 @@ class CandidateSanitizer:
             if cp is not None and cp >= self.crash_threshold:
                 self._stats["high_crash_prob"] += 1
                 return False, "high_crash_prob"
+
+        # 2.7. Supply-chain alpha hard block (negative event = don't open)
+        if self.chain_alpha:
+            ca = self.chain_alpha.get(code.upper())
+            if ca is not None and ca < self.min_chain_alpha:
+                self._stats["chain_negative"] += 1
+                return False, "chain_negative"
+
+        # 2.8. RiskGuard cooldown (stop-loss / event / ST cooldown still active)
+        if self.cooldown_set and code.upper() in self.cooldown_set:
+            self._stats["in_cooldown"] += 1
+            return False, "in_cooldown"
 
         # 3-6. quote-dependent rules
         if quote is None:

@@ -34,8 +34,77 @@ EVENTS_DIR_V2 = DATA_DIR / "llm_events_v2"
 OUTPUT_PATH = DATA_DIR / "llm_event_factors.parquet"
 
 
+def _load_events_via_eventstore(start_dt: datetime, end_dt: datetime) -> pd.DataFrame | None:
+    """Try to load events via the unified EventStore. Returns None if the
+    store is unavailable / empty so the caller falls back to legacy jsonl.
+
+    Tonight's audit (P1-12) flagged that this builder bypassed EventStore
+    and read llm_events_v2/llm_events jsonl directly, which meant the 5-field
+    time-semantics work in EventStore (signal_date, execution_date, etc.)
+    didn't flow through to factor construction. Prefer EventStore; fall
+    back keeps backfill scripts working.
+    """
+    try:
+        from factors.event_store import EventStore
+    except Exception as e:
+        logger.debug("EventStore import failed (%s) — using legacy jsonl path", e)
+        return None
+    try:
+        store = EventStore()
+        df = store.query(
+            start_date=start_dt.strftime("%Y-%m-%d"),
+            end_date=end_dt.strftime("%Y-%m-%d"),
+        )
+        if df is None or df.empty:
+            return None
+        # Match the legacy schema the rest of build_llm_event_factors expects.
+        # EventStore rows have: stock_code, event_type, direction, confidence,
+        # publish_time, signal_date, source, summary, source_quality, etc.
+        # Legacy code expects file_date (proxy for "extract day") + the V2
+        # impact synthesis based on direction/is_price_sensitive.
+        df = df.copy()
+        df["file_date"] = df.get("signal_date", "")
+        # Derive qlib_code from stock_code (legacy schema expects qlib_code,
+        # EventStore only stores stock_code).
+        if "qlib_code" not in df.columns and "stock_code" in df.columns:
+            def _to_qlib(c):
+                c = str(c).strip()
+                if not c or not c[:6].isdigit() if c[:2].isalpha() else not c.isdigit():
+                    return ""
+                # bare numeric -> infer prefix
+                if c.isdigit():
+                    if c.startswith(("60", "68", "9")):
+                        return f"SH{c}"
+                    elif c.startswith(("00", "30", "20")):
+                        return f"SZ{c}"
+                    elif c.startswith(("4", "8")):
+                        return f"BJ{c}"
+                    return ""
+                return c.upper()
+            df["qlib_code"] = df["stock_code"].apply(_to_qlib)
+        # Synthesize impact from direction + sensitivity (mirrors load_events V2 branch)
+        direction = pd.to_numeric(df.get("direction", 0), errors="coerce").fillna(0)
+        is_price_sensitive = df.get("is_price_sensitive", False)
+        if not isinstance(is_price_sensitive, pd.Series):
+            is_price_sensitive = pd.Series([False] * len(df), index=df.index)
+        magnitude = is_price_sensitive.map(lambda x: 0.05 if x else 0.02)
+        if "impact_1d" not in df.columns:
+            df["impact_1d"] = direction * magnitude
+        if "impact_5d" not in df.columns:
+            df["impact_5d"] = direction * magnitude * 0.6
+        if "relevance" not in df.columns:
+            df["relevance"] = df.get("is_official_disclosure", False).map(lambda x: 1.0 if x else 0.7) if "is_official_disclosure" in df.columns else 0.7
+        if "novelty" not in df.columns:
+            df["novelty"] = df.get("is_new_information", True).map(lambda x: 0.9 if x else 0.2) if "is_new_information" in df.columns else 0.7
+        logger.info("Loaded %d events via EventStore", len(df))
+        return df
+    except Exception as e:
+        logger.warning("EventStore query failed (%s) — using legacy jsonl path", e)
+        return None
+
+
 def load_events(lookback_days: int = 30, as_of: str = None) -> pd.DataFrame:
-    """Load LLM-extracted events from JSONL files within lookback window.
+    """Load LLM-extracted events from EventStore (preferred) or JSONL files.
 
     Args:
         lookback_days: number of past days to include
@@ -50,6 +119,12 @@ def load_events(lookback_days: int = 30, as_of: str = None) -> pd.DataFrame:
     as_of_dt = datetime.strptime(as_of, "%Y-%m-%d")
     start_dt = as_of_dt - timedelta(days=lookback_days)
 
+    # 1. PRIMARY: unified EventStore
+    es_df = _load_events_via_eventstore(start_dt, as_of_dt)
+    if es_df is not None and not es_df.empty:
+        return es_df
+
+    # 2. FALLBACK: legacy jsonl files (kept for backfill scripts + DR)
     all_records = []
     for day_offset in range(lookback_days + 1):
         date = (start_dt + timedelta(days=day_offset)).strftime("%Y-%m-%d")

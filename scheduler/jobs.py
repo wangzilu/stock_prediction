@@ -743,18 +743,87 @@ class DailyPipeline:
         """Build a CandidateSanitizer for the current pipeline call.
 
         Per-call instance so reject reasons / counts are scoped to this
-        recommendation cycle and logged in summary form. Crash predictions
-        are loaded once per pipeline and reused (RiskGuard cannot_buy tier
-        applied at recommendation time, not just OMS time).
+        recommendation cycle and logged in summary form. Sources loaded:
+        - crash_predictions_latest.json    → high_crash_prob block
+        - global_chain_factors.parquet     → chain_negative block (alpha < -2.0)
+        - paper_shadow/risk_guard_state.json → in_cooldown block
+        The OMS RiskGuard layers (crash + supply chain + cooldown) thus apply
+        at recommendation time too, not just at OMS legacy execution.
         """
         today = datetime.now().strftime("%Y-%m-%d")
         crash_probs = self._load_crash_probs_for_sanitizer()
+        chain_alpha = self._load_chain_alpha_for_sanitizer(today)
+        cooldown_set = self._load_cooldown_for_sanitizer(today)
         return CandidateSanitizer(
             today=today,
             require_quote=require_quote,
             max_prediction_age_days=max_prediction_age_days,
             crash_probs=crash_probs,
+            chain_alpha=chain_alpha,
+            cooldown_set=cooldown_set,
         )
+
+    def _load_chain_alpha_for_sanitizer(self, today: str) -> dict | None:
+        """Read global_chain_factors.parquet for today's chain alpha."""
+        from config.settings import DATA_DIR
+        cached = getattr(self, "_chain_alpha_cache", None)
+        if cached is not None:
+            return cached
+        path = DATA_DIR / "global_chain_factors.parquet"
+        if not path.exists():
+            self._chain_alpha_cache = None
+            return None
+        try:
+            df = pd.read_parquet(path)
+            if df.empty or "global_chain_alpha" not in df.columns:
+                self._chain_alpha_cache = None
+                return None
+            dt = pd.Timestamp(today)
+            dates = df.index.get_level_values("datetime")
+            if dt in dates:
+                snap = df.xs(dt, level="datetime")
+            else:
+                latest = dates.max()
+                age = (dt - latest).days
+                if age > 2:
+                    logger.warning(
+                        "Chain factors stale (%s, %d days) — skipping chain block in sanitizer",
+                        latest.date(), age,
+                    )
+                    self._chain_alpha_cache = None
+                    return None
+                snap = df.xs(latest, level="datetime")
+            alpha = snap["global_chain_alpha"]
+            alpha.index = alpha.index.str.upper()
+            out = {c: float(v) for c, v in alpha.items() if pd.notna(v)}
+            self._chain_alpha_cache = out or None
+            return self._chain_alpha_cache
+        except Exception as e:
+            logger.warning("Failed to load chain alpha for sanitizer: %s", e)
+            self._chain_alpha_cache = None
+            return None
+
+    def _load_cooldown_for_sanitizer(self, today: str) -> set | None:
+        """Read RiskGuard state files (champion + shadow) and return union
+        of codes whose cooldown is still active on `today`."""
+        from config.settings import DATA_DIR
+        cached = getattr(self, "_cooldown_cache", None)
+        if cached is not None:
+            return cached
+        codes: set[str] = set()
+        for sub in ("paper", "paper_shadow"):
+            state_path = DATA_DIR / sub / "risk_guard_state.json"
+            if not state_path.exists():
+                continue
+            try:
+                state = json.loads(state_path.read_text())
+                for code, until in (state.get("cooldowns", {}) or {}).items():
+                    if isinstance(until, str) and today < until:
+                        codes.add(code.upper())
+            except Exception as e:
+                logger.warning("Failed to read %s for cooldown: %s", state_path, e)
+        self._cooldown_cache = codes or None
+        return self._cooldown_cache
 
     def _load_crash_probs_for_sanitizer(self) -> dict | None:
         """Read crash_predictions_latest.json and return {code_upper: prob}.
