@@ -74,6 +74,8 @@ class CandidateSanitizer:
         allow_bse: bool = False,
         require_quote: bool = True,
         min_listing_days: int = 60,
+        crash_probs: dict | None = None,
+        crash_threshold: float = 0.65,
     ):
         self.today = today or datetime.now().strftime("%Y-%m-%d")
         self.min_volume = float(min_volume)
@@ -81,6 +83,12 @@ class CandidateSanitizer:
         self.allow_bse = bool(allow_bse)
         self.require_quote = bool(require_quote)
         self.min_listing_days = int(min_listing_days)
+        # Crash probability hard block (mini-RiskGuard for recommendation path).
+        # crash_probs is {code_upper: prob}; codes with prob >= threshold are
+        # rejected even before the LGB ranking + sanitizer chain. Threshold
+        # 0.65 matches OMS RiskGuard's "cannot_buy" tier.
+        self.crash_probs = {k.upper(): float(v) for k, v in (crash_probs or {}).items()}
+        self.crash_threshold = float(crash_threshold)
         self._st_list_path = st_list_path
         self._st_set: set[str] | None = None
         self._st_load_failed = False
@@ -239,6 +247,13 @@ class CandidateSanitizer:
         if new_listing is True:
             self._stats["new_listing"] += 1
             return False, "new_listing"
+
+        # 2.6. Crash probability hard block
+        if self.crash_probs:
+            cp = self.crash_probs.get(code.upper())
+            if cp is not None and cp >= self.crash_threshold:
+                self._stats["high_crash_prob"] += 1
+                return False, "high_crash_prob"
 
         # 3-6. quote-dependent rules
         if quote is None:

@@ -127,13 +127,15 @@ class LLMEventExtractorV2:
             "prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0,
         }
 
-    def _record_stats(self, http_ok: bool, parse_ok: bool, usage: dict):
+    def _record_stats(self, http_ok: bool, parse_ok: bool, usage: dict, rate_limited: bool = False):
         with self._stats_lock:
             self._stats["calls"] += 1
             if not http_ok:
                 self._stats["http_fail"] += 1
             elif not parse_ok:
                 self._stats["parse_fail"] += 1
+            if rate_limited:
+                self._stats["rate_limited"] = self._stats.get("rate_limited", 0) + 1
             self._stats["prompt_tokens"] += usage.get("prompt_tokens", 0)
             self._stats["completion_tokens"] += usage.get("completion_tokens", 0)
             self._stats["reasoning_tokens"] += usage.get("reasoning_tokens", 0)
@@ -149,10 +151,21 @@ class LLMEventExtractorV2:
             self._call_timestamps.append(time.time())
 
     def _call_llm(self, user_prompt: str) -> tuple[str, dict]:
-        """Returns (text, usage). usage has http_ok + token counts."""
+        """Returns (text, usage). usage has http_ok + token counts.
+
+        Retry policy: 4 attempts. 429 (RPM exceeded) gets exponential backoff
+        with jitter (5s, 15s, 45s, +/- 30% random); other transient errors
+        get a flat 3s wait between attempts. The previous policy (2 attempts,
+        flat 3s) dropped 273 of 425 calls today on the rerun because the
+        4-thread burst pattern hit MiniMax-Text-01's RPM cap and each thread
+        only waited 3s before giving up.
+        """
+        import random
         self._rate_limit()
         last_err = None
-        for attempt in range(2):
+        last_was_429 = False
+        backoffs_429 = [5.0, 15.0, 45.0]
+        for attempt in range(4):
             try:
                 resp = requests.post(
                     self.api_url,
@@ -166,11 +179,17 @@ class LLMEventExtractorV2:
                 )
                 if resp.status_code != 200:
                     last_err = f"HTTP {resp.status_code} {resp.text[:200]}"
-                    if attempt == 0:
-                        time.sleep(3)
+                    last_was_429 = resp.status_code == 429
+                    if attempt < 3:
+                        if last_was_429 and attempt < len(backoffs_429):
+                            base = backoffs_429[attempt]
+                            wait = base * random.uniform(0.7, 1.3)
+                        else:
+                            wait = 3.0
+                        time.sleep(wait)
                         continue
-                    logger.warning("V2 LLM call failed: %s", last_err)
-                    return "", {"http_ok": False}
+                    logger.warning("V2 LLM call failed after 4 attempts: %s", last_err)
+                    return "", {"http_ok": False, "rate_limited": last_was_429}
                 body = resp.json()
                 text = body["choices"][0]["message"]["content"]
                 text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
@@ -184,10 +203,10 @@ class LLMEventExtractorV2:
                 }
             except Exception as e:
                 last_err = repr(e)
-                if attempt == 0:
-                    time.sleep(3)
+                if attempt < 3:
+                    time.sleep(3.0 * random.uniform(0.7, 1.3))
         if last_err:
-            logger.warning("V2 LLM exception: %s", last_err)
+            logger.warning("V2 LLM exception after 4 attempts: %s", last_err)
         return "", {"http_ok": False}
 
     def _parse_response(self, text: str) -> dict | None:
@@ -262,7 +281,12 @@ class LLMEventExtractorV2:
             prompt += f"\n内容: {content[:300]}"
         text, usage = self._call_llm(prompt)
         event = self._parse_response(text)
-        self._record_stats(usage.get("http_ok", False), event is not None, usage)
+        self._record_stats(
+            usage.get("http_ok", False),
+            event is not None,
+            usage,
+            rate_limited=usage.get("rate_limited", False),
+        )
         return event
 
     def extract_from_news_file(self, news_path: Path, max_news_per_stock: int = 1,
@@ -357,9 +381,10 @@ class LLMEventExtractorV2:
         if s["calls"]:
             avg_tok = (s["prompt_tokens"] + s["completion_tokens"]) / s["calls"]
             logger.info(
-                "V2 LLM stats: model=%s calls=%d http_fail=%d parse_fail=%d "
-                "prompt_tok=%d completion_tok=%d reason_tok=%d avg_tok/call=%.0f",
-                self.model, s["calls"], s["http_fail"], s["parse_fail"],
-                s["prompt_tokens"], s["completion_tokens"], s["reasoning_tokens"], avg_tok,
+                "V2 LLM stats: model=%s calls=%d http_fail=%d (rate_limited=%d) "
+                "parse_fail=%d prompt_tok=%d completion_tok=%d reason_tok=%d avg_tok/call=%.0f",
+                self.model, s["calls"], s["http_fail"], s.get("rate_limited", 0),
+                s["parse_fail"], s["prompt_tokens"], s["completion_tokens"],
+                s["reasoning_tokens"], avg_tok,
             )
         return output_path

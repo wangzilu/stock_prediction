@@ -743,14 +743,55 @@ class DailyPipeline:
         """Build a CandidateSanitizer for the current pipeline call.
 
         Per-call instance so reject reasons / counts are scoped to this
-        recommendation cycle and logged in summary form.
+        recommendation cycle and logged in summary form. Crash predictions
+        are loaded once per pipeline and reused (RiskGuard cannot_buy tier
+        applied at recommendation time, not just OMS time).
         """
         today = datetime.now().strftime("%Y-%m-%d")
+        crash_probs = self._load_crash_probs_for_sanitizer()
         return CandidateSanitizer(
             today=today,
             require_quote=require_quote,
             max_prediction_age_days=max_prediction_age_days,
+            crash_probs=crash_probs,
         )
+
+    def _load_crash_probs_for_sanitizer(self) -> dict | None:
+        """Read crash_predictions_latest.json and return {code_upper: prob}.
+
+        Cached on the instance; mtime-checked. Returns None if file missing
+        or older than 3 days (sanitizer treats None as 'no filter applied').
+        """
+        from config.settings import DATA_DIR
+        cached = getattr(self, "_crash_probs_cache", None)
+        if cached is not None:
+            return cached
+        path = DATA_DIR / "crash_predictions_latest.json"
+        if not path.exists():
+            self._crash_probs_cache = None
+            return None
+        try:
+            payload = json.loads(path.read_text())
+            pred_date = payload.get("date", "")
+            try:
+                pd_dt = datetime.strptime(pred_date[:10], "%Y-%m-%d")
+                age = (datetime.now() - pd_dt).days
+                if age > 3:
+                    logger.warning(
+                        "crash_predictions_latest.json is %d days stale (date=%s) — skipping crash hard-block",
+                        age, pred_date,
+                    )
+                    self._crash_probs_cache = None
+                    return None
+            except (ValueError, TypeError):
+                pass
+            preds = payload.get("predictions", {}) or {}
+            self._crash_probs_cache = {str(k).upper(): float(v) for k, v in preds.items()}
+            return self._crash_probs_cache
+        except Exception as e:
+            logger.warning("Failed to load crash predictions: %s", e)
+            self._crash_probs_cache = None
+            return None
 
     def _candidates_from_stock_snapshot(
         self,

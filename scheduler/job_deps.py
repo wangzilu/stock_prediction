@@ -23,32 +23,50 @@ STATUS_DIR: Path = DATA_DIR / "job_status"
 # ---------------------------------------------------------------------------
 
 JOB_DEPS: dict[str, list[str]] = {
-    # Data ingestion — no upstream
+    # ---- Data ingestion — no upstream ------------------------------------
     "qlib_data_update": [],
     "spot_cache_warmup": [],
-    # Post-data-update processing
+    "global_industry_news": [],
+    "sentiment_daily": [],
+    "guba_popularity": [],
+    "llm_event_pipeline": [],
+    "llm_event_retry": ["llm_event_pipeline"],
+    # ---- Post-data-update processing -------------------------------------
     "fund_flow_update": ["qlib_data_update"],
     "valuation_update": ["qlib_data_update"],
     "regime_daily_update": ["qlib_data_update"],
-    # Training and inference depend on fresh data
-    "midweek_train": ["qlib_data_update"],
-    "lgb_after_close_smoke": ["qlib_data_update"],
-    "weekly_full_retrain": ["qlib_data_update"],
-    # Shadow optimizer + paper trading depend on smoke test
-    "shadow_optimizer": ["lgb_after_close_smoke"],
+    "global_chain_extract": ["global_industry_news"],
+    "global_chain_factors": ["global_chain_extract"],
+    # Feature cache rebuild reads qlib + holder + flow into a single parquet
+    "feature_cache_rebuild": ["qlib_data_update", "fund_flow_update"],
+    # ---- Training and inference depend on fresh cache --------------------
+    "midweek_train": ["feature_cache_rebuild"],
+    "lgb_after_close_smoke": ["feature_cache_rebuild"],
+    "weekly_full_retrain": ["feature_cache_rebuild"],
+    "predict_crash_daily": ["feature_cache_rebuild"],
+    # ---- Shadow optimizer + paper trading depend on smoke test -----------
+    "shadow_optimizer": ["lgb_after_close_smoke", "predict_crash_daily"],
     "paper_trading": ["lgb_after_close_smoke"],
-    # Factor monitoring depends on data
-    "factor_decay_monitor": ["qlib_data_update"],
-    "brinson_attribution": ["qlib_data_update"],
-    # Push jobs — morning needs data (previous day), evening needs data
+    # Shadow overlays (each needs the smoke + their own factor source)
+    "shadow_chain_overlay": ["lgb_after_close_smoke", "global_chain_factors"],
+    "shadow_klen_overlay": ["lgb_after_close_smoke"],
+    "shadow_vol_compression": ["lgb_after_close_smoke"],
+    "shadow_roc5_tsmin10": ["lgb_after_close_smoke"],
+    # ---- Factor monitoring depends on data -------------------------------
+    "factor_decay_monitor": ["lgb_after_close_smoke"],
+    "brinson_attribution": ["lgb_after_close_smoke"],
+    # ---- Push jobs ------------------------------------------------------
+    # Morning needs yesterday's after-close training cache — gated by
+    # lgb_after_close_smoke's success the previous evening, not today's.
+    # Without per-date "yesterday" support in check_upstream, we leave the
+    # morning push ungated and rely on the freshness gate in run_paper_trading
+    # and CandidateSanitizer to refuse stale predictions.
     "morning_recommendation": [],
     "sell_check": [],
     "daily_summary": [],
     "evening_outlook": ["qlib_data_update"],
-    # Ancillary
+    # ---- Ancillary ------------------------------------------------------
     "risk_check": [],
-    "llm_event_pipeline": [],
-    "guba_popularity": [],
     "daily_health_check": ["qlib_data_update"],
 }
 

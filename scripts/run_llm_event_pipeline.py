@@ -168,13 +168,18 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
         logger.debug(traceback.format_exc())
         return False
 
-    # Step 1.5: Filter news through event_filter (Phase 4T-3)
-    # Writes filtered output to a SEPARATE file; the raw daily_news/ file is
-    # preserved untouched (downstream backfill + health_check depend on it).
-    logger.info("[Step 1.5/3] Filtering news via event_filter...")
-    filtered_path = news_path  # fallback if filter is unavailable
+    # Step 1.5: L0 classify + ranking filter, then write filtered output.
+    # L0 classify_l0() partitions items into: direct (rule-emits structured
+    # event, skips LLM), drop (noise), dup (already extracted from cache),
+    # and l1 (default LLM path). The ranking filter then trims l1 to top-N.
+    # Direct events get appended to the V2 jsonl ahead of Step 2 so the
+    # extractor can resume / dedup against them.
+    # Raw daily_news/ stays untouched; filtered output goes to a sister dir.
+    logger.info("[Step 1.5/3] L0 classify + event_filter ranking...")
+    filtered_path = news_path
+    direct_events: list[dict] = []
     try:
-        from factors.event_filter import filter_candidates, select_for_llm
+        from factors.event_filter import classify_l0, filter_candidates, select_for_llm
         import json as _json_filter
 
         if news_path.exists():
@@ -191,11 +196,26 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
 
             total_before = len(raw_items)
             if total_before > 0:
-                scored = filter_candidates(raw_items)
+                # L0 classify with persistent dedup cache
+                l0_cache = DATA_DIR / "llm_event_cache" / "seen.jsonl"
+                routed = classify_l0(
+                    raw_items, extract_date=target_date, cache_path=l0_cache,
+                )
+                stats = routed["stats"]
+                logger.info(
+                    "  L0 routing: total=%d direct=%d l1=%d drop=%d dup=%d rules=%s",
+                    stats["total_in"], stats["direct"], stats["l1"],
+                    stats["drop"], stats["dup"], stats["rule_hits"],
+                )
+                direct_events = routed["direct"]
+
+                # Rank-and-cap the L1 stream
+                scored = filter_candidates(routed["l1"])
                 selected = select_for_llm(scored)
                 total_after = len(selected)
                 logger.info(
-                    f"  Filtered {total_before} items -> {total_after} for LLM extraction"
+                    "  Rank+select: %d L1 candidates -> %d for LLM",
+                    len(routed["l1"]), total_after,
                 )
 
                 filtered_dir = news_path.parent.parent / "daily_news_filtered"
@@ -205,6 +225,7 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
                     for item in selected:
                         item.pop("priority_score", None)
                         item.pop("must_send", None)
+                        item.pop("_l2_hint", None)
                         f.write(_json_filter.dumps(item, ensure_ascii=False) + "\n")
             else:
                 logger.info("  No items to filter")
@@ -219,9 +240,9 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
         logger.warning(
             "  event_filter failed (non-fatal, using unfiltered news): %s", e
         )
+        import traceback as _tb
+        logger.debug(_tb.format_exc())
 
-    # From here on, downstream LLM extraction reads the filtered file (or raw
-    # if the filter step bailed out).
     news_path = filtered_path
 
     # Step 2: Extract events via LLM (120-min timeout for full-A 5000 stocks)
@@ -271,6 +292,22 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
         finally:
             _signal.alarm(0)
             _signal.signal(_signal.SIGALRM, old_handler)
+
+        # Append L0 direct events (rule-classified routines, no LLM call)
+        # to the V2 jsonl AFTER the extractor writes so they aren't wiped
+        # by extract_from_news_file's "fewer than 500 rows => rewrite" guard.
+        if events_path is not None and direct_events:
+            try:
+                import json as _json_l0
+                with open(events_path, "a", encoding="utf-8") as f:
+                    for ev in direct_events:
+                        f.write(_json_l0.dumps(ev, ensure_ascii=False) + "\n")
+                logger.info(
+                    "  L0 direct events appended: %d -> %s",
+                    len(direct_events), events_path,
+                )
+            except Exception as e:
+                logger.warning("L0 direct events append failed (non-fatal): %s", e)
 
         # Write to unified EventStore (PRIMARY path, non-fatal on failure)
         if events_path is not None:
