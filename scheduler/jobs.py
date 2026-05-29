@@ -730,6 +730,34 @@ class DailyPipeline:
             return None
         return payload
 
+    def _is_st_or_excluded(self, name: str, code: str) -> bool:
+        """Return True if this stock should be excluded from recommendations.
+
+        Mirrors the training-time tradable_mask filter (which excludes ST /
+        *ST / 退市整理), so that recommendation inference doesn't surface
+        stocks the model was never trained to score safely. The previous
+        implementation only enforced this in training, leaving inference to
+        push ST names whenever their model score happened to be high.
+        """
+        nm = (name or "").strip()
+        if nm.startswith("ST") or nm.startswith("*ST") or "退" in nm:
+            return True
+        # Membership in st_stock_list.json (refreshed weekly via fetch_st_list.py).
+        # Cache the set on first call.
+        if getattr(self, "_st_set_cache", None) is None:
+            try:
+                import json as _json_st
+                from config.settings import DATA_DIR
+                st_path = DATA_DIR / "st_stock_list.json"
+                self._st_set_cache = (
+                    set(s.upper() for s in _json_st.loads(st_path.read_text()))
+                    if st_path.exists() else set()
+                )
+            except Exception as e:
+                logger.warning("ST list load failed (filter degrades open): %s", e)
+                self._st_set_cache = set()
+        return (code or "").upper() in self._st_set_cache
+
     def _candidates_from_stock_snapshot(
         self,
         snapshot: dict,
@@ -738,11 +766,16 @@ class DailyPipeline:
     ) -> list[dict]:
         """Convert a persisted 22:00 stock snapshot into morning candidates."""
         candidates = []
+        n_st_skipped = 0
         for item in snapshot.get("items", []):
             if not isinstance(item, dict):
                 continue
             code = str(item.get("code", "")).upper().strip()
             if code[:2] not in ("SH", "SZ", "BJ"):
+                continue
+            name = str(item.get("name") or code[-6:])
+            if self._is_st_or_excluded(name, code):
+                n_st_skipped += 1
                 continue
             short_score = _finite_float(item.get("model_score", item.get("lgb_score")))
             if short_score <= 0:
@@ -750,7 +783,7 @@ class DailyPipeline:
             has_lgb = bool(item.get("has_lgb", item.get("score_source") == "ml_model"))
             candidate = {
                 "code": code,
-                "name": str(item.get("name") or code[-6:]),
+                "name": name,
                 "market": MARKET_STOCK,
                 "short_score": short_score,
                 "has_lgb": has_lgb,
@@ -768,11 +801,14 @@ class DailyPipeline:
                 candidate["next_day_change_pct"] = self._estimate_next_day_change_pct(candidate)
             candidates.append(candidate)
 
+        if n_st_skipped:
+            logger.info("Snapshot candidates: filtered %d ST/excluded stocks", n_st_skipped)
         return candidates
 
     def _build_stock_candidates(self, lgb_preds: dict, stock_macro: float) -> list[dict]:
         """Build A-share candidates with model-covered stocks preferred when available."""
         candidates = []
+        n_st_skipped = 0
         self.market_collector._load_spot_cache()
         spot = self.market_collector._spot_cache
         lgb_available = bool(lgb_preds) and getattr(self, "_lgb_status", {}).get("status") == "ok"
@@ -781,6 +817,9 @@ class DailyPipeline:
             logger.warning("Spot cache empty, falling back to watchlist")
             for code, name, market in WATCHLIST:
                 if market != MARKET_STOCK:
+                    continue
+                if self._is_st_or_excluded(name, code):
+                    n_st_skipped += 1
                     continue
                 quote = self._get_quote(code, market)
                 if not quote:
@@ -825,6 +864,10 @@ class DailyPipeline:
                     continue
 
                 qlib_code = self._qlib_code_from_spot_code(code_num)
+                name = str(row.get("名称", code_num))
+                if self._is_st_or_excluded(name, qlib_code):
+                    n_st_skipped += 1
+                    continue
                 has_lgb = qlib_code in lgb_preds
 
                 short_score = _finite_float(lgb_preds.get(qlib_code)) if has_lgb else self._fallback_quant_score(
@@ -838,7 +881,7 @@ class DailyPipeline:
                 flow_score = self._capital_flow_score(qlib_code)
                 candidate = {
                     "code": qlib_code,
-                    "name": str(row.get("名称", code_num)),
+                    "name": name,
                     "market": MARKET_STOCK,
                     "short_score": short_score,
                     "has_lgb": has_lgb,
@@ -863,10 +906,11 @@ class DailyPipeline:
             reverse=True,
         )
         logger.info(
-            "Screened %s A-share candidates from spot (%s model scores, lgb_available=%s)",
+            "Screened %s A-share candidates from spot (%s model scores, lgb_available=%s, st_skipped=%d)",
             len(candidates),
             len(lgb_preds),
             lgb_available,
+            n_st_skipped,
         )
         return candidates
 
