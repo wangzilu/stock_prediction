@@ -36,6 +36,12 @@ class CronJob:
     network: str = "none"       # domestic/global/none/llm/push
     timeout_sec: int = 0        # 0 = no limit
     critical: bool = False      # True = downstream depends on this
+    # When True, run_with_status is invoked with --enforce-deps so cron will
+    # short-circuit (exit 75) if any upstream from scheduler.job_deps hasn't
+    # successfully completed today. Opt-in per job so the first cycle after
+    # rollout doesn't brick jobs whose upstream hasn't written its status
+    # file yet.
+    enforce_deps: bool = False
 
 
 def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_ROOT) -> list[CronJob]:
@@ -117,31 +123,38 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("midweek_train", "15 18 * * 3",
                 [py, str(scripts / "train_lgb.py")], "lgb_after_close_train.log",
                 network="none", timeout_sec=7200),
+        # --- Feature cache rebuild (depends on qlib_data_update + fund_flow_update) ---
+        CronJob("feature_cache_rebuild", "25 18 * * 1-5",
+                [py, str(scripts / "build_feature_cache.py"), "--all"], "feature_cache_rebuild.log",
+                network="domestic", timeout_sec=1800, critical=True),
         # --- Prediction + Paper (none, critical) ---
+        # Smoke depends on feature_cache_rebuild; downstream paper/shadow
+        # opt into --enforce-deps so stale upstream blocks rather than
+        # silently trades on yesterday's signal.
         CronJob("lgb_after_close_smoke", "35 18 * * 1-5",
                 [py, str(scripts / "smoke_lgb_predict.py")], "lgb_after_close_smoke.log",
-                network="none", timeout_sec=900, critical=True),
+                network="none", timeout_sec=900, critical=True, enforce_deps=True),
         CronJob("predict_crash_daily", "37 18 * * 1-5",
                 [py, str(scripts / "predict_crash_daily.py")], "crash_predict.log",
-                network="none", timeout_sec=120),
+                network="none", timeout_sec=120, enforce_deps=True),
         CronJob("shadow_optimizer", "40 18 * * 1-5",
                 [py, str(scripts / "run_shadow_optimizer.py")], "shadow_optimizer.log",
-                network="none", timeout_sec=600),
+                network="none", timeout_sec=600, enforce_deps=True),
         CronJob("paper_trading", "42 18 * * 1-5",
                 [py, str(scripts / "run_paper_trading.py")], "paper_trading.log",
-                network="none", timeout_sec=600),
+                network="none", timeout_sec=600, enforce_deps=True),
         CronJob("shadow_chain_overlay", "45 18 * * 1-5",
                 [py, str(scripts / "shadow_supply_chain_overlay.py")], "shadow_chain_overlay.log",
-                network="none", timeout_sec=120),
+                network="none", timeout_sec=120, enforce_deps=True),
         CronJob("shadow_klen_overlay", "46 18 * * 1-5",
                 [py, str(scripts / "shadow_klen_overlay.py")], "shadow_klen_overlay.log",
-                network="none", timeout_sec=120),
+                network="none", timeout_sec=120, enforce_deps=True),
         CronJob("shadow_vol_compression", "47 18 * * 1-5",
                 [py, str(scripts / "shadow_vol_compression.py")], "shadow_vol_compression.log",
-                network="none", timeout_sec=120),
+                network="none", timeout_sec=120, enforce_deps=True),
         CronJob("shadow_roc5_tsmin10", "48 18 * * 1-5",
                 [py, str(scripts / "shadow_roc5_tsmin10.py")], "shadow_roc5_tsmin10.log",
-                network="none", timeout_sec=120),
+                network="none", timeout_sec=120, enforce_deps=True),
         # --- Monitoring (none) ---
         CronJob("factor_decay_monitor", "49 18 * * 1-5",
                 [py, str(scripts / "monitor_factor_decay.py")], "factor_decay.log",
@@ -194,13 +207,15 @@ def render_job(job: CronJob, python_bin: str = DEFAULT_PYTHON, project_root: Pat
     network_cmd += ["--"] + inner_cmd
 
     # Wrap with run_with_status.py (job status tracking)
-    command = [
+    status_args = [
         python_bin,
         str(status_wrapper),
         "--job-id", job.job_id,
         "--cwd", str(project_root),
-        "--",
-    ] + network_cmd
+    ]
+    if job.enforce_deps:
+        status_args.append("--enforce-deps")
+    command = status_args + ["--"] + network_cmd
 
     return (
         f"{job.schedule} "

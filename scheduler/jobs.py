@@ -739,8 +739,15 @@ class DailyPipeline:
         return payload
 
     def _make_sanitizer(self, *, require_quote: bool = True,
-                        max_prediction_age_days: int = 3) -> CandidateSanitizer:
+                        max_prediction_age_days: int = 3,
+                        target_date: str | None = None) -> CandidateSanitizer:
         """Build a CandidateSanitizer for the current pipeline call.
+
+        target_date: the date the pipeline is generating signals FOR. For
+        live runs equals system today; for backfill / --date / shadow replay
+        it can differ, and IPO-age / chain-stale / cooldown checks must use
+        that date, not wall-clock today. Defaults to the pipeline's recorded
+        target_date if set on the instance, otherwise system today.
 
         Per-call instance so reject reasons / counts are scoped to this
         recommendation cycle and logged in summary form. Sources loaded:
@@ -750,7 +757,11 @@ class DailyPipeline:
         The OMS RiskGuard layers (crash + supply chain + cooldown) thus apply
         at recommendation time too, not just at OMS legacy execution.
         """
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = (
+            target_date
+            or getattr(self, "_pipeline_target_date", None)
+            or datetime.now().strftime("%Y-%m-%d")
+        )
         crash_probs = self._load_crash_probs_for_sanitizer()
         chain_alpha = self._load_chain_alpha_for_sanitizer(today)
         cooldown_set = self._load_cooldown_for_sanitizer(today)
@@ -842,18 +853,29 @@ class DailyPipeline:
         try:
             payload = json.loads(path.read_text())
             pred_date = payload.get("date", "")
+            # Fail-CLOSED on bad/missing date: crash hard-block is a
+            # safety signal, so an unverifiable provenance date means we
+            # disable it rather than silently apply predictions from an
+            # unknown vintage. (Previous behaviour: pass-through and
+            # apply anyway, which could mis-reject candidates from a
+            # week-old file.)
             try:
-                pd_dt = datetime.strptime(pred_date[:10], "%Y-%m-%d")
-                age = (datetime.now() - pd_dt).days
-                if age > 3:
-                    logger.warning(
-                        "crash_predictions_latest.json is %d days stale (date=%s) — skipping crash hard-block",
-                        age, pred_date,
-                    )
-                    self._crash_probs_cache = None
-                    return None
+                pd_dt = datetime.strptime(str(pred_date)[:10], "%Y-%m-%d")
             except (ValueError, TypeError):
-                pass
+                logger.warning(
+                    "crash_predictions_latest.json has unparseable date=%r — skipping crash hard-block",
+                    pred_date,
+                )
+                self._crash_probs_cache = None
+                return None
+            age = (datetime.now() - pd_dt).days
+            if age > 3:
+                logger.warning(
+                    "crash_predictions_latest.json is %d days stale (date=%s) — skipping crash hard-block",
+                    age, pred_date,
+                )
+                self._crash_probs_cache = None
+                return None
             preds = payload.get("predictions", {}) or {}
             self._crash_probs_cache = {str(k).upper(): float(v) for k, v in preds.items()}
             return self._crash_probs_cache
@@ -1041,10 +1063,12 @@ class DailyPipeline:
         # ST/BJ/suspended/一字板 tickers even though they're not user-pushed.
         spot = self._spot_lookup()
         sanitizer = self._make_sanitizer(require_quote=False)
-        sanitized_preds = [
-            (code, score) for code, score in sorted_preds
-            if sanitizer.check(code, str((spot.get(code) or {}).get("名称", "")), quote=spot.get(code))[0]
-        ]
+        sanitized_preds = []
+        for code, score in sorted_preds:
+            quote = spot.get(code)  # pandas Series or None — `Series or {}` raises
+            name = str(quote.get("名称", "")) if quote is not None else ""
+            if sanitizer.check(code, name, quote=quote)[0]:
+                sanitized_preds.append((code, score))
         sanitizer.log_summary(label="intraday_index_forecast")
         market_prediction = self.index_predictor.predict(
             global_indices=global_index_data,
@@ -1125,10 +1149,12 @@ class DailyPipeline:
         sorted_preds = sorted(lgb_preds.items(), key=lambda item: item[1], reverse=True)
         spot = self._spot_lookup()
         sanitizer = self._make_sanitizer(require_quote=False)
-        sanitized_preds = [
-            (code, score) for code, score in sorted_preds
-            if sanitizer.check(code, str((spot.get(code) or {}).get("名称", "")), quote=spot.get(code))[0]
-        ]
+        sanitized_preds = []
+        for code, score in sorted_preds:
+            quote = spot.get(code)
+            name = str(quote.get("名称", "")) if quote is not None else ""
+            if sanitizer.check(code, name, quote=quote)[0]:
+                sanitized_preds.append((code, score))
         sanitizer.log_summary(label="morning_final_index_forecast")
         market_prediction = self.index_predictor.predict(
             as_of=now,
@@ -2159,10 +2185,12 @@ class DailyPipeline:
         sorted_preds = sorted(lgb_preds.items(), key=lambda x: x[1], reverse=True)
         spot = self._spot_lookup()
         idx_sanitizer = self._make_sanitizer(require_quote=False)
-        sanitized_preds = [
-            (code, score) for code, score in sorted_preds
-            if idx_sanitizer.check(code, str((spot.get(code) or {}).get("名称", "")), quote=spot.get(code))[0]
-        ]
+        sanitized_preds = []
+        for code, score in sorted_preds:
+            quote = spot.get(code)
+            name = str(quote.get("名称", "")) if quote is not None else ""
+            if idx_sanitizer.check(code, name, quote=quote)[0]:
+                sanitized_preds.append((code, score))
         idx_sanitizer.log_summary(label="evening_index_top_bull_bear")
         top_bull = sanitized_preds[:10]
         top_bear = sanitized_preds[-5:]

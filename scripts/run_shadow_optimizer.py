@@ -38,6 +38,8 @@ def main():
     group.add_argument("--reset", action="store_true")
     group.add_argument("--compare", action="store_true")
     parser.add_argument("--date", type=str, default=None)
+    parser.add_argument("--force-stale", action="store_true",
+                        help="Run even if prediction freshness check fails (default: abort)")
     args = parser.parse_args()
 
     from paper.oms import PaperOMS
@@ -91,6 +93,22 @@ def main():
     # Run daily
     date = args.date or datetime.now().strftime("%Y-%m-%d")
     logger.info(f"=== Shadow Optimizer: {date} ===")
+
+    # Mirror champion's freshness gate (run_paper_trading.py). Without this,
+    # champion refuses to act on stale predictions but shadow keeps riding
+    # them, poisoning the comparison the whole shadow experiment is supposed
+    # to provide. Pass --force-stale to override.
+    try:
+        from scheduler.data_health import is_fresh
+        if not is_fresh("lgb_after_close_smoke") and not getattr(args, "force_stale", False):
+            logger.error(
+                "Refusing to run shadow optimizer: no fresh prediction health for today "
+                "(lgb_after_close_smoke). Pass --force-stale to override."
+            )
+            sys.exit(2)
+    except ImportError:
+        logger.warning("Freshness gate unavailable (scheduler.data_health) — proceeding without it")
+
     pnl = oms.run_daily(date)
 
     # Handle pending mode

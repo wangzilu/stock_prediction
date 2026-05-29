@@ -68,19 +68,21 @@ def _load_events_via_eventstore(start_dt: datetime, end_dt: datetime) -> pd.Data
         # EventStore only stores stock_code).
         if "qlib_code" not in df.columns and "stock_code" in df.columns:
             def _to_qlib(c):
-                c = str(c).strip()
-                if not c or not c[:6].isdigit() if c[:2].isalpha() else not c.isdigit():
+                c = str(c).strip().upper()
+                if not c:
                     return ""
-                # bare numeric -> infer prefix
-                if c.isdigit():
+                # Already a qlib code (SH/SZ/BJ + 6 digits)
+                if len(c) == 8 and c[:2] in ("SH", "SZ", "BJ") and c[2:].isdigit():
+                    return c
+                # Bare numeric -> infer prefix
+                if c.isdigit() and len(c) == 6:
                     if c.startswith(("60", "68", "9")):
                         return f"SH{c}"
-                    elif c.startswith(("00", "30", "20")):
+                    if c.startswith(("00", "30", "20")):
                         return f"SZ{c}"
-                    elif c.startswith(("4", "8")):
+                    if c.startswith(("4", "8")):
                         return f"BJ{c}"
-                    return ""
-                return c.upper()
+                return ""
             df["qlib_code"] = df["stock_code"].apply(_to_qlib)
         # Synthesize impact from direction + sensitivity (mirrors load_events V2 branch)
         direction = pd.to_numeric(df.get("direction", 0), errors="coerce").fillna(0)
