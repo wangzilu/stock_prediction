@@ -872,6 +872,49 @@ class PaperOMS:
 
         return filled
 
+    def reconcile_pending_history(self, today: str = None) -> dict:
+        """Reconcile any prior pending orders whose T+1 data is now available.
+
+        Walks pending_orders_*.json in chronological order. For each with
+        status != "filled" and signal_date < today, calls reconcile(). Stops
+        at the first deferral — by construction, if signal_date N defers
+        because T+1=N+1 has no Qlib data, no later signal_date will either.
+
+        Without this, run_daily(today) only reconciles today's orders
+        (which always defer for live runs since T+1 is the future), so the
+        OMS state never advances past the last manual reconcile.
+        """
+        today = today or datetime.now().strftime("%Y-%m-%d")
+        pending_files = sorted(self._state_dir.glob("pending_orders_*.json"))
+
+        replayed, deferred, skipped = 0, 0, 0
+        for path in pending_files:
+            signal_date = path.stem.replace("pending_orders_", "")
+            if signal_date >= today:
+                continue
+            try:
+                data = json.loads(path.read_text())
+            except Exception:
+                continue
+            if data.get("status") == "filled":
+                continue
+            result = self.reconcile(signal_date)
+            status = result.get("status")
+            if status == "pending":
+                deferred += 1
+                break
+            elif status == "filled":
+                replayed += 1
+            else:
+                skipped += 1
+
+        if replayed or deferred:
+            logger.info(
+                "  Reconcile history: %d replayed, %d deferred, %d skipped",
+                replayed, deferred, skipped,
+            )
+        return {"replayed": replayed, "deferred": deferred, "skipped": skipped}
+
     # ------------------------------------------------------------------
     # Legacy single-step entry point (backward compatible)
     # ------------------------------------------------------------------
@@ -882,13 +925,17 @@ class PaperOMS:
         In "legacy" mode (default): runs the original single-step flow where
         orders are generated and filled in the same call.
 
-        In "pending" mode: calls generate_orders() then reconcile() in
-        sequence.  reconcile() may return status="pending" if T+1 prices
-        are not yet available.
+        In "pending" mode: replays any historical pending orders whose T+1
+        data is now available, then calls generate_orders() and reconcile()
+        for *date*. reconcile(date) typically defers in live runs since T+1
+        prices are not yet known.
         """
         date = date or datetime.now().strftime("%Y-%m-%d")
 
         if self.mode == "pending":
+            # Walk forward through any unfilled history first
+            self.reconcile_pending_history(today=date)
+
             gen = self.generate_orders(date)
             if gen.get("status") in ("no_predictions",):
                 # Still update holding days and PnL
