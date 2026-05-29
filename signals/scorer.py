@@ -60,7 +60,9 @@ class SignalScorer:
         self,
         weight_short: float = 0.4,
         weight_mid: float = 0.3,
-        weight_sentiment: float = 0.2,
+        weight_sentiment: float = 0.0,  # Disabled: SnowNLP trained on product reviews,
+        # no backtest evidence of alpha. Will re-enable with validated sentiment
+        # source (guba heat contrarian overlay) after 60+ day accumulation.
         weight_macro: float = 0.0,  # Demoted: LLM geo 33% accuracy, worse than random
     ):
         self.weight_short = weight_short
