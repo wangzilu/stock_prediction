@@ -297,8 +297,17 @@ def _validate_event(event: dict) -> tuple[dict, list[str]]:
     if event.get("execution_date"):
         out["execution_date"] = event["execution_date"]
     else:
-        # execution_date = signal_date (T+1 open execution assumed)
-        out["execution_date"] = out["signal_date"]
+        # execution_date = next business day after signal_date.
+        # signal_date is the first trading day the event becomes actionable.
+        # An order generated on that day fills at the FOLLOWING session's open
+        # (T+1), so execution_date must be that next business day, not signal_date.
+        # Previously these were equal — module docstring already documented this
+        # gap; the actual write path is now consistent with it.
+        try:
+            sd = pd.Timestamp(out["signal_date"])
+            out["execution_date"] = (sd + BDay(1)).strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            out["execution_date"] = out["signal_date"]
 
     # Dedup hash
     out["_hash"] = _event_hash(out)
@@ -596,6 +605,10 @@ def _convert_legacy_event(raw: dict, file_date: str) -> dict:
 
     # Compute the 5 explicit time fields for migrated events
     signal_date = _compute_signal_date(publish_time, available_date)
+    try:
+        execution_date = (pd.Timestamp(signal_date) + BDay(1)).strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        execution_date = signal_date
 
     unified = {
         "date": available_date,
@@ -612,7 +625,10 @@ def _convert_legacy_event(raw: dict, file_date: str) -> dict:
         "event_time": publish_time or file_date,   # best guess for legacy
         "available_time": raw.get("extract_date", file_date),
         "signal_date": signal_date,
-        "execution_date": signal_date,  # T+1 open execution assumed
+        # execution_date = next business day after signal_date. A T+1-open
+        # order generated on signal_date can only fill at the FOLLOWING
+        # session's open, so execution_date must be that next business day.
+        "execution_date": execution_date,
         # Metadata
         "llm_model": raw.get("model_version", ""),
         "prompt_version": raw.get("prompt_version", ""),

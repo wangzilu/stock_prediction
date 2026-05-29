@@ -274,10 +274,23 @@ class MarketCollector:
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(RETRY_DELAY)
 
-        # Fallback to Tencent batch API
-        logger.info("AKShare spot failed, falling back to Tencent...")
+        # Fallback to Tencent batch API.
+        # IMPORTANT: Tencent fallback only covers WATCHLIST (~50 stocks),
+        # whereas AKShare returns the full 5000+ market. Upstream callers
+        # (scheduler/jobs.py screening) treat the spot cache as full-market,
+        # so a silent fallback silently shrinks the candidate universe.
+        # Mark the cache as PARTIAL and emit an ERROR so the downstream
+        # screener can detect coverage degradation and either reject the
+        # run or warn the user instead of silently recommending from a
+        # 50-stock pool.
+        logger.error(
+            "AKShare spot failed after %d retries — falling back to Tencent (WATCHLIST-only, ~%d stocks). "
+            "Downstream screeners will see a SHRUNK universe; set _spot_partial=True flag.",
+            MAX_RETRIES, 50,
+        )
         self._spot_cache = self._load_spot_tencent()
-        self._write_spot_disk_cache(self._spot_cache, "tencent")
+        self._spot_partial = True
+        self._write_spot_disk_cache(self._spot_cache, "tencent_partial")
         self._spot_loaded = True  # Don't retry even if Tencent also failed
 
     def warm_spot_cache(self) -> dict:

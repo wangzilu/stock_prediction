@@ -790,6 +790,7 @@ class PaperOMS:
             self.state["trade_count"] += 1
 
         # Buys
+        unfilled_buys: list[dict] = []
         if buys:
             target_weights = pending.get("target_weights", {})
             total_portfolio_value = cash
@@ -804,13 +805,16 @@ class PaperOMS:
                     per_stock_value = cash * 0.95 / max(n_target, 1)
 
                 if per_stock_value < 1000:
+                    unfilled_buys.append({"code": code, "reason": "size_below_min"})
                     continue
                 buy_price = prices.get(code, 0)
                 if buy_price <= 0:
                     logger.warning(f"  No fill price for {code}, skip buy")
+                    unfilled_buys.append({"code": code, "reason": "no_price_likely_halted"})
                     continue
                 shares = int(per_stock_value / buy_price / 100) * 100
                 if shares <= 0:
+                    unfilled_buys.append({"code": code, "reason": "zero_shares_after_rounding"})
                     continue
 
                 amount = shares * buy_price
@@ -819,6 +823,7 @@ class PaperOMS:
                 total_cost = amount + commission + slippage_cost
 
                 if total_cost > cash:
+                    unfilled_buys.append({"code": code, "reason": "insufficient_cash"})
                     continue
 
                 cash -= total_cost
@@ -860,12 +865,25 @@ class PaperOMS:
 
         self._save_state()
 
-        # Build filled order file
+        if unfilled_buys:
+            logger.warning(
+                "  %d intended buy(s) could not fill: %s",
+                len(unfilled_buys),
+                {u["code"]: u["reason"] for u in unfilled_buys},
+            )
+
+        # Build filled order file. status="filled" historically applied even
+        # when many intended buys couldn't transact (no price = likely halted,
+        # cash exhausted, etc.). Now we surface unfilled_buys so consumers can
+        # tell a partial reconcile from a clean one. status="filled" still
+        # means "no more work to do for this signal_date", not "all buys went
+        # through".
         filled = {
             "signal_date": date,
             "fill_date": use_date,
             "reconciled_at": datetime.now().isoformat(timespec="seconds"),
             "fills": fills,
+            "unfilled_buys": unfilled_buys,
             "price_type": "next_open",
             "daily_pnl": pnl.get("daily_return", 0.0),
             "status": "filled",
