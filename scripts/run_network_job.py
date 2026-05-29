@@ -174,11 +174,25 @@ def main() -> None:
     _log(f"Command: {' '.join(cmd)}")
 
     try:
-        result = subprocess.run(cmd, env=env, timeout=timeout)
-        sys.exit(result.returncode)
-    except subprocess.TimeoutExpired:
-        _log(f"TIMEOUT — command exceeded {timeout}s, killed")
-        sys.exit(124)
+        # start_new_session=True creates a new process group so we can
+        # kill the entire tree (including child workers) on timeout.
+        proc = subprocess.Popen(cmd, env=env, start_new_session=True)
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Kill entire process group, not just the direct child
+            import signal
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                proc.wait(timeout=5)
+            except Exception:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            _log(f"TIMEOUT — command exceeded {timeout}s, killed process group")
+            sys.exit(124)
+        sys.exit(proc.returncode)
+    except Exception as exc:
+        _log(f"ERROR — {exc}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

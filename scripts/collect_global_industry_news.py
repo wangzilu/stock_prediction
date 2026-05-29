@@ -299,20 +299,28 @@ def collect_global_industry_news(
 
 
 def _write_data_health(target_date: str, stats: dict, total: int) -> None:
-    """Write data health status for monitoring."""
-    DATA_HEALTH_DIR.mkdir(parents=True, exist_ok=True)
-    health = {
-        "job": "collect_global_industry_news",
-        "date": target_date,
-        "timestamp": datetime.now().isoformat(),
-        "status": "success" if total > 0 else "empty",
-        "total_items": total,
-        "topic_stats": stats,
-    }
-    health_path = DATA_HEALTH_DIR / f"global_industry_news_{target_date}.json"
-    with open(health_path, "w", encoding="utf-8") as f:
-        json.dump(health, f, ensure_ascii=False, indent=2)
-    logger.info("Data health written to %s", health_path)
+    """Write data health via unified scheduler.data_health interface."""
+    try:
+        from scheduler.data_health import write_health, HealthStatus
+        write_health("global_industry_news", HealthStatus(
+            success=total > 0,
+            n_items=total,
+            latest_date=target_date,
+            network_profile="global",
+        ), date=target_date)
+    except Exception:
+        # Fallback: write custom health file
+        DATA_HEALTH_DIR.mkdir(parents=True, exist_ok=True)
+        health = {
+            "job": "global_industry_news",
+            "date": target_date,
+            "status": "success" if total > 0 else "empty",
+            "total_items": total,
+        }
+        health_path = DATA_HEALTH_DIR / f"global_industry_news_{target_date}.json"
+        with open(health_path, "w", encoding="utf-8") as f:
+            json.dump(health, f, ensure_ascii=False, indent=2)
+    logger.info("Data health written for global_industry_news")
 
 
 def main():

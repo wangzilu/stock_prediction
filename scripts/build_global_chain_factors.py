@@ -73,6 +73,33 @@ def _build_entity_edge_map(edges: list[dict]) -> dict[str, list[dict]]:
 # Event loading
 # ---------------------------------------------------------------------------
 
+def _load_pre_extracted_events(
+    target_date: str,
+    lookback_days: int = EVENT_LOOKBACK_DAYS,
+) -> list[dict]:
+    """Load pre-extracted events from global_chain_events/ directory.
+
+    These are produced by extract_global_supply_chain_events.py and are
+    preferred over re-extracting from raw news.
+    """
+    import json
+    target = pd.Timestamp(target_date)
+    events = []
+    for i in range(lookback_days):
+        d = (target - pd.Timedelta(days=i)).strftime("%Y-%m-%d")
+        path = EVENTS_DIR / f"{d}.jsonl"
+        if path.exists():
+            for line in open(path):
+                line = line.strip()
+                if line:
+                    e = json.loads(line)
+                    e.setdefault("date", d)
+                    events.append(e)
+    if events:
+        logger.info(f"Loaded {len(events)} pre-extracted events from {EVENTS_DIR}")
+    return events
+
+
 def load_events_from_news(
     target_date: str,
     lookback_days: int = EVENT_LOOKBACK_DAYS,
@@ -337,7 +364,12 @@ def build_factors(
     if demo:
         events = generate_demo_events(target_date)
     else:
-        events = load_events_from_news(target_date, lookback_days=lookback_days)
+        # Prefer pre-extracted events from global_chain_events/ (produced by
+        # extract_global_supply_chain_events.py). Fall back to raw news + rule
+        # extraction if pre-extracted events don't exist.
+        events = _load_pre_extracted_events(target_date, lookback_days)
+        if not events:
+            events = load_events_from_news(target_date, lookback_days=lookback_days)
 
     if not events:
         logger.warning("No events found — cannot build factors")
