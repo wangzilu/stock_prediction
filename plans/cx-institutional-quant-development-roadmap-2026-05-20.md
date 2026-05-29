@@ -2666,3 +2666,56 @@ LLM 事件 latest_date < today → LLM overlay 降权或关闭
 | 4 | 多源 fallback（每类信息 ≥ 2 源） | P1 |
 | 5 | WeChat 告警接入 | P1 |
 | 6 | 本地关键数据镜像校验 | P2 |
+
+---
+
+## 29. 市场情绪因子策略（2026-05-29 调研结论）
+
+**核心发现**：A 股情绪是**反转型**的——高情绪 → 未来跑输。原因是散户占成交量 80%、做空受限、T+1。
+
+### 29.1 当前项目情绪状态
+
+| 组件 | 状态 | 结论 |
+|------|------|------|
+| SnowNLP 情绪评分 | ❌ 已禁用 (0.2→0.0) | 商品评论模型，不适合金融文本 |
+| turn_anom20/60 | ✅ 已在 champion | **这是最强的情绪代理因子** (IC -0.03~-0.05) |
+| 股吧热度 | 6 天数据 | 需 60 天后做反转验证 |
+| 雪球热股 | 4 天数据 | 同上 |
+| 融资余额 | ✅ 已在 regime | 做市场级控仓 |
+| 涨跌停比 | ✅ 已在 regime | 同上 |
+
+### 29.2 A 股情绪因子有效性排序
+
+| 因子 | IC | 方向 | 持仓期 | 实用性 |
+|------|-----|------|--------|--------|
+| **换手异常 (ATR)** | -0.03~-0.05 | 反转 | 5-20d | ✅ 最强，已有 |
+| 换手波动率 | -0.02~-0.04 | 反转 | 5-20d | ✅ 可加 |
+| 融资余额变化 | -0.01~-0.02 | 反转 | 10-20d | ⚠️ regime 用 |
+| 股吧热度反转 | -0.01~-0.015 | 反转 | 5-20d | ⚠️ 等数据 |
+| 北向资金 | +0.01 | 动量 | 5-20d | ⚠️ 已有数据 |
+| 涨跌停比 | 市场级 | 反转 | 10-20d | ⚠️ regime |
+
+### 29.3 关键学术结论
+
+- 高情绪在 A 股预测**负**收益（Baker-Wurgler China adaptation）
+- 唯一例外：**日内到 1 天是动量**（+0.26%），5 天后变反转
+- 大部分情绪 alpha 被换手异常因子捕获（IC overlap > 80%）
+- NLP 文本情绪在控制换手后**增量非常小**（~0.005 IC）
+
+### 29.4 行动计划
+
+**已完成**：
+- ✅ SignalScorer 情绪权重 0.2 → 0.0
+- ✅ 换手异常在 champion 特征集
+
+**Phase 4S-sent（情绪因子正式版）**：
+1. 股吧热度积累 60 天 → 反转因子 Alpha Factory gate
+2. 市场级情绪指数（融资余额 + 涨跌停 + 换手聚合）→ regime
+3. 如果 gate 通过 → overlay（不进 XGB）
+4. 不做 Weibo/小红书/SnowNLP/FinBERT
+
+### 29.5 参考文献
+- Baker-Wurgler China: investor sentiment index via margin/IPO/turnover
+- A-share turnover anomaly: -1.87% monthly spread between top/bottom deciles
+- Chinese stock forum direct sentiment: contrarian at 5d+, momentum at 1d
+- T+1 rule: only short-term reversal exists in A-shares
