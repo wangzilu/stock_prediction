@@ -99,26 +99,81 @@ class SupplyChainMapper:
             return yaml.safe_load(f) or []
 
     def _load_industry_stocks(self) -> dict[str, list[str]]:
-        """Load industry → stock mapping. Returns {industry_name: [qlib_codes]}."""
+        """Load industry → stock mapping. Returns {industry_name: [qlib_codes]}.
+
+        Priority: baostock (5500+ stocks) > JQData (698 stocks).
+        Maps CSRC industry codes to TOPIC_TO_INDUSTRY keys via a mapping table.
+        """
         result = {}
 
-        # Try JQData SW classification
-        jq_path = DATA_DIR / "jqdata" / "industry_sw.parquet"
-        if jq_path.exists():
-            ind = pd.read_parquet(jq_path)
-            if "sw_l1_name" in ind.columns and "code" in ind.columns:
-                for _, row in ind.iterrows():
-                    industry = str(row.get("sw_l1_name", ""))
-                    if not industry:
+        # Map from CSRC (证监会) industry codes to our topic industry names
+        CSRC_TO_SW = {
+            "C39计算机、通信和其他电子设备制造业": "电子I",
+            "I65软件和信息技术服务业": "计算机I",
+            "I64互联网和相关服务": "计算机I",
+            "C38电气机械和器材制造业": "电力设备I",
+            "C36汽车制造业": "汽车I",
+            "C35专用设备制造业": "机械设备I",
+            "C34通用设备制造业": "机械设备I",
+            "C32有色金属冶炼和压延加工业": "有色金属I",
+            "C31黑色金属冶炼和压延加工业": "钢铁I",
+            "C26化学原料和化学制品制造业": "基础化工I",
+            "C25石油加工、炼焦和核燃料加工业": "石油石化I",
+            "B07石油和天然气开采业": "石油石化I",
+            "B09有色金属矿采选业": "有色金属I",
+            "B06煤炭开采和洗选业": "煤炭I",
+            "C27医药制造业": "医药生物I",
+            "C37铁路、船舶、航空航天和其他运输设备制造业": "国防军工I",
+            "C40仪器仪表制造业": "机械设备I",
+            "C41其他制造业": "机械设备I",
+            "C33金属制品业": "钢铁I",
+            "I63电信、广播电视和卫星传输服务": "通信I",
+            "R87文化艺术业": "传媒I",
+            "C13农副食品加工业": "食品饮料I",
+            "C14食品制造业": "食品饮料I",
+            "C15酒、饮料和精制茶制造业": "食品饮料I",
+            "C29橡胶和塑料制品业": "基础化工I",
+            "C30非金属矿物制品业": "建筑材料I",
+            "K70房地产业": "房地产I",
+            "D44电力、热力生产和供应业": "公用事业I",
+            "C17纺织业": "纺织服饰I",
+            "C18纺织服装、服饰业": "纺织服饰I",
+            "C28化学纤维制造业": "基础化工I",
+        }
+
+        # Try baostock classification first (5500+ stocks)
+        bs_path = DATA_DIR / "baostock_industry.parquet"
+        if bs_path.exists():
+            df = pd.read_parquet(bs_path)
+            if "qlib_code" in df.columns and "industry" in df.columns:
+                for _, row in df.iterrows():
+                    csrc_industry = str(row.get("industry", ""))
+                    qlib = str(row.get("qlib_code", ""))
+                    if not csrc_industry or not qlib:
                         continue
-                    jq_code = str(row.get("code", ""))
-                    if ".XSHE" in jq_code:
-                        qlib = f"sz{jq_code[:6]}"
-                    elif ".XSHG" in jq_code:
-                        qlib = f"sh{jq_code[:6]}"
-                    else:
-                        continue
-                    result.setdefault(industry, []).append(qlib)
+                    # Map CSRC to our industry names
+                    sw_name = CSRC_TO_SW.get(csrc_industry)
+                    if sw_name:
+                        result.setdefault(sw_name, []).append(qlib)
+
+        # Fallback: JQData SW classification
+        if not result:
+            jq_path = DATA_DIR / "jqdata" / "industry_sw.parquet"
+            if jq_path.exists():
+                ind = pd.read_parquet(jq_path)
+                if "sw_l1_name" in ind.columns and "code" in ind.columns:
+                    for _, row in ind.iterrows():
+                        industry = str(row.get("sw_l1_name", ""))
+                        if not industry:
+                            continue
+                        jq_code = str(row.get("code", ""))
+                        if ".XSHE" in jq_code:
+                            qlib = f"sz{jq_code[:6]}"
+                        elif ".XSHG" in jq_code:
+                            qlib = f"sh{jq_code[:6]}"
+                        else:
+                            continue
+                        result.setdefault(industry, []).append(qlib)
 
         logger.info(f"Industry mapping: {len(result)} industries, "
                     f"{sum(len(v) for v in result.values())} stocks")
