@@ -11,13 +11,28 @@ from signals.scorer import SignalScorer
 
 
 def _make_pipeline():
-    """Create a fully mocked DailyPipeline."""
+    """Create a fully mocked DailyPipeline.
+
+    Per quarantine §6.5: production code now accesses the crypto collector
+    via `self._get_crypto_collector()` (lazy, flag-gated) and
+    `self._crypto_collector` (cache slot), not `self.crypto_collector`.
+
+    Tests that pre-date the quarantine set `pipeline.crypto_collector.X` —
+    to keep those tests meaningful (the mock object must intersect the
+    production read path), we wire all three references to the same
+    MagicMock instance. The instance-level `_get_crypto_collector` override
+    bypasses the LEGACY_MARKET_CONTEXT_ENABLED check so tests exercise
+    the legacy code branches uniformly.
+    """
     pipeline = DailyPipeline.__new__(DailyPipeline)
     pipeline.market_collector = MagicMock()
     pipeline.market_collector._spot_cache = None
     pipeline.market_collector._spot_loaded = False
     pipeline.market_collector._akshare_down = False
-    pipeline.crypto_collector = MagicMock()
+    crypto_mock = MagicMock()
+    pipeline._crypto_collector = crypto_mock
+    pipeline._get_crypto_collector = lambda: crypto_mock
+    pipeline.crypto_collector = crypto_mock  # alias for legacy test setup
     pipeline.gold_collector = MagicMock()
     pipeline.sentiment_collector = MagicMock()
     pipeline.macro_collector = MagicMock()
