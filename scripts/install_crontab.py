@@ -189,6 +189,10 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("brinson_attribution", "50 18 * * 1-5",
                 [py, str(scripts / "run_brinson_attribution.py")], "brinson_attribution.log",
                 network="none", timeout_sec=600),
+        # --- LLM 429 retry queue drain (after main pipeline + evening) ---
+        CronJob("llm_retry_queue_drain", "30 22 * * 1-5",
+                [py, str(scripts / "drain_llm_retry_queue.py")], "llm_retry_drain.log",
+                network="llm", timeout_sec=3600),
         CronJob("daily_health_check", "55 18 * * 1-5",
                 [py, str(scripts / "daily_health_check.py")], "health_check.log",
                 network="none", timeout_sec=300),

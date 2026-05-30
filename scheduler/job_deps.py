@@ -31,6 +31,7 @@ JOB_DEPS: dict[str, list[str]] = {
     "guba_popularity": [],
     "llm_event_pipeline": [],
     "llm_event_retry": ["llm_event_pipeline"],
+    "llm_retry_queue_drain": ["llm_event_pipeline"],
     # ---- Post-data-update processing -------------------------------------
     "fund_flow_update": ["qlib_data_update"],
     "valuation_update": ["qlib_data_update"],

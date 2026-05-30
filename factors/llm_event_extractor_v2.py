@@ -32,6 +32,11 @@ logger = logging.getLogger(__name__)
 EVENTS_DIR = DATA_DIR / "llm_events_v2"
 EVENTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Persistent retry queue: items that fail with 429 even after exponential
+# backoff get appended here so a later cron job can re-attempt them.
+RETRY_QUEUE_DIR = DATA_DIR / "llm_retry_queue"
+RETRY_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+
 # V2 Event types (more granular than v1)
 EVENT_TYPES = [
     "earnings_beat", "earnings_miss", "earnings_inline",
@@ -275,19 +280,45 @@ class LLMEventExtractorV2:
             "summary": str(data.get("summary", ""))[:100],
         }
 
-    def extract_single(self, code: str, name: str, title: str, content: str = "") -> dict | None:
+    def extract_single(self, code: str, name: str, title: str, content: str = "",
+                       *, source: str = "", publish_time: str = "",
+                       qlib_code: str = "", target_date: str = "") -> dict | None:
         prompt = f"股票: {code} {name}\n标题: {title}"
         if content and content != title:
             prompt += f"\n内容: {content[:300]}"
         text, usage = self._call_llm(prompt)
         event = self._parse_response(text)
+        rate_limited = usage.get("rate_limited", False)
         self._record_stats(
             usage.get("http_ok", False),
             event is not None,
             usage,
-            rate_limited=usage.get("rate_limited", False),
+            rate_limited=rate_limited,
         )
+        # Persistent retry queue: only enqueue when the final failure mode
+        # was 429 (transient API rate limit), not parse error or invalid
+        # input. Parse failures retry would just fail again — only rate-
+        # limited items benefit from a delayed second attempt.
+        if event is None and rate_limited and target_date:
+            self._enqueue_retry(
+                target_date,
+                {
+                    "stock_code": code, "stock_name": name,
+                    "title": title, "content": content,
+                    "source": source, "publish_time": publish_time,
+                    "qlib_code": qlib_code,
+                },
+            )
         return event
+
+    def _enqueue_retry(self, target_date: str, item: dict) -> None:
+        """Append an item to today's retry queue file."""
+        path = RETRY_QUEUE_DIR / f"{target_date}.jsonl"
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.warning("retry queue append failed (%s): %s", path, e)
 
     def extract_from_news_file(self, news_path: Path, max_news_per_stock: int = 1,
                                 target_date: str = None) -> Path:
@@ -341,7 +372,13 @@ class LLMEventExtractorV2:
             source = item.get("source", "unknown")
             source_info = SOURCE_TIERS.get(source, {"tier": "media", "quality": 0.5})
 
-            event = self.extract_single(code, name, title, content)
+            event = self.extract_single(
+                code, name, title, content,
+                source=source,
+                publish_time=item.get("publish_time", ""),
+                qlib_code=item.get("qlib_code", ""),
+                target_date=target_date,
+            )
             if event:
                 record = {
                     "stock_code": code,
