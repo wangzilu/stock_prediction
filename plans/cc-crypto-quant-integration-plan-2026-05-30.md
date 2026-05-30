@@ -8,7 +8,26 @@
 
 ## 0. 一句话决策
 
-**起步策略 = funding arb（不是 stat arb），起步技术栈 = 库不用框架，起步架构 = `core/ + ashare/ + crypto/` 三 namespace，起步资金 = $5k paper → $50k Phase 1 → $200k Phase 3。** 不做 LP / restaking / RWA / memecoin / MEV / 散户 LOB / 自主 LLM 下单。
+**起步策略 = funding arb 作为 Phase C/D paper-only 研究 / Phase G+ 实盘 canary（不是 stat arb，也不是即刻实盘），起步技术栈 = 库不用框架，起步架构 = `core/ + ashare/ + crypto/` 三 namespace（物理迁移 Phase G+ user sign-off 后），资金推进 = state-gated（不是固定金额阶梯）。** 不做 LP / restaking / RWA / memecoin / MEV / 散户 LOB / 自主 LLM 下单 / DeFi 进 quant pipeline / Phase A-F 任何 leverage。
+
+> **本节于 §0.5 自纠错章节中重写，原版本"$5k → $50k → $200k → $500k 资金阶梯"已被推翻。详情见 §0.5。**
+
+## 0.5 自纠错（post cc↔cx convergence + paper-only constraint，2026-05-30）
+
+本文档初版完成时未充分覆盖三个后续约束：(a) cx review 五轮收敛指出的执行节奏过于激进，(b) 用户 2026-05-30 hard rule「先不实盘先不加杠杆，每天 paper」，(c) cx system-design-review 8.0/10 评分中的研究冻结要求。以下 8 项纠错具有最高权威性，任何与之冲突的下文条目按此处覆盖。
+
+| # | 章节 | 原表述（错） | 纠正后（对） | 依据 |
+|---|---|---|---|---|
+| 1 | §0 / §1 / §10 / §11 | 资金阶梯 $5k paper → $50k Phase 1 实盘 → $200k Phase 3 → $500k Phase 4 | 资金推进 = state-gated promotion（signal-only → paper → testnet → tiny canary → scale）。**所有阶段需用户书面 sign-off**，不依赖时间或金额触发 | spec §−1 paper-only constraint；spec §"CC Plan Self-corrections Required" 行 1 |
+| 2 | §2.DeFi / §2.推荐组合 / §10 Week 4 / §12 决策点 5 / §13.DeFi | 60% Aave/Sky/Morpho base + 30% funding arb + 10% Hyperliquid HYPE 积分 / Phase 1 起就接 DeFi yield | **DeFi 移出 quant pipeline，作为独立的 capital-management benchmark note**（"若 quant book 跑不赢 stablecoin carry，quant book 不值得 scale"）。`plans/capital-management-note.md` 独立追踪，不影响 model promotion / paper OMS / signal validation | cx Addendum §"Remaining Non-Accepted Items For CC" #3；spec §"CC Plan Self-corrections Required" 行 2 |
+| 3 | §0 / §1 / §10 funding arb framing | "funding arb 起步策略实盘"、"Phase 1 实盘 $50k"、"Week 4 funding arb 实盘 $5k testnet/小额" | funding arb 是 **Phase Crypto-C/D paper 策略**，仅在 Phase G+ 经用户书面 sign-off 且通过 6 项 minimum evidence（venue-specific funding history / 净成本 backtest / 负 funding stress window / API outage 模拟 / withdrawal halt 模拟 / 抵押 ledger reconciliation）后才进入 tiny canary | cx Addendum #1 + spec §5.2 Phase E acceptance |
+| 4 | §10 Week 1 / §14 step 8-22 / §15 物理迁移 | Week 1 即 `core/ 抽离 + ashare/ 迁入回归测试`；step 22 一次性 `git mv` 物理移动 | `core/ + ashare/ + crypto/` 是 **target architecture**，物理迁移 gated 到 **Phase Crypto-G+ + 用户书面 sign-off**。Phase 0a-F 仅做 adapter wiring，原 production 文件不动 | spec §6.5 strict step order；spec §-0.5 Layer 5 staged deployment |
+| 5 | §3 §15 Nautilus stance | "NautilusTrader — 留到 Phase 4 真要 HFT 时再评估"；"明确不做" | Nautilus 推迟到 **Phase Crypto-G prototype**，**理由是 process-model 与 cron pipeline 冲突**（actor/event-loop vs cron-batched IO）。不是"等到 HFT"。Phase A-F 禁止 piecemeal import `nautilus_trader.model.*` 任何类型 | spec §"CC Plan Self-corrections Required" 行 5 + §−0.5 Layer 1 |
+| 6 | §5 WORTH TRYING / §13 ML/RL frontier | RD-Agent / Kronos / GraphSAGE / CryptoTrade / TLOB 在 Phase 0-3 可试 | 所有 frontier 模型一律 **Phase Crypto-F shadow / research backlog only**，Phase A-D 禁止。Phase D paper OMS 信号不得包含 frontier 输出 | cx Addendum #6；spec Research Freeze 列表 |
+| 7 | §2 funding 数值 | "11% 年化"、"7.4% 净 carry"、"22-36% / -1% to -8%"、"$10M+ <5bp 滑点"、"92% 时间正 funding" 无标签 | 全部添加 evidence tag：`[exchange-dashboard]` (BitMEX 2025Q3) / `[paper-reported]` (He 2024) / `[paper-reported]` 等。任何用于 sizing / risk 决策的数字必须 `[validated-on-local]` 后才能采用 | spec §1.6 + cx Addendum #7 四标签系统 |
+| 8 | §14.1 audit table | 20 行 file:line 表无版本锁定 | §14.1 顶部加 `AUDIT-FROZEN-AT: acaedfaf51fd2a46e19cddc6a2b6f7d2451f80b7`（commit acaedfa 该文件状态）。后续修改创建 §14.2/§14.3，禁止在地修改 §14.1 | spec §1.3 audit version-locking |
+
+**适用顺序**：本节 §0.5 覆盖一切。下文 §1-§16 保留是为了完整记录初版思路与 cc↔cx 收敛过程，不再作为实施依据。Phase 0a 起的所有 implementation 决策应直接引用 `plans/cc-crypto-implementation-spec-2026-05-30.md` 及本节。
 
 ---
 
@@ -506,6 +525,15 @@ class OrderRouter(Protocol):
 **配对依赖**：step 14↔15 必同 PR；step 17↔step 24 测同一接口；step 22 必须在 step 9-21 全绿后才执行。
 
 ## 14.1 当前代码 20 处 asset-implicit 假设（file:line）
+
+```
+AUDIT-FROZEN-AT: acaedfaf51fd2a46e19cddc6a2b6f7d2451f80b7
+                 (commit acaedfa — this file's state at PR docs commit)
+PHASE: Pre-Phase-0a (to be re-pinned at Phase Crypto-0 sign-off)
+DATE-FROZEN: 2026-05-30
+```
+
+> 版本锁定规则（spec §1.3）：后续修改创建 §14.2 / §14.3 新章节，**禁止在地修改 §14.1**。Phase Crypto-0 sign-off 时重新 pin 到当时 SHA 并写入 commit history。
 
 | # | 文件:行 | 假设 | 解耦方案 |
 |---|---|---|---|

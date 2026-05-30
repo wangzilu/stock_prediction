@@ -567,7 +567,13 @@ APIs may need proxy; domestic collectors should remain proxy-free.
 
 ### Phase Crypto-0: Design and Data Audit
 
-Duration: 1-2 days.
+Duration: 1-2 weeks (revised from initial "1-2 days" per CC Implementation
+Punch List item A, 2026-05-30). The scope grew over cc↔cx convergence
+to include §14.1 audit version-locking, numeric claims tagging,
+target-architecture decision, ssproxy / external-volume / legacy-quarantine
+prerequisites, and the measurement spike — 1-2 days is unrealistic
+for this deliverable set. Realistic estimate aligned with CC spec §1
+Phase 0a/0b/0c sub-phases.
 
 Tasks:
 
@@ -666,7 +672,15 @@ Acceptance:
 - Positions and PnL tracked.
 - Fee/slippage accounted.
 - No live exchange keys required.
-- At least 30 days of paper before promotion.
+- **Collateral ledger reconciliation prototype** against a synthetic
+  exchange statement schema (per CC Implementation Punch List item C,
+  2026-05-30) — even paper-only mode requires the ledger to be
+  reconciliation-shaped so Phase E/G+ stress simulations have a real
+  surface to exercise.
+- Paper observation gated by **user written sign-off** rather than a
+  fixed "30 days" trigger (per §−1 paper-only constraint). The 30-day
+  marker remains as a soft target for when CC asks the user "ready to
+  discuss next step?", not as auto-promotion.
 
 ### Phase Crypto-E: Derivatives RiskGuard and Paper Funding Strategy
 
@@ -683,7 +697,18 @@ Acceptance:
 - Funding/OI features available for majors.
 - High-crowding risk flag tested.
 - RiskGuard can reduce exposure or block entries.
-- Funding-arbitrage strategy exists only in paper/testnet.
+- Funding-arbitrage strategy exists only in paper, leverage=1.0
+  (no margin, no real testnet — per §−1).
+- **6 minimum-evidence items before any live funding-arb canary** (per
+  CC Implementation Punch List item C, 2026-05-30):
+  1. Venue-specific funding history (not only aggregate dashboard)
+  2. Net-of-fee, net-of-slippage, net-of-borrow/collateral-cost backtest
+  3. Stress windows: consecutive negative funding + large spot/perp moves
+  4. Simulated withdrawal halt + venue outage + stale WebSocket behavior
+  5. Collateral ledger reconciliation against synthetic exchange statement
+  6. Max-loss calculation under liquidation-buffer assumptions
+- Funding-arb paper PnL appears in §11 daily report (cc spec) as a
+  separate line so user can compare to spot-only PnL during observation.
 - No real leverage until local validation and paper evidence pass.
 
 ### Phase Crypto-F: Event/On-chain Overlay

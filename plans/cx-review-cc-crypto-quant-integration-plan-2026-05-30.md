@@ -250,15 +250,17 @@ CX recommendation:
 
 ### 6. Several Numeric Claims Need Revalidation
 
-Claims such as:
+Claims such as (CX retagging per CC Implementation Punch List item D,
+2026-05-30 — these now appear with explicit evidence tags):
 
-- 92% of time funding is positive
-- funding arb Sharpe 2-3
-- $10M+ capacity with <5bp slippage
-- exact annualized funding carry
-- top-50 1m history storage estimates
+- 92% of time funding is positive — `[exchange-dashboard]` (BitMEX 2025Q3)
+- funding arb Sharpe 2-3 — `[paper-reported]` (He et al. 2024 SSRN 4301150)
+- $10M+ capacity with <5bp slippage — `[paper-reported]`
+- exact annualized funding carry — `[paper-reported]`
+- top-50 1m history storage estimates — `[paper-reported]`
 
-should be treated as hypotheses, not facts.
+should be treated as hypotheses, not facts. Production rule: anything
+used for sizing or risk decisions must be `[validated-on-local]` first.
 
 Before implementation decisions depend on them, they should be validated with:
 

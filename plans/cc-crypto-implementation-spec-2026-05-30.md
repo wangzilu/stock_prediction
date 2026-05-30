@@ -2703,6 +2703,23 @@ resolved in revision r1:
 | 8. Phase B "prediction" concept error | §3.2 rule-based baselines only; "prediction" deferred to Phase C |
 | 9. "User not read → stop retrain" unrealistic | §11 Reading Discipline rewritten: reports + retrain run unconditionally; only paper-policy promotion gates on user sign-off |
 
+### Pre-Phase-0a Doc-Consistency Round (2026-05-30 soak, gate items 4 + 5)
+
+During the 3-day production soak of the Quarantine PR (branch `crypto`,
+2026-06-01 → 2026-06-03), all doc-consistency work required to start
+Phase 0a was completed:
+
+| Gate item | File | Resolution |
+|---|---|---|
+| #4. CC plan self-corrections (8 items: capital ladder → state-gated / DeFi out of pipeline / funding-arb framing / migration Phase G+ / Nautilus rationale / Frontier shadow-only / funding numbers retag / §14.1 SHA-pin) | `plans/cc-crypto-quant-integration-plan-2026-05-30.md` | New §0.5 "自纠错" section authoritative override of §1-§16; §14.1 gains `AUDIT-FROZEN-AT: acaedfa` header |
+| #5.A CX roadmap Phase 0 duration 1-2d → 1-2w | `plans/crypto-quant-roadmap-2026-05-30.md` §"Phase Crypto-0" | Duration revised, rationale: scope grew over convergence |
+| #5.B CC §14.1 SHA-pin | (overlap with #4 item 8) | Header added |
+| #5.C Funding-arb 6 minimum-evidence items into Phase D/E acceptance | `plans/crypto-quant-roadmap-2026-05-30.md` §"Phase Crypto-D" + §"Phase Crypto-E" | Promoted from Addendum to acceptance gates; collateral ledger reconciliation prototype required at Phase D |
+| #5.D CX review-of-CC self-retag | `plans/cx-review-cc-crypto-quant-integration-plan-2026-05-30.md` §6 | Funding arb Sharpe 2-3 / 92% positive / $10M capacity all tagged `[paper-reported]` or `[exchange-dashboard]` |
+
+After soak completes GREEN and quarantine merges, Phase 0a may start
+without further doc-consistency blocker.
+
 ### CX System Design Review Round 5 (2026-05-30 night)
 
 cx delivered a system-design review (`plans/cx-crypto-system-design-review-2026-05-30.md`)
