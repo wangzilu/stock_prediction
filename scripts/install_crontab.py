@@ -190,13 +190,15 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                 [py, str(scripts / "run_brinson_attribution.py")], "brinson_attribution.log",
                 network="none", timeout_sec=600),
         # --- LLM 429 retry queue drain (after main pipeline + evening) ---
-        # Depends on llm_event_pipeline (no queue to drain if pipeline didn't
-        # run). enforce_deps with 4h wait budget so a 16:30 pipeline that
-        # itself ran late (e.g. 19:00) can still gate the 22:30 drain.
+        # Deliberately NOT enforce_deps. This is a recovery job — gating it
+        # on the main pipeline's success would defeat its purpose when the
+        # pipeline itself partially failed (which is exactly when the queue
+        # has items to retry). Drain self-checks: it no-ops cleanly when the
+        # queue file is absent, and its EventStore sync + factor rebuild are
+        # idempotent so re-running them is safe.
         CronJob("llm_retry_queue_drain", "30 22 * * 1-5",
                 [py, str(scripts / "drain_llm_retry_queue.py")], "llm_retry_drain.log",
-                network="llm", timeout_sec=3600,
-                enforce_deps=True, dep_wait_seconds=14400),
+                network="llm", timeout_sec=3600),
         CronJob("daily_health_check", "55 18 * * 1-5",
                 [py, str(scripts / "daily_health_check.py")], "health_check.log",
                 network="none", timeout_sec=300),

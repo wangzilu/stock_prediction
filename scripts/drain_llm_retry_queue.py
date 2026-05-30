@@ -116,118 +116,134 @@ def _rebuild_factors(target_date: str) -> None:
 
 
 def drain(target_date: str) -> dict:
-    """Process the retry queue for one date. Returns counters."""
+    """Process the retry queue for one date. Returns counters.
+
+    Closeout (EventStore sync + factor rebuild) runs UNCONDITIONALLY when
+    the queue file existed at entry, even if every item was a duplicate or
+    every retry still failed. Rationale: a prior drain may have appended
+    recoveries to V2 jsonl but crashed before sync — the items now show
+    as duplicates and would be cleared without ever reaching EventStore /
+    factor parquet. Both operations are idempotent (EventStore.add_events
+    dedups by hash, build_factors rewrites the day's parquet), so the
+    wasted-work cost is bounded and the safety gain is real.
+    """
     queue_path = RETRY_QUEUE_DIR / f"{target_date}.jsonl"
-    if not queue_path.exists():
-        logger.info("No retry queue for %s — nothing to do", target_date)
-        return {"items": 0, "recovered": 0, "still_failed": 0, "duplicates": 0}
+    events_path = EVENTS_DIR / f"{target_date}.jsonl"
 
     raw_items: list[dict] = []
-    with open(queue_path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                raw_items.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+    if queue_path.exists():
+        with open(queue_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    raw_items.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        if not raw_items:
+            queue_path.unlink(missing_ok=True)
+            logger.info("Queue %s was empty, removed", queue_path)
+    else:
+        logger.info("No retry queue for %s — drain mode is closeout-only", target_date)
 
-    if not raw_items:
-        logger.info("Queue %s is empty", queue_path)
-        return {"items": 0, "recovered": 0, "still_failed": 0, "duplicates": 0}
-
-    # Dedup within the queue + against already-written events.
-    events_path = EVENTS_DIR / f"{target_date}.jsonl"
-    existing_keys = _existing_event_keys(events_path)
-    seen_in_queue: set[str] = set()
-    items: list[dict] = []
     n_dup = 0
-    for it in raw_items:
-        k = _dedup_key(it)
-        if k in seen_in_queue or k in existing_keys:
-            n_dup += 1
-            continue
-        seen_in_queue.add(k)
-        items.append(it)
-    if n_dup:
-        logger.info("Dropped %d duplicate items (queue self-dup or already-extracted)", n_dup)
-    if not items:
-        logger.info("All queue items were duplicates — clearing queue")
-        queue_path.unlink(missing_ok=True)
-        return {"items": len(raw_items), "recovered": 0, "still_failed": 0, "duplicates": n_dup}
-
-    logger.info("Draining %d unique items from %s", len(items), queue_path.name)
-    extractor = LLMEventExtractorV2()
-    recovered: list[dict] = []
     still_failed: list[dict] = []
+    recovered: list[dict] = []
 
-    for item in items:
-        code = item.get("stock_code", "")
-        name = item.get("stock_name", "")
-        title = item.get("title", "")
-        content = item.get("content", "")
-        source = item.get("source", "unknown")
-        # Pass target_date="" so a 2nd failure doesn't double-enqueue.
-        event = extractor.extract_single(
-            code, name, title, content,
-            source=source,
-            publish_time=item.get("publish_time", ""),
-            qlib_code=item.get("qlib_code", ""),
-            target_date="",
-        )
-        if event:
-            source_info = SOURCE_TIERS.get(source, {"tier": "media", "quality": 0.5})
-            record = {
-                "stock_code": code,
-                "stock_name": name,
-                "qlib_code": item.get("qlib_code", ""),
-                "publish_time": item.get("publish_time", ""),
-                "title": title,
-                "source": source,
-                "source_tier": source_info["tier"],
-                "source_quality": source_info["quality"],
-                "extract_date": target_date,
-                "extractor_version": "v2_retry",
-                **event,
-            }
-            recovered.append(record)
+    if raw_items:
+        # Dedup within the queue + against already-written events.
+        existing_keys = _existing_event_keys(events_path)
+        seen_in_queue: set[str] = set()
+        items: list[dict] = []
+        for it in raw_items:
+            k = _dedup_key(it)
+            if k in seen_in_queue or k in existing_keys:
+                n_dup += 1
+                continue
+            seen_in_queue.add(k)
+            items.append(it)
+        if n_dup:
+            logger.info("Dropped %d duplicate items (queue self-dup or already-extracted)", n_dup)
+
+        if items:
+            logger.info("Draining %d unique items from %s", len(items), queue_path.name)
+            extractor = LLMEventExtractorV2()
+            for item in items:
+                code = item.get("stock_code", "")
+                name = item.get("stock_name", "")
+                title = item.get("title", "")
+                content = item.get("content", "")
+                source = item.get("source", "unknown")
+                # Pass target_date="" so a 2nd failure doesn't double-enqueue.
+                event = extractor.extract_single(
+                    code, name, title, content,
+                    source=source,
+                    publish_time=item.get("publish_time", ""),
+                    qlib_code=item.get("qlib_code", ""),
+                    target_date="",
+                )
+                if event:
+                    source_info = SOURCE_TIERS.get(source, {"tier": "media", "quality": 0.5})
+                    record = {
+                        "stock_code": code,
+                        "stock_name": name,
+                        "qlib_code": item.get("qlib_code", ""),
+                        "publish_time": item.get("publish_time", ""),
+                        "title": title,
+                        "source": source,
+                        "source_tier": source_info["tier"],
+                        "source_quality": source_info["quality"],
+                        "extract_date": target_date,
+                        "extractor_version": "v2_retry",
+                        **event,
+                    }
+                    recovered.append(record)
+                else:
+                    still_failed.append(item)
+
+            if recovered:
+                with open(events_path, "a", encoding="utf-8") as f:
+                    for rec in recovered:
+                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                logger.info("Appended %d recovered events to %s", len(recovered), events_path)
+
+            stats = dict(extractor._stats)
+            logger.info(
+                "Drain stats: calls=%d http_fail=%d (rate_limited=%d) parse_fail=%d duplicates=%d",
+                stats.get("calls", 0), stats.get("http_fail", 0),
+                stats.get("rate_limited", 0), stats.get("parse_fail", 0), n_dup,
+            )
+
+        # Rewrite queue with still-failed items only (or delete if empty)
+        if still_failed:
+            tmp = queue_path.with_suffix(".jsonl.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                for item in still_failed:
+                    f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            tmp.replace(queue_path)
+            logger.warning("%d items still failed after retry, queue kept", len(still_failed))
         else:
-            still_failed.append(item)
+            queue_path.unlink(missing_ok=True)
+            logger.info("Queue fully drained")
 
-    if recovered:
-        with open(events_path, "a", encoding="utf-8") as f:
-            for rec in recovered:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        logger.info("Appended %d recovered events to %s", len(recovered), events_path)
-
-        # Close the loop: same downstream steps as the main pipeline.
+    # Unconditional closeout: covers the half-completed scenario where a
+    # prior run appended to V2 jsonl but crashed before EventStore/factor
+    # sync. Both downstream ops are idempotent.
+    closeout_ran = False
+    if events_path.exists():
         _sync_to_eventstore(events_path, target_date)
         _rebuild_factors(target_date)
-
-    # Rewrite queue with still-failed items only
-    if still_failed:
-        tmp = queue_path.with_suffix(".jsonl.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            for item in still_failed:
-                f.write(json.dumps(item, ensure_ascii=False) + "\n")
-        tmp.replace(queue_path)
-        logger.warning("%d items still failed after retry, queue kept", len(still_failed))
+        closeout_ran = True
     else:
-        queue_path.unlink(missing_ok=True)
-        logger.info("Queue fully drained")
+        logger.info("No V2 jsonl for %s — skipping closeout", target_date)
 
-    stats = dict(extractor._stats)
-    logger.info(
-        "Drain stats: calls=%d http_fail=%d (rate_limited=%d) parse_fail=%d duplicates=%d",
-        stats.get("calls", 0), stats.get("http_fail", 0),
-        stats.get("rate_limited", 0), stats.get("parse_fail", 0), n_dup,
-    )
     return {
         "items": len(raw_items),
         "recovered": len(recovered),
         "still_failed": len(still_failed),
         "duplicates": n_dup,
+        "closeout_ran": closeout_ran,
     }
 
 
