@@ -2036,19 +2036,18 @@ class DailyPipeline:
             for i, rec in enumerate(top_recs[:20]):
                 code = getattr(rec, "code", str(rec)) if not isinstance(rec, dict) else rec.get("code", "?")
                 name = getattr(rec, "name", "") if not isinstance(rec, dict) else rec.get("name", "")
-                # Per code-review P2-a (2026-05-30): the Recommendation
-                # dataclass field is `final_score`, not `score`. The old
-                # `getattr(rec, "score", 0)` always fell through to 0
-                # because no such attribute exists, so the fallback report
-                # rendered score=0.000 for every recommendation. Prefer
-                # final_score, with `score` as a defensive secondary
-                # fallback for any caller still passing a `score`-keyed dict.
+                # signals/scorer.py:Recommendation field is `final_score`,
+                # not `score`. The legacy `getattr(rec, "score", 0)` always
+                # fell through to 0 because no such attribute exists —
+                # fallback report rendered score=0.000 for every entry.
+                # Prefer final_score, with `score` as a defensive secondary
+                # for any caller still passing a `score`-keyed dict.
                 if isinstance(rec, dict):
-                    score = rec.get("final_score", rec.get("score", 0))
+                    raw_score = rec.get("final_score", rec.get("score", 0))
                 else:
-                    score = getattr(rec, "final_score", getattr(rec, "score", 0))
+                    raw_score = getattr(rec, "final_score", getattr(rec, "score", 0))
                 try:
-                    lines.append(f"  {i+1}. {code} {name} (score={float(score):.3f})")
+                    lines.append(f"  {i+1}. {code} {name} (score={float(raw_score):.3f})")
                 except (TypeError, ValueError):
                     lines.append(f"  {i+1}. {code} {name} (score=n/a)")
             report = "\n".join(lines)

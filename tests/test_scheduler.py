@@ -10,21 +10,67 @@ from signals.index_predictor import OvernightIndexPredictor
 from signals.scorer import SignalScorer
 
 
+@pytest.fixture(autouse=True)
+def _isolate_sanitizer_from_production_data(monkeypatch):
+    """Quarantine tests in this file from production data files.
+
+    DailyPipeline._make_sanitizer reads three live production state
+    files at call time:
+      - data/storage/crash_predictions_latest.json
+      - data/storage/global_chain_factors.parquet
+      - data/storage/paper_shadow/risk_guard_state.json
+
+    Tests that exercise methods which internally build a sanitizer
+    (e.g. _build_evening_stock_forecasts, _build_stock_candidates,
+    _candidates_from_stock_snapshot) would otherwise inherit whatever
+    crash probabilities / chain-alpha flags / cooldown set happens to
+    be in production at test-run time. That made the suite
+    non-deterministic — pinning the previous reviewer hours on
+    "SZ300750 missing intermittently" — chain-alpha < -2.0 on the
+    latest snapshot was the actual cause.
+
+    Each of these loaders now returns the empty / None default during
+    tests. Tests that need to exercise a specific reject rule should
+    monkeypatch the specific loader they care about after this fixture
+    runs.
+    """
+    monkeypatch.setattr(
+        DailyPipeline, "_load_crash_probs_for_sanitizer",
+        lambda self: {},
+    )
+    monkeypatch.setattr(
+        DailyPipeline, "_load_chain_alpha_for_sanitizer",
+        lambda self, today: None,
+    )
+    monkeypatch.setattr(
+        DailyPipeline, "_load_cooldown_for_sanitizer",
+        lambda self, today: set(),
+    )
+
+
 def _make_pipeline():
     """Create a fully mocked DailyPipeline.
 
-    Per quarantine §6.5: production code now accesses the crypto collector
-    via `self._get_crypto_collector()` (lazy, flag-gated) and
-    `self._crypto_collector` (cache slot), not `self.crypto_collector`.
+    Mirrors scheduler/jobs.py:DailyPipeline.__init__() instance-attribute
+    setup. Uses __new__ to skip the real __init__ (which would instantiate
+    network-touching collectors), then manually sets every attribute that
+    __init__ would set. If __init__ gains a new attribute, this helper
+    must be updated in lockstep — otherwise tests silently break with
+    AttributeError deep in production code paths (caught by helpers like
+    `except Exception: continue`, which makes diagnosis hard).
 
-    Tests that pre-date the quarantine set `pipeline.crypto_collector.X` —
-    to keep those tests meaningful (the mock object must intersect the
-    production read path), we wire all three references to the same
-    MagicMock instance. The instance-level `_get_crypto_collector` override
-    bypasses the LEGACY_MARKET_CONTEXT_ENABLED check so tests exercise
-    the legacy code branches uniformly.
+    Crypto-quarantine specifics (§6.5): production now accesses the legacy
+    crypto collector via `self._get_crypto_collector()` (lazy, flag-gated)
+    and `self._crypto_collector` (cache slot), not `self.crypto_collector`.
+    To keep legacy test setups like `pipeline.crypto_collector.X` meaningful
+    (so the mock intersects the production read path), this helper wires
+    all three references to the same MagicMock instance. The instance-level
+    `_get_crypto_collector` override bypasses the
+    LEGACY_MARKET_CONTEXT_ENABLED flag so tests exercise the legacy code
+    branches uniformly.
     """
     pipeline = DailyPipeline.__new__(DailyPipeline)
+    # Live collectors → MagicMock
     pipeline.market_collector = MagicMock()
     pipeline.market_collector._spot_cache = None
     pipeline.market_collector._spot_loaded = False
@@ -45,8 +91,16 @@ def _make_pipeline():
     pipeline.market_judge = MagicMock()
     pipeline.llm_analyst = MagicMock()
     pipeline.index_predictor = OvernightIndexPredictor()
+    # Cached data (matches __init__ block at scheduler/jobs.py:85-88)
     pipeline._geo_factors = None
     pipeline._headlines = None
+    pipeline._capital_flow_signals = None
+    # Pre-trained models (matches __init__ block at scheduler/jobs.py:90-95)
+    pipeline._lgb_predictions = None
+    pipeline._lgb_status = {"status": "unknown", "count": 0, "error": ""}
+    pipeline._rl_agent = None
+    pipeline._mid_model = None
+    pipeline._mid_model_checked = False
     return pipeline
 
 
@@ -244,10 +298,13 @@ def test_evening_outlook_records_structured_market_prediction():
     assert "北证" in pushed_report
     assert "科创" in pushed_report
     assert "五、个股预测" in pushed_report
-    assert "短线前五" in pushed_report
-    assert "中线前五" in pushed_report
-    assert "长线前五" in pushed_report
-    assert "综合前五" in pushed_report
+    # Production format uses "前十" (limit=10 at scheduler/jobs.py:2241).
+    # Long-horizon section uses "长线观察榜前十（仅供参考...）" so we
+    # broaden to "长线".
+    assert "短线前十" in pushed_report
+    assert "中线前十" in pushed_report
+    assert "长线" in pushed_report
+    assert "综合前十" in pushed_report
     assert "六、黄金预测" in pushed_report
     assert "七、加密货币预测" in pushed_report
     assert "LLM outlook" in pushed_report
@@ -380,16 +437,23 @@ def test_daily_summary_includes_morning_final_prediction_comparison():
 
 def test_evening_stock_forecasts_include_horizon_and_composite_top_five():
     pipeline = _make_pipeline()
+    # 最新价 column required — sanitizer's invalid_price rule rejects
+    # rows without a positive price regardless of require_quote setting.
     pipeline.market_collector._spot_cache = pd.DataFrame([
-        {"代码": "600519", "名称": "贵州茅台", "涨跌幅": 1.0, "成交量": 1000000},
-        {"代码": "688981", "名称": "中芯国际", "涨跌幅": 2.0, "成交量": 900000},
-        {"代码": "000001", "名称": "平安银行", "涨跌幅": 0.5, "成交量": 800000},
-        {"代码": "300750", "名称": "宁德时代", "涨跌幅": 3.0, "成交量": 700000},
-        {"代码": "002415", "名称": "海康威视", "涨跌幅": 0.2, "成交量": 600000},
-        {"代码": "601318", "名称": "中国平安", "涨跌幅": -0.1, "成交量": 500000},
+        {"代码": "600519", "名称": "贵州茅台", "最新价": 1800.0, "涨跌幅": 1.0, "成交量": 1000000},
+        {"代码": "688981", "名称": "中芯国际", "最新价": 80.0, "涨跌幅": 2.0, "成交量": 900000},
+        {"代码": "000001", "名称": "平安银行", "最新价": 12.0, "涨跌幅": 0.5, "成交量": 800000},
+        {"代码": "300750", "名称": "宁德时代", "最新价": 220.0, "涨跌幅": 3.0, "成交量": 700000},
+        {"代码": "002415", "名称": "海康威视", "最新价": 30.0, "涨跌幅": 0.2, "成交量": 600000},
+        {"代码": "601318", "名称": "中国平安", "最新价": 45.0, "涨跌幅": -0.1, "成交量": 500000},
     ])
     pipeline.market_collector._load_spot_cache.return_value = None
 
+    # Production calls _build_evening_stock_forecasts(lgb_preds, limit=10)
+    # at scheduler/jobs.py:2241 and the label is hardcoded "前十". Test
+    # the production default to keep the assertion aligned with the
+    # actual evening report — previous "limit=5" + "前五" pair did not
+    # match any real code path.
     groups = pipeline._build_evening_stock_forecasts(
         {
             "SH600519": 0.08,
@@ -399,19 +463,21 @@ def test_evening_stock_forecasts_include_horizon_and_composite_top_five():
             "SZ002415": 0.04,
             "SH601318": 0.03,
         },
-        limit=5,
+        limit=10,
     )
     text = pipeline._format_evening_stock_forecasts(groups)
 
-    assert len(groups["短线"]) == 5
-    assert len(groups["中线"]) == 5
-    assert len(groups["长线"]) == 5
-    assert len(groups["综合"]) == 5
-    assert "短线前五" in text
-    assert "中线前五" in text
-    assert "长线前五" in text
-    assert "综合前五" in text
-    assert "模型分" in text
+    assert len(groups["短线"]) == 6
+    assert len(groups["中线"]) == 6
+    assert len(groups["长线"]) == 6
+    assert len(groups["综合"]) == 6
+    assert "短线前十" in text
+    assert "中线前十" in text
+    assert "长线" in text  # 长线观察榜前十
+    assert "综合前十" in text
+    # Production format renders "模型+0.0700" (no "分" suffix) — drift
+    # from earlier "模型分" label. Assert on the broader substring.
+    assert "模型" in text
     assert "Qlib" not in text
     assert "LGB" not in text
 
