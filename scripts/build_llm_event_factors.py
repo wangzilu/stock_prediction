@@ -105,12 +105,26 @@ def _load_events_via_eventstore(start_dt: datetime, end_dt: datetime) -> pd.Data
         return None
 
 
-def load_events(lookback_days: int = 30, as_of: str = None) -> pd.DataFrame:
-    """Load LLM-extracted events from EventStore (preferred) or JSONL files.
+def load_events(lookback_days: int = 30, as_of: str = None,
+                source: str = "jsonl") -> pd.DataFrame:
+    """Load LLM-extracted events from V2/V1 JSONL (default) or EventStore.
+
+    source: "jsonl" (default, current production behavior) or "eventstore".
+
+    EventStore and JSONL paths use DIFFERENT time semantics for the lookback
+    window: JSONL groups by file_date (the day the extractor ran), while
+    EventStore groups by signal_date (the next business day after publish
+    time = first actionable trading day). On 2026-05-29 production data the
+    two paths produce wildly different factor distributions (sentiment_score
+    mean differs by 17000%, only ~24% stock overlap) because re-extractions
+    inflate JSONL counts while EventStore's BDay roll changes the time
+    bucket. Until backtest validates which path gives better IC, jsonl
+    remains the default so factor behavior stays unchanged.
 
     Args:
         lookback_days: number of past days to include
         as_of: reference date YYYY-MM-DD (default: today)
+        source: "jsonl" or "eventstore"
 
     Returns:
         DataFrame with all events from the lookback window
@@ -121,12 +135,13 @@ def load_events(lookback_days: int = 30, as_of: str = None) -> pd.DataFrame:
     as_of_dt = datetime.strptime(as_of, "%Y-%m-%d")
     start_dt = as_of_dt - timedelta(days=lookback_days)
 
-    # 1. PRIMARY: unified EventStore
-    es_df = _load_events_via_eventstore(start_dt, as_of_dt)
-    if es_df is not None and not es_df.empty:
-        return es_df
+    if source == "eventstore":
+        es_df = _load_events_via_eventstore(start_dt, as_of_dt)
+        if es_df is not None and not es_df.empty:
+            return es_df
+        logger.warning("EventStore source requested but empty/unavailable — falling back to jsonl")
 
-    # 2. FALLBACK: legacy jsonl files (kept for backfill scripts + DR)
+    # Default / fallback: legacy jsonl files
     all_records = []
     for day_offset in range(lookback_days + 1):
         date = (start_dt + timedelta(days=day_offset)).strftime("%Y-%m-%d")
@@ -188,7 +203,8 @@ def parse_publish_date(publish_time_str: str) -> str | None:
         return None
 
 
-def build_factors(signal_date: str = None, lookback_days: int = 30) -> pd.DataFrame:
+def build_factors(signal_date: str = None, lookback_days: int = 30,
+                  source: str = "jsonl") -> pd.DataFrame:
     """Build LLM event factors for a given signal date.
 
     PIT-safe: only uses events with publish_time <= signal_date.
@@ -196,6 +212,7 @@ def build_factors(signal_date: str = None, lookback_days: int = 30) -> pd.DataFr
     Args:
         signal_date: YYYY-MM-DD (default: today)
         lookback_days: days of history to consider
+        source: "jsonl" (default) or "eventstore"
 
     Returns:
         DataFrame indexed by qlib_code with factor columns
@@ -205,7 +222,7 @@ def build_factors(signal_date: str = None, lookback_days: int = 30) -> pd.DataFr
 
     signal_dt = datetime.strptime(signal_date, "%Y-%m-%d")
 
-    df = load_events(lookback_days=lookback_days, as_of=signal_date)
+    df = load_events(lookback_days=lookback_days, as_of=signal_date, source=source)
     if df.empty:
         return pd.DataFrame()
 
@@ -301,6 +318,7 @@ def build_factors_range(
     start_date: str = None,
     end_date: str = None,
     lookback_days: int = 30,
+    source: str = "jsonl",
 ) -> pd.DataFrame:
     """Build factors for a date range and save to parquet.
 
@@ -324,7 +342,7 @@ def build_factors_range(
     current = start_dt
     while current <= end_dt:
         date_str = current.strftime("%Y-%m-%d")
-        df = build_factors(signal_date=date_str, lookback_days=lookback_days)
+        df = build_factors(signal_date=date_str, lookback_days=lookback_days, source=source)
         if not df.empty:
             all_dfs.append(df)
         current += timedelta(days=1)
@@ -362,22 +380,30 @@ def main():
     parser.add_argument("--start", type=str, default=None, help="Range start date")
     parser.add_argument("--end", type=str, default=None, help="Range end date")
     parser.add_argument("--lookback", type=int, default=30, help="Event lookback days (default: 30)")
+    parser.add_argument(
+        "--source", choices=["jsonl", "eventstore"], default="jsonl",
+        help="Event source: 'jsonl' (default, current production) groups by file_date; "
+             "'eventstore' groups by signal_date and changes factor distributions by ~100x. "
+             "Use eventstore only for IC backtests, not live production.",
+    )
     args = parser.parse_args()
 
     if args.date:
-        df = build_factors(signal_date=args.date, lookback_days=args.lookback)
+        df = build_factors(signal_date=args.date, lookback_days=args.lookback, source=args.source)
         if not df.empty:
             # Single-date mode: save/append to parquet
             build_factors_range(
                 start_date=args.date,
                 end_date=args.date,
                 lookback_days=args.lookback,
+                source=args.source,
             )
     else:
         build_factors_range(
             start_date=args.start,
             end_date=args.end,
             lookback_days=args.lookback,
+            source=args.source,
         )
 
 
