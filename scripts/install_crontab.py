@@ -190,9 +190,13 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                 [py, str(scripts / "run_brinson_attribution.py")], "brinson_attribution.log",
                 network="none", timeout_sec=600),
         # --- LLM 429 retry queue drain (after main pipeline + evening) ---
+        # Depends on llm_event_pipeline (no queue to drain if pipeline didn't
+        # run). enforce_deps with 4h wait budget so a 16:30 pipeline that
+        # itself ran late (e.g. 19:00) can still gate the 22:30 drain.
         CronJob("llm_retry_queue_drain", "30 22 * * 1-5",
                 [py, str(scripts / "drain_llm_retry_queue.py")], "llm_retry_drain.log",
-                network="llm", timeout_sec=3600),
+                network="llm", timeout_sec=3600,
+                enforce_deps=True, dep_wait_seconds=14400),
         CronJob("daily_health_check", "55 18 * * 1-5",
                 [py, str(scripts / "daily_health_check.py")], "health_check.log",
                 network="none", timeout_sec=300),
