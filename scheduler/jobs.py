@@ -1437,20 +1437,26 @@ class DailyPipeline:
     def _format_crypto_forecast(self, crypto_data, geo_factors: dict) -> str:
         """Format concise BTC/ETH forecast for evening report.
 
-        Per quarantine §6.5 L6: when crypto context is disabled (collector
-        is None or no realtime data fetched), return a fixed
-        disabled-context stub rather than synthesising BTC/ETH numbers
-        from macro factors. The previous behaviour leaked a fake forecast
-        into the evening report even when LEGACY_MARKET_CONTEXT_ENABLED
-        was off — that violated the quarantine intent.
+        Per quarantine §6.5 L6 and code-review I1: distinguish two
+        distinct empty paths:
+          (a) flag off  → "crypto context disabled" stub (quarantine intent)
+          (b) flag on but no data fetched → "暂无实时数据" fallback
+              (network failure / collector returned nothing)
+        Conflating them previously caused flag-on+network-fail runs to
+        emit the quarantine-off text, which is misleading.
         """
         from config.feature_flags import LEGACY_MARKET_CONTEXT_ENABLED
         crypto_data = crypto_data or {}
-        if not LEGACY_MARKET_CONTEXT_ENABLED or not crypto_data:
+        if not LEGACY_MARKET_CONTEXT_ENABLED:
             return (
                 "七、加密货币预测\n"
                 "BTC/ETH：crypto context disabled（legacy quarantine off, "
-                "见 plans/cc-crypto-implementation-spec-2026-05-30.md §6.5）。"
+                "见 §6.5）。"
+            )
+        if not crypto_data:
+            return (
+                "七、加密货币预测\n"
+                "BTC/ETH：暂无实时数据，先按震荡处理。"
             )
         policy = _finite_float(geo_factors.get("policy_signal"))
         geo_risk = _finite_float(geo_factors.get("geo_risk_index"))
@@ -1470,8 +1476,6 @@ class DailyPipeline:
                 f"{name}：{self._pct_direction(expected)}，{price_text}最近交易日{change:+.2f}%，"
                 f"明日参考{expected:+.2f}%附近"
             )
-        if len(lines) == 1:
-            lines.append("BTC/ETH：暂无实时数据，先按震荡处理。")
         return "\n".join(lines)
 
     def _fallback_world_outlook(self, geo_factors: dict, headlines: list) -> str:

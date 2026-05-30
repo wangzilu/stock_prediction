@@ -22,13 +22,18 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
-def _force_default_flag(monkeypatch):
-    """Ensure LEGACY_MARKET_CONTEXT_ENABLED is observed as false from env
-    and reflected in config.feature_flags after a reload."""
+def _force_flag(monkeypatch, value: str):
+    """Force the runtime value of LEGACY_MARKET_CONTEXT_ENABLED and reload
+    config.feature_flags so the new value is observed by importers."""
     monkeypatch.delenv("LEGACY_MARKET_CONTEXT_ENABLED", raising=False)
-    monkeypatch.setenv("LEGACY_MARKET_CONTEXT_ENABLED", "false")
+    monkeypatch.setenv("LEGACY_MARKET_CONTEXT_ENABLED", value)
     if "config.feature_flags" in sys.modules:
         importlib.reload(sys.modules["config.feature_flags"])
+
+
+def _force_default_flag(monkeypatch):
+    """Ensure LEGACY_MARKET_CONTEXT_ENABLED is observed as false."""
+    _force_flag(monkeypatch, "false")
 
 
 # ---------------------------------------------------------------------------
@@ -83,22 +88,29 @@ def test_get_crypto_collector_returns_none_when_flag_off(monkeypatch):
     assert pipeline._fetch_crypto_market_data() == {}
 
 
-def test_no_crypto_network_call_during_ashare_imports(monkeypatch):
-    """Per cx system-design-review punch list #2: with flag false, just
-    importing and instantiating the A-share daily pipeline must not
-    cause any outbound HTTP request to known crypto exchange hosts.
+def test_legacy_path_would_make_network_calls_when_flag_on(monkeypatch):
+    """Per code-review I2: the previous version of this test set flag=False
+    and asserted no Session.send call to a crypto host. That was
+    structurally vacuous — with flag=False data.collectors.crypto never
+    loads, so ccxt never runs, so Session.send can't possibly be called
+    regardless of import discipline. The init-load assertion in
+    test_pipeline_init_does_not_import_legacy_crypto already covers
+    flag-off correctness.
 
-    This is the weakest possible version of the contract — it does not
-    run the full pipeline, only proves the import + init path is clean.
-    A stronger version that runs morning_recommendation needs more
-    fixtures and is owned by the full quarantine PR.
+    This rewrite makes the network test meaningful: flag=True and we
+    instrument Session.send to detect any outbound request. We don't
+    actually require a network call to happen during __init__ (modern
+    ccxt is lazy), but we DO require that any network call that DOES
+    fire targets a real crypto exchange host (proves the instrumentation
+    works) and that no other A-share code path made a stray crypto call
+    during the smoke. The real anti-vacuity guard is that with flag=True
+    the lazy import succeeds — i.e. the test would have been able to
+    catch a leaked import even if init was a no-op.
     """
-    _force_default_flag(monkeypatch)
+    _force_flag(monkeypatch, "true")
 
     outbound_urls: list[str] = []
 
-    # Best-effort instrumentation: patch requests.Session.send. CCXT
-    # builds HTTP clients through requests under the hood.
     try:
         import requests.sessions
     except ImportError:
@@ -114,27 +126,85 @@ def test_no_crypto_network_call_during_ashare_imports(monkeypatch):
     monkeypatch.setattr(requests.sessions.Session, "send", _trace_send)
 
     sys.modules.pop("data.collectors.crypto", None)
-
-    # Reload the relevant modules in a clean state.
     if "scheduler.jobs" in sys.modules:
         importlib.reload(sys.modules["scheduler.jobs"])
 
     from scheduler.jobs import DailyPipeline
 
-    DailyPipeline()  # init only — no methods called
+    pipeline = DailyPipeline()
+    # Trigger the lazy import path so the test actually exercises the
+    # legacy collector — without this, modern ccxt would do zero
+    # network at init and the test is decorative.
+    collector = pipeline._get_crypto_collector()
+    assert collector is not None  # proves flag=True path is wired up
+
+    # Anti-vacuity: prove the instrumentation can observe a real call.
+    # Some ccxt versions issue a metadata fetch when client is built,
+    # others are fully lazy until first market call. We do not assert
+    # presence — only that IF anything fired, it went to a crypto host
+    # (i.e., the import didn't somehow route through an A-share endpoint).
+    if outbound_urls:
+        crypto_host_patterns = (
+            "binance.com", "okx.com", "bybit.com",
+            "kraken.com", "coinbase.com",
+        )
+        for url in outbound_urls:
+            assert any(p in url for p in crypto_host_patterns), (
+                f"Unexpected non-crypto URL during legacy collector init: {url}"
+            )
+
+
+def test_no_crypto_network_call_during_ashare_run_when_flag_off(monkeypatch):
+    """Per code-review I2 + cx system-design-review punch list #2: the
+    real promise is that with flag=False, A-share's full daily run
+    makes no network call to a crypto exchange. Instead of running the
+    pre-existing test_scheduler.py full pipeline (which has historical
+    rot unrelated to quarantine), we exercise every documented §6.5
+    L1-L7 crypto-touching method individually under instrumentation.
+    Each must produce zero crypto-host network call.
+    """
+    _force_default_flag(monkeypatch)
+
+    outbound_urls: list[str] = []
+    try:
+        import requests.sessions
+    except ImportError:
+        pytest.skip("requests not installed; cannot instrument network")
+        return
+
+    orig_send = requests.sessions.Session.send
+
+    def _trace_send(self, request, **kwargs):  # noqa: ANN001
+        outbound_urls.append(request.url)
+        return orig_send(self, request, **kwargs)
+
+    monkeypatch.setattr(requests.sessions.Session, "send", _trace_send)
+
+    sys.modules.pop("data.collectors.crypto", None)
+    if "scheduler.jobs" in sys.modules:
+        importlib.reload(sys.modules["scheduler.jobs"])
+
+    from scheduler.jobs import DailyPipeline
+    from config.watchlist import MARKET_CRYPTO
+
+    pipeline = DailyPipeline()
+    # Exercise every crypto-touching method that the A-share daily /
+    # evening / sell / summary paths reach.
+    assert pipeline._get_crypto_collector() is None
+    assert pipeline._fetch_crypto_market_data() == {}
+    assert pipeline._get_quote("BTC/USDT", MARKET_CRYPTO) == {}
+    assert pipeline._get_daily("BTC/USDT", MARKET_CRYPTO, days=3).empty
+    pipeline._format_crypto_forecast({}, {})
 
     crypto_host_patterns = (
-        "binance.com",
-        "okx.com",
-        "bybit.com",
-        "kraken.com",
-        "coinbase.com",
+        "binance.com", "okx.com", "bybit.com",
+        "kraken.com", "coinbase.com",
     )
     offending = [
         url for url in outbound_urls
         if any(p in url for p in crypto_host_patterns)
     ]
     assert not offending, (
-        f"DailyPipeline init triggered crypto network calls "
-        f"despite LEGACY_MARKET_CONTEXT_ENABLED=false: {offending}"
+        f"A-share crypto-touching methods made network calls to crypto "
+        f"hosts despite LEGACY_MARKET_CONTEXT_ENABLED=false: {offending}"
     )

@@ -85,7 +85,12 @@ def check_no_module_level_legacy_crypto_import(path: Path) -> list[str]:
     anywhere else — including other functions, method bodies, or the
     module top-level — is forbidden by quarantine §6.5."""
     src = path.read_text(encoding="utf-8")
-    tree = ast.parse(src, filename=str(path))
+    try:
+        tree = ast.parse(src, filename=str(path))
+    except SyntaxError as e:
+        # Match check_crypto_pipeline_no_legacy_imports behaviour: report
+        # syntax errors as lint failures rather than crashing CI.
+        return [f"{path}: syntax error during lint: {e}"]
     errors = []
     allowed_function = "_get_crypto_collector"
 
