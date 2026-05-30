@@ -2036,8 +2036,21 @@ class DailyPipeline:
             for i, rec in enumerate(top_recs[:20]):
                 code = getattr(rec, "code", str(rec)) if not isinstance(rec, dict) else rec.get("code", "?")
                 name = getattr(rec, "name", "") if not isinstance(rec, dict) else rec.get("name", "")
-                score = getattr(rec, "score", 0) if not isinstance(rec, dict) else rec.get("score", 0)
-                lines.append(f"  {i+1}. {code} {name} (score={score:.3f})")
+                # Per code-review P2-a (2026-05-30): the Recommendation
+                # dataclass field is `final_score`, not `score`. The old
+                # `getattr(rec, "score", 0)` always fell through to 0
+                # because no such attribute exists, so the fallback report
+                # rendered score=0.000 for every recommendation. Prefer
+                # final_score, with `score` as a defensive secondary
+                # fallback for any caller still passing a `score`-keyed dict.
+                if isinstance(rec, dict):
+                    score = rec.get("final_score", rec.get("score", 0))
+                else:
+                    score = getattr(rec, "final_score", getattr(rec, "score", 0))
+                try:
+                    lines.append(f"  {i+1}. {code} {name} (score={float(score):.3f})")
+                except (TypeError, ValueError):
+                    lines.append(f"  {i+1}. {code} {name} (score=n/a)")
             report = "\n".join(lines)
         model_quality = self._load_model_quality_line()
         status_block = self._model_status_text()
