@@ -682,10 +682,19 @@ class PaperOMS:
         prices = self._load_real_prices(date, extra_codes=all_codes, use_next_open=False)
         price_type = getattr(self, "_price_type", "close_estimate")
 
-        # Compute target weights for buy sizing
+        # Compute target weights for buy sizing.
+        # CRITICAL: in optimizer_v2 + pending mode, _generate_target_optimizer
+        # stores the just-computed (RiskGuard + reduce_weight aware) target
+        # into state["pending_target_weights"]; prev_weights still holds the
+        # PREVIOUS reconcile's weights. Reading prev_weights here meant new
+        # buys had no weight at all (they weren't in last cycle's portfolio),
+        # falling back to cash * 0.95 / N and silently bypassing
+        # reduce_weight. Read pending_target_weights first; only legacy mode
+        # commits straight to prev_weights so it's still correct there.
         target_weights = {}
         if self.execution_mode == "optimizer_v2":
-            target_weights = dict(self.state.get("prev_weights", {}))
+            target_weights = dict(self.state.get("pending_target_weights")
+                                  or self.state.get("prev_weights", {}))
         else:
             # Equal weight for buffered_partial
             if target:

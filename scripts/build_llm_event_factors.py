@@ -106,10 +106,14 @@ def _load_events_via_eventstore(start_dt: datetime, end_dt: datetime) -> pd.Data
 
 
 def load_events(lookback_days: int = 30, as_of: str = None,
-                source: str = "jsonl") -> pd.DataFrame:
+                source: str = "jsonl", allow_fallback: bool = False) -> pd.DataFrame:
     """Load LLM-extracted events from V2/V1 JSONL (default) or EventStore.
 
     source: "jsonl" (default, current production behavior) or "eventstore".
+    allow_fallback: when source="eventstore" and the EventStore query is empty
+        or fails, return jsonl results instead of raising. Default False so
+        IC backtests can't be silently contaminated — if you ask for
+        EventStore, you must get EventStore or a clear failure.
 
     EventStore and JSONL paths use DIFFERENT time semantics for the lookback
     window: JSONL groups by file_date (the day the extractor ran), while
@@ -125,6 +129,7 @@ def load_events(lookback_days: int = 30, as_of: str = None,
         lookback_days: number of past days to include
         as_of: reference date YYYY-MM-DD (default: today)
         source: "jsonl" or "eventstore"
+        allow_fallback: when True, eventstore empty/error falls through to jsonl
 
     Returns:
         DataFrame with all events from the lookback window
@@ -139,7 +144,15 @@ def load_events(lookback_days: int = 30, as_of: str = None,
         es_df = _load_events_via_eventstore(start_dt, as_of_dt)
         if es_df is not None and not es_df.empty:
             return es_df
-        logger.warning("EventStore source requested but empty/unavailable — falling back to jsonl")
+        if not allow_fallback:
+            raise RuntimeError(
+                f"source='eventstore' explicitly requested but EventStore returned "
+                f"empty/None for [{start_dt.date()}, {as_of_dt.date()}]. Pass "
+                f"allow_fallback=True (or --allow-fallback on the CLI) to silently "
+                f"fall back to jsonl. Default is fail-loud so IC backtests can't "
+                f"unknowingly measure the wrong source."
+            )
+        logger.warning("EventStore source requested but empty/unavailable — falling back to jsonl (--allow-fallback)")
 
     # Default / fallback: legacy jsonl files
     all_records = []
@@ -204,7 +217,7 @@ def parse_publish_date(publish_time_str: str) -> str | None:
 
 
 def build_factors(signal_date: str = None, lookback_days: int = 30,
-                  source: str = "jsonl") -> pd.DataFrame:
+                  source: str = "jsonl", allow_fallback: bool = False) -> pd.DataFrame:
     """Build LLM event factors for a given signal date.
 
     PIT-safe: only uses events with publish_time <= signal_date.
@@ -222,7 +235,8 @@ def build_factors(signal_date: str = None, lookback_days: int = 30,
 
     signal_dt = datetime.strptime(signal_date, "%Y-%m-%d")
 
-    df = load_events(lookback_days=lookback_days, as_of=signal_date, source=source)
+    df = load_events(lookback_days=lookback_days, as_of=signal_date, source=source,
+                     allow_fallback=allow_fallback)
     if df.empty:
         return pd.DataFrame()
 
@@ -319,6 +333,7 @@ def build_factors_range(
     end_date: str = None,
     lookback_days: int = 30,
     source: str = "jsonl",
+    allow_fallback: bool = False,
 ) -> pd.DataFrame:
     """Build factors for a date range and save to parquet.
 
@@ -342,7 +357,8 @@ def build_factors_range(
     current = start_dt
     while current <= end_dt:
         date_str = current.strftime("%Y-%m-%d")
-        df = build_factors(signal_date=date_str, lookback_days=lookback_days, source=source)
+        df = build_factors(signal_date=date_str, lookback_days=lookback_days,
+                           source=source, allow_fallback=allow_fallback)
         if not df.empty:
             all_dfs.append(df)
         current += timedelta(days=1)
@@ -386,17 +402,24 @@ def main():
              "'eventstore' groups by signal_date and changes factor distributions by ~100x. "
              "Use eventstore only for IC backtests, not live production.",
     )
+    parser.add_argument(
+        "--allow-fallback", action="store_true",
+        help="If --source eventstore is requested but EventStore is empty/unavailable, "
+             "fall back to jsonl. Default is fail-loud so IC backtests can't silently "
+             "measure the wrong source.",
+    )
     args = parser.parse_args()
 
     if args.date:
-        df = build_factors(signal_date=args.date, lookback_days=args.lookback, source=args.source)
+        df = build_factors(signal_date=args.date, lookback_days=args.lookback,
+                           source=args.source, allow_fallback=args.allow_fallback)
         if not df.empty:
-            # Single-date mode: save/append to parquet
             build_factors_range(
                 start_date=args.date,
                 end_date=args.date,
                 lookback_days=args.lookback,
                 source=args.source,
+                allow_fallback=args.allow_fallback,
             )
     else:
         build_factors_range(
@@ -404,6 +427,7 @@ def main():
             end_date=args.end,
             lookback_days=args.lookback,
             source=args.source,
+            allow_fallback=args.allow_fallback,
         )
 
 

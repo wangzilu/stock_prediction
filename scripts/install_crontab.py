@@ -42,6 +42,11 @@ class CronJob:
     # rollout doesn't brick jobs whose upstream hasn't written its status
     # file yet.
     enforce_deps: bool = False
+    # When enforce_deps is True, max wall-clock seconds the downstream waits
+    # for upstreams to complete. Must cover the WORST-case upstream chain
+    # completion time from this job's start. Default 1800s (30 min) only
+    # works for jobs whose upstreams are guaranteed done by start time.
+    dep_wait_seconds: int = 1800
 
 
 def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_ROOT) -> list[CronJob]:
@@ -136,30 +141,47 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         # Smoke depends on feature_cache_rebuild; downstream paper/shadow
         # opt into --enforce-deps so stale upstream blocks rather than
         # silently trades on yesterday's signal.
+        #
+        # Wait-budget reasoning:
+        #   qlib_data_update 17:45 + timeout 3600s → worst-case done 18:45
+        #   feature_cache_rebuild 18:25 + (waits up to 30min for qlib) +
+        #     own 30min timeout → worst-case done 19:15
+        #   lgb_after_close_smoke 18:35 must therefore wait up to 40 min
+        #     to see cache_rebuild complete; 30 min default would give
+        #     up at 19:05, 10 min short. 3600s = 60 min covers it.
+        #   All later jobs inherit the same worst case → 3600s across.
         CronJob("lgb_after_close_smoke", "35 18 * * 1-5",
                 [py, str(scripts / "smoke_lgb_predict.py")], "lgb_after_close_smoke.log",
-                network="none", timeout_sec=900, critical=True, enforce_deps=True),
+                network="none", timeout_sec=900, critical=True,
+                enforce_deps=True, dep_wait_seconds=3600),
         CronJob("predict_crash_daily", "37 18 * * 1-5",
                 [py, str(scripts / "predict_crash_daily.py")], "crash_predict.log",
-                network="none", timeout_sec=120, enforce_deps=True),
+                network="none", timeout_sec=120,
+                enforce_deps=True, dep_wait_seconds=3600),
         CronJob("shadow_optimizer", "40 18 * * 1-5",
                 [py, str(scripts / "run_shadow_optimizer.py")], "shadow_optimizer.log",
-                network="none", timeout_sec=600, enforce_deps=True),
+                network="none", timeout_sec=600,
+                enforce_deps=True, dep_wait_seconds=3600),
         CronJob("paper_trading", "42 18 * * 1-5",
                 [py, str(scripts / "run_paper_trading.py")], "paper_trading.log",
-                network="none", timeout_sec=600, enforce_deps=True),
+                network="none", timeout_sec=600,
+                enforce_deps=True, dep_wait_seconds=3600),
         CronJob("shadow_chain_overlay", "45 18 * * 1-5",
                 [py, str(scripts / "shadow_supply_chain_overlay.py")], "shadow_chain_overlay.log",
-                network="none", timeout_sec=120, enforce_deps=True),
+                network="none", timeout_sec=120,
+                enforce_deps=True, dep_wait_seconds=3600),
         CronJob("shadow_klen_overlay", "46 18 * * 1-5",
                 [py, str(scripts / "shadow_klen_overlay.py")], "shadow_klen_overlay.log",
-                network="none", timeout_sec=120, enforce_deps=True),
+                network="none", timeout_sec=120,
+                enforce_deps=True, dep_wait_seconds=3600),
         CronJob("shadow_vol_compression", "47 18 * * 1-5",
                 [py, str(scripts / "shadow_vol_compression.py")], "shadow_vol_compression.log",
-                network="none", timeout_sec=120, enforce_deps=True),
+                network="none", timeout_sec=120,
+                enforce_deps=True, dep_wait_seconds=3600),
         CronJob("shadow_roc5_tsmin10", "48 18 * * 1-5",
                 [py, str(scripts / "shadow_roc5_tsmin10.py")], "shadow_roc5_tsmin10.log",
-                network="none", timeout_sec=120, enforce_deps=True),
+                network="none", timeout_sec=120,
+                enforce_deps=True, dep_wait_seconds=3600),
         # --- Monitoring (none) ---
         CronJob("factor_decay_monitor", "49 18 * * 1-5",
                 [py, str(scripts / "monitor_factor_decay.py")], "factor_decay.log",
@@ -220,6 +242,8 @@ def render_job(job: CronJob, python_bin: str = DEFAULT_PYTHON, project_root: Pat
     ]
     if job.enforce_deps:
         status_args.append("--enforce-deps")
+        if job.dep_wait_seconds != 1800:
+            status_args.extend(["--dep-wait-seconds", str(job.dep_wait_seconds)])
     command = status_args + ["--"] + network_cmd
 
     return (

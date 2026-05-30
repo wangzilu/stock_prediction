@@ -92,6 +92,15 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     if args.enforce_deps:
         if not _wait_for_upstream(args.job_id, today, args.dep_wait_seconds):
+            # Write an explicit "blocked" entry so the daily health dashboard
+            # can distinguish "upstream still pending" from "job never ran".
+            # Without this, exit 75 left job_status.json silent and the
+            # operator only saw "missing" with no indication this job tried
+            # and gave up.
+            mark_complete(
+                args.job_id, today, success=False,
+                details=f"blocked: upstream wait budget {args.dep_wait_seconds}s exhausted",
+            )
             return 75  # EX_TEMPFAIL — semantically "try again later"
 
     def _run() -> None:
