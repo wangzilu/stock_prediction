@@ -15,3 +15,8 @@ class PortfolioConstraints:
     industry_map: dict = field(default_factory=dict)   # stock -> industry
     adv: dict = field(default_factory=dict)             # stock -> ADV value
     volatility: dict = field(default_factory=dict)      # stock -> daily vol
+    # Soft position-sizing multipliers from RiskGuard (e.g. crash_prob 0.50
+    # → 0.5x, 0.70 → 0.25x). Applied to raw alpha-proportional weights
+    # BEFORE the per-stock cap + turnover constraint so the cap can still
+    # enforce diversification on the down-weighted name.
+    reduce_weight: dict = field(default_factory=dict)   # stock -> multiplier in (0, 1]

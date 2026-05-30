@@ -121,6 +121,24 @@ class TurnoverConstrainedOptimizer:
             total = shifted.sum()
             raw_weights = {s: float(shifted[s] / total) for s in all_stocks}
 
+        # Step 2.5: RiskGuard soft penalty (crash_prob 0.5/0.7 tiers).
+        # Multiply target weights by reduce_weight[code] (typically 0.25 or 0.5)
+        # before bounds + turnover so a flagged stock can still appear in the
+        # top-K universe but at a clamped size. Then renormalize so total
+        # remains 1.0 (the freed weight gets redistributed to non-penalized
+        # stocks proportionally via the renorm).
+        if constraints and getattr(constraints, "reduce_weight", None):
+            n_applied = 0
+            for code, mult in constraints.reduce_weight.items():
+                if code in raw_weights and 0.0 < float(mult) < 1.0:
+                    raw_weights[code] *= float(mult)
+                    n_applied += 1
+            if n_applied:
+                total = sum(raw_weights.values())
+                if total > 0:
+                    raw_weights = {s: w / total for s, w in raw_weights.items()}
+                logger.info("optimizer_v2: applied reduce_weight to %d stocks", n_applied)
+
         # Apply per-stock weight cap
         raw_weights = self._apply_weight_bounds(raw_weights)
 

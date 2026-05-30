@@ -158,21 +158,25 @@ class PaperOMS:
             positions[code] = pos
         return positions
 
-    def generate_target(self, predictions: dict) -> list:
+    def generate_target(self, predictions: dict, risk_info: dict | None = None) -> list:
         """Generate target portfolio.
 
         For buffered_partial: returns (target_list, sells, buys)
         For optimizer_v2: returns (target_list, sells, buys) derived from weight changes
+
+        risk_info (optional) carries RiskGuard outputs that influence sizing
+        beyond simple include/exclude — currently `reduce_weight` (soft crash
+        tier multipliers). Threaded through to the optimizer.
         """
         if not predictions:
             return list(self.state.get("positions", {}).keys()), [], []
 
         if self.execution_mode == "optimizer_v2":
-            return self._generate_target_optimizer(predictions)
+            return self._generate_target_optimizer(predictions, risk_info=risk_info)
 
         return self._generate_target_buffered(predictions)
 
-    def _generate_target_optimizer(self, predictions: dict):
+    def _generate_target_optimizer(self, predictions: dict, risk_info: dict | None = None):
         """Generate target via optimizer_v2 (alpha-proportional + turnover constraint)."""
         import pandas as pd
         from backtest.optimizer_v2 import TurnoverConstrainedOptimizer
@@ -187,7 +191,11 @@ class PaperOMS:
         prev_weights = self.state.get("prev_weights", {})
         holding_days = {code: pos.get("holding_days", 0)
                         for code, pos in self.state.get("positions", {}).items()}
-        constraints = PortfolioConstraints(min_hold_days=self.min_hold_days)
+        reduce_weight = dict((risk_info or {}).get("reduce_weight", {}))
+        constraints = PortfolioConstraints(
+            min_hold_days=self.min_hold_days,
+            reduce_weight=reduce_weight,
+        )
 
         target_weights = optimizer.optimize(
             alpha_scores=scores, prev_weights=prev_weights,
@@ -573,10 +581,16 @@ class PaperOMS:
             return None
 
     def _apply_risk_guard(self, predictions: dict, date: str):
-        """Run RiskGuard checks.  Returns (filtered_predictions, extra_sells, risk_info)."""
+        """Run RiskGuard checks.  Returns (filtered_predictions, extra_sells, risk_info).
+
+        risk_info now also propagates reduce_weight (the soft crash-tier
+        penalty multipliers, e.g. crash_prob 0.50 → 0.5x, 0.70 → 0.25x). The
+        optimizer reads constraints.reduce_weight to scale target weights
+        before the per-stock cap, so this layer is no longer dead code.
+        """
         extra_sells = []
         risk = None
-        risk_info = {"force_sell": [], "alert_level": "normal"}
+        risk_info = {"force_sell": [], "alert_level": "normal", "reduce_weight": {}}
         try:
             from backtest.risk_guard import RiskGuard
             # Pass state_dir to RiskGuard for champion/shadow isolation
@@ -612,6 +626,14 @@ class PaperOMS:
                 predictions = {k: v for k, v in predictions.items()
                                if k not in risk.cannot_buy and k.lower() not in risk.cannot_buy}
 
+            # Surface reduce_weight for the optimizer downstream
+            if risk.reduce_weight:
+                risk_info["reduce_weight"] = dict(risk.reduce_weight)
+                logger.info(
+                    "  RiskGuard reduce_weight: %d stocks (soft crash tier)",
+                    len(risk.reduce_weight),
+                )
+
             extra_sells = [code for code in risk.force_sell
                            if code in self.state.get("positions", {})]
         except Exception as e:
@@ -646,8 +668,8 @@ class PaperOMS:
 
         predictions, extra_sells, risk_info = self._apply_risk_guard(predictions, date)
 
-        # Generate target
-        target, sells, buys = self.generate_target(predictions)
+        # Generate target — pass risk_info so optimizer applies reduce_weight
+        target, sells, buys = self.generate_target(predictions, risk_info=risk_info)
 
         if extra_sells:
             sells = list(set(sells + extra_sells))
@@ -993,8 +1015,8 @@ class PaperOMS:
 
         predictions, extra_sells, _risk_info = self._apply_risk_guard(predictions, date)
 
-        # Generate target
-        target, sells, buys = self.generate_target(predictions)
+        # Generate target — pass risk_info so optimizer applies reduce_weight
+        target, sells, buys = self.generate_target(predictions, risk_info=_risk_info)
 
         # Add risk-forced sells
         if extra_sells:
