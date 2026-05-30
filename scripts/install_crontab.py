@@ -97,9 +97,16 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("guba_popularity", "35 16 * * 1-5",
                 [py, str(scripts / "collect_guba_sentiment.py")], "guba_popularity.log",
                 network="domestic", timeout_sec=600),
-        CronJob("llm_event_retry", "30 17 * * 1-5",
-                [py, str(scripts / "run_llm_event_pipeline.py")], "llm_event_retry.log",
-                network="llm", timeout_sec=7200),
+        # NOTE: The 17:30 llm_event_retry full-rerun was REMOVED 2026-05-31.
+        # Reason (cx code review): factors/llm_event_extractor_v2.py:332-335
+        # deletes any existing jsonl with <500 lines before re-running. So a
+        # successful-but-partial 16:30 pipeline (e.g. 152 events written)
+        # would be DESTROYED by 17:30 retry, and a still-throttled second
+        # run could leave the day worse than before (regression of already-
+        # written events). The 22:30 llm_retry_queue_drain (below) is the
+        # correct compensation: it appends queue-recovered events without
+        # touching the existing jsonl, and idempotently re-syncs EventStore
+        # + rebuilds factors. Do NOT re-add this full-rerun entry.
         CronJob("spot_cache_warmup", "5 17 * * 1-5",
                 [py, main_py, "--warm-spot-cache"], "cron_spot_cache_warmup.log",
                 network="domestic", timeout_sec=600),
