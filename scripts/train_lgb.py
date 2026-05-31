@@ -237,8 +237,27 @@ def main():
                                          data_key=DataHandlerLP.DK_L)
                 print(f"Merged {supp_cols} supplementary features "
                       f"(learn features: {verify.shape[1]})")
+                # Per code-review P2 2026-05-31: extract real feature
+                # name list for artifact contract (was always [] because
+                # `feature_cols` was never defined). verify.columns is a
+                # MultiIndex [("feature", name), ...].
+                feature_cols = [
+                    col[1] if isinstance(col, tuple) else col
+                    for col in verify.columns.tolist()
+                ]
     except Exception as e:
         print(f"Supplementary feature merge skipped: {e}")
+        # If merge failed, feature_cols may not be defined — fall back to
+        # raw Alpha158 names if we can derive them
+        try:
+            from qlib.data.dataset.handler import DataHandlerLP as _DK
+            verify_fallback = dataset.prepare("train", col_set="feature", data_key=_DK.DK_L)
+            feature_cols = [
+                col[1] if isinstance(col, tuple) else col
+                for col in verify_fallback.columns.tolist()
+            ]
+        except Exception:
+            feature_cols = []
 
     # Model selection: XGB (better IC) or LGB (fallback)
     model_type = os.environ.get("TRAIN_MODEL_TYPE", "xgb").lower()
@@ -362,7 +381,12 @@ def main():
             model_name="xgb_174",
             feature_set="FS-174",
             description="Production LGB training run",
-            feature_list=feature_cols if 'feature_cols' in dir() else [],
+            # Per code-review P2 2026-05-31: this used to be
+            #   feature_cols if 'feature_cols' in dir() else []
+            # but `feature_cols` was never defined → always [], artifact
+            # contract empty. Now feature_cols is set above from the
+            # actual handler columns after supplementary merge.
+            feature_list=list(feature_cols),
             label_column=LABEL_EXPR,
             data_asof_date=train_end,
             n_features=n_features,
