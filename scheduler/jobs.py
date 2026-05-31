@@ -202,13 +202,30 @@ class DailyPipeline:
             return _use_cache(str(e))
         return self._lgb_predictions
 
-    def _load_capital_flow_signals(self) -> dict:
-        """Load latest capital flow signals from parquet files.
+    def _load_capital_flow_signals(self, target_date: str | None = None) -> dict:
+        """Load capital flow signals from parquet files.
 
-        Returns dict: {qlib_code: {"net_mf": float, "net_mf_pct": float,
-                                    "net_mf_5d": float, "nb_present": bool}}
+        Args:
+            target_date: optional YYYY-MM-DD as-of date. When None (default,
+                live cron path), returns latest 5 trading days as before —
+                no behavior change. When passed (backfill / snapshot replay /
+                test paths), filters parquet rows to those with
+                trade_date <= target_date, then takes the latest 5 within
+                that window. Per code-review P2 2026-05-31 (cx finding):
+                without this guard, backfill paths that called this method
+                would leak future capital flow into historical
+                morning-recommendation reconstructions.
+
+        Returns dict: {qlib_code: {"net_mf": float, "net_mf_5d": float,
+                                    "nb_present": bool, ...}}
+
+        Cache note: when target_date is None (live), result is cached on
+        self._capital_flow_signals. When target_date is provided (backfill),
+        cache is BYPASSED — different target_dates must return different
+        results, so caching them under one slot would corrupt either live
+        or backfill output.
         """
-        if self._capital_flow_signals is not None:
+        if target_date is None and self._capital_flow_signals is not None:
             return self._capital_flow_signals
 
         signals = {}
@@ -222,7 +239,11 @@ class DailyPipeline:
                 ])
                 df = df.dropna(subset=["net_mf_amount"])
                 df["trade_date"] = df["trade_date"].astype(str)
-                # Latest 5 trading days per stock
+                # PIT-safe slicing per target_date (cx P2 2026-05-31)
+                if target_date is not None:
+                    df = df[df["trade_date"] <= target_date]
+                # Latest 5 trading days per stock within the (optionally
+                # constrained) window
                 latest_dates = sorted(df["trade_date"].unique())[-5:]
                 recent = df[df["trade_date"].isin(latest_dates)]
 
@@ -250,6 +271,9 @@ class DailyPipeline:
                 nb = pd.read_parquet(nb_path)
                 nb = nb.dropna(subset=["trade_date"])
                 nb["trade_date"] = nb["trade_date"].astype(str)
+                # Same PIT-safe slicing applied to northbound (cx P2 2026-05-31)
+                if target_date is not None:
+                    nb = nb[nb["trade_date"] <= target_date]
                 latest_nb_dates = sorted(nb["trade_date"].unique())[-5:]
                 recent_nb = nb[nb["trade_date"].isin(latest_nb_dates)]
 
@@ -292,7 +316,11 @@ class DailyPipeline:
             except Exception as e:
                 logger.warning(f"Failed to load northbound signals: {e}")
 
-        self._capital_flow_signals = signals
+        # Only cache the LIVE-path result (target_date=None). Backfill
+        # paths produce different signals per target_date and must not
+        # share the cache slot.
+        if target_date is None:
+            self._capital_flow_signals = signals
         return signals
 
     def _capital_flow_score(self, qlib_code: str) -> float:
