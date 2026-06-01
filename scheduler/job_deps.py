@@ -30,7 +30,9 @@ JOB_DEPS: dict[str, list[str]] = {
     "sentiment_daily": [],
     "guba_popularity": [],
     "llm_event_pipeline": [],
-    "llm_event_retry": ["llm_event_pipeline"],
+    # llm_event_retry removed 2026-05-31: 17:30 full-rerun was data-destructive
+    # (deleted partial jsonl, re-extracted under same throttling). See commit
+    # 8beeab2. llm_retry_queue_drain at 22:30 is the correct compensation.
     "llm_retry_queue_drain": ["llm_event_pipeline"],
     # ---- Post-data-update processing -------------------------------------
     "fund_flow_update": ["qlib_data_update"],

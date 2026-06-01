@@ -1,18 +1,31 @@
 """Tradable Universe Filter — stock filtering for training and inference.
 
-Training-time filter (get_tradable_mask):
+Per code-review P2 2026-05-31: docstring previously promised low-liquidity
+filter (amount < 5M) + min_market_cap filter, but the implementation
+never used them — `min_daily_amount` and `min_market_cap` were dead
+parameters. Docstring now reflects what the code ACTUALLY does. The
+liquidity / market-cap filters are deferred to a follow-up that plumbs
+$amount and market cap data through (see feature_merger / spot_cache).
+
+Training-time filter (get_tradable_mask) — actually implemented:
   1. ST / *ST / 退市整理 — from st_stock_list.json
   2. IPO < 60 trading days — cumulative day count
-  3. Suspended (volume=0) — from turn_raw in cache
-  4. 一字板 (zero range) — from KLEN in cache
-  5. Low liquidity (amount < 5M) — from amount_raw in cache
-  6. BSE stocks — instrument prefix "bj"
+  3. BSE stocks — instrument prefix "bj"
+
+Training-time filters NOT YET implemented (despite earlier comments):
+  - Suspended (volume=0): applied separately in candidate_sanitizer at
+    recommendation time, not in tradable_mask at training time
+  - 一字板 (zero range): same as above
+  - Low liquidity (amount < 5M): not implemented anywhere yet
+  - Market cap filter: not implemented anywhere yet
 
 Inference-time filter (filter_predictions):
-  - ST stocks (from cached list) — lightweight, no market data needed
+  - ST stocks (from cached list)
   - BSE stocks
   NOTE: ADV, suspended, limit-up/down are NOT checked at inference time
-  because real-time market data is not available when predictions are generated.
+  because real-time market data is not available when predictions are
+  generated. CandidateSanitizer at run_daily_recommendation time covers
+  the runtime guards.
 
 Usage:
     from models.universe_filter import UniverseFilter
@@ -41,17 +54,17 @@ class UniverseFilter:
     def __init__(
         self,
         min_listing_days: int = 60,
-        min_daily_amount: float = 5e6,   # 500万 daily turnover
-        min_market_cap: float = 5e8,     # 5亿 total market cap
         exclude_st: bool = True,
-        exclude_suspended: bool = True,
         exclude_bse: bool = True,         # 北交所 (codes starting with 8/4 on BSE)
     ):
+        # Per code-review P2 2026-05-31: removed dead parameters
+        # `min_daily_amount`, `min_market_cap`, `exclude_suspended` —
+        # they were accepted but never used in get_tradable_mask. Better
+        # to delete than leave the false promise. If/when liquidity or
+        # market-cap filters are added, re-add the params with actual
+        # implementation in the same PR.
         self.min_listing_days = min_listing_days
-        self.min_daily_amount = min_daily_amount
-        self.min_market_cap = min_market_cap
         self.exclude_st = exclude_st
-        self.exclude_suspended = exclude_suspended
         self.exclude_bse = exclude_bse
 
         # Cache
@@ -87,9 +100,11 @@ class UniverseFilter:
             mask &= listing_mask
             logger.info(f"  IPO filter (<{self.min_listing_days}d): removed {n_ipo} stock-days ({n_ipo/n_total*100:.1f}%)")
 
-        # 3. Exclude low liquidity (using amount_raw from cache if available)
-        # This is applied per-date in the feature cache
-        # We'll use Qlib $amount if available, otherwise skip
+        # NOTE: low-liquidity filter is NOT implemented (was promised in
+        # earlier docstring but never coded). CandidateSanitizer at
+        # recommendation time covers volume==0 (suspended) check via the
+        # spot quote, which is sufficient for production runtime.
+        # Training-time low-liquidity filter is a separate follow-up.
 
         # 4. Exclude BSE stocks (北交所: codes like bj430xxx, bj83xxxx)
         if self.exclude_bse:

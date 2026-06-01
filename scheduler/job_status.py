@@ -146,7 +146,7 @@ _JOB_DISPLAY_NAMES = {
     "risk_check": "风控检查",
     "spot_cache_warmup": "行情缓存",
     "llm_event_pipeline": "LLM事件抽取",
-    "llm_event_retry": "LLM事件重试",
+    "llm_retry_queue_drain": "LLM事件队列补抽",
     "guba_popularity": "股吧人气",
     "qlib_data_update": "Qlib数据更新",
     "fund_flow_update": "资金流向抓取",
