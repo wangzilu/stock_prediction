@@ -28,6 +28,55 @@ DATA_DIR = PROJECT_ROOT / "data" / "storage"
 PAPER_DIR = DATA_DIR / "paper"
 
 
+def _build_cost_inputs(date: str | None,
+                        impact_model: str,
+                        impact_coefficient: float,
+                        lookback_days: int):
+    """Return (cost_model, vol_adv_snapshot) for PaperOMS.
+
+    Per cx round 3 P2 #84 follow-up (Task #87): production paper was
+    using bare slippage_rate even after the sqrt_adv plumbing landed,
+    because run_paper_trading.py never instantiated a CostModel with
+    impact_model="sqrt_adv" and never loaded the per-stock vol/ADV
+    snapshot. This helper does both.
+
+    When impact_model is "fixed" (default), returns (None, None) so
+    PaperOMS sees no cost_model and no snapshot — behaviour identical
+    to pre-fix. When "sqrt_adv", builds + caches today's snapshot
+    from qlib historical data and returns the matching CostModel.
+
+    Any failure in snapshot construction degrades gracefully to
+    (cost_model, None) so a missing qlib path can never break paper
+    trading — the sqrt_adv path then falls back per-fill to bare rate.
+    """
+    if impact_model == "fixed":
+        return None, None
+
+    from backtest.cost_model import CostModel
+    cm = CostModel(impact_model="sqrt_adv",
+                    impact_coefficient=impact_coefficient)
+    try:
+        from paper.cost_inputs import load_or_build_snapshot
+        # init qlib lazily (only when sqrt_adv is requested — keeps
+        # cron startup cheap when running in fixed mode)
+        from config.qlib_runtime import init_qlib
+        from config.settings import QLIB_PROVIDER_URI
+        init_qlib(QLIB_PROVIDER_URI)
+        asof = date or datetime.now().strftime("%Y-%m-%d")
+        snapshot = load_or_build_snapshot(asof, lookback_days=lookback_days)
+        logger.info(
+            "Cost inputs: sqrt_adv (coeff=%.3f), snapshot codes=%d",
+            impact_coefficient, len(snapshot),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "Cost-input snapshot build failed (%s) — sqrt_adv path will "
+            "fall back to bare rate per-fill", e,
+        )
+        snapshot = None
+    return cm, snapshot
+
+
 def main():
     parser = argparse.ArgumentParser()
     group = parser.add_mutually_exclusive_group()
@@ -39,9 +88,38 @@ def main():
     parser.add_argument("--capital", type=float, default=1_000_000)
     parser.add_argument("--force-stale", action="store_true",
                         help="Run even if prediction freshness check fails (default: abort)")
+    # cx round 3 P2 #84 follow-up: sqrt_adv activation knobs
+    parser.add_argument(
+        "--impact-model", choices=["fixed", "sqrt_adv"], default="fixed",
+        help="Cost-model impact branch. 'fixed' (default) preserves pre-fix "
+             "bare slippage_rate behaviour. 'sqrt_adv' activates the "
+             "Almgren-Chriss path; requires qlib historical data for the "
+             "per-stock vol/ADV snapshot."
+    )
+    parser.add_argument(
+        "--impact-coefficient", type=float, default=0.1,
+        help="Coefficient on the sqrt_adv slippage term. Ignored when "
+             "--impact-model=fixed.",
+    )
+    parser.add_argument(
+        "--cost-lookback-days", type=int, default=20,
+        help="Rolling window for vol/ADV snapshot. Default 20 matches "
+             "PortfolioBacktest.cost_vol_window default.",
+    )
     args = parser.parse_args()
 
-    oms = PaperOMS(initial_capital=args.capital, mode="pending")
+    cost_model, vol_adv_snapshot = _build_cost_inputs(
+        date=args.date,
+        impact_model=args.impact_model,
+        impact_coefficient=args.impact_coefficient,
+        lookback_days=args.cost_lookback_days,
+    )
+    oms = PaperOMS(
+        initial_capital=args.capital,
+        mode="pending",
+        cost_model=cost_model,
+        vol_adv_snapshot=vol_adv_snapshot,
+    )
 
     if args.status:
         s = oms.status()
