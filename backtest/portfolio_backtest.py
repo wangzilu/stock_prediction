@@ -184,6 +184,10 @@ class PortfolioBacktest:
         vol_threshold: float = 1.5, # if current vol > threshold * median, reduce trading
         # --- Drawdown stop-loss ---
         drawdown_stop: float = 0.0, # if > 0, force sell all when drawdown exceeds this (e.g. 0.08 = 8%)
+        # --- sqrt_adv cost model wiring (cx code review round 3 P2) ---
+        enable_sqrt_adv_costs: bool = False,
+        portfolio_value: float = 1_000_000.0,  # USD-ish notional; only matters when sqrt_adv enabled
+        cost_vol_window: int = 20,             # rolling window for per-stock vol estimate
         # --- Optimizer V2 ---
         optimizer=None,             # TurnoverConstrainedOptimizer instance
     ):
@@ -203,7 +207,102 @@ class PortfolioBacktest:
         self.vol_window = vol_window
         self.vol_threshold = vol_threshold
         self.drawdown_stop = drawdown_stop
+        # sqrt_adv: when enabled AND cost_model.impact_model="sqrt_adv" AND
+        # adv data passed to run(), cost rate per day is computed from
+        # portfolio-average vol + ADV via CostModel.round_trip_rate(vol, adv, tv).
+        # Default OFF for backward compatibility — promote once a paired
+        # backtest confirms the cost numbers are sensible at your sizing.
+        self.enable_sqrt_adv_costs = enable_sqrt_adv_costs
+        self.portfolio_value = float(portfolio_value)
+        self.cost_vol_window = int(cost_vol_window)
         self.optimizer = optimizer
+
+    def _compute_sqrt_adv_cost_kwargs(
+        self,
+        *,
+        date,
+        target_portfolio,
+        returns: pd.DataFrame,
+        adv: Optional[pd.DataFrame],
+        turnover: float,
+    ) -> dict:
+        """Build the kwargs for CostModel.round_trip_rate.
+
+        When sqrt_adv is disabled OR we lack the data to compute vol+ADV
+        for the current portfolio, return {} so round_trip_rate falls
+        back to the static rate (preserves prior behaviour).
+
+        Otherwise return {daily_volatility, adv, trade_value} computed
+        as a portfolio-level cross-sectional average:
+
+          - avg_adv  = cross-sectional mean of ADV across held stocks
+          - avg_vol  = cross-sectional mean of cost_vol_window-day stdev
+                       of per-stock daily returns up to `date`
+          - tv       = portfolio_value * turnover / max(1, n_stocks)
+
+        Cost.round_trip_rate then computes
+          slip = avg_vol * sqrt(tv / avg_adv) * impact_coefficient
+        which scales superlinearly with trade size (the desired
+        Almgren-Chriss-style impact, not the static spread proxy).
+        """
+        if not self.enable_sqrt_adv_costs:
+            return {}
+        if adv is None or self.cost.impact_model != "sqrt_adv":
+            return {}
+        port = list(target_portfolio)
+        if not port:
+            return {}
+
+        # avg ADV across portfolio on `date`
+        try:
+            day_adv = adv.loc[date]
+            if isinstance(day_adv, pd.DataFrame):
+                day_adv = day_adv.iloc[:, 0]
+            day_adv = day_adv.reindex(port).dropna()
+            if day_adv.empty:
+                return {}
+            avg_adv = float(day_adv.mean())
+            if not (avg_adv > 0):
+                return {}
+        except Exception:
+            return {}
+
+        # avg per-stock vol over cost_vol_window days up to and including
+        # `date`. returns is a (datetime, instrument) frame.
+        try:
+            ret_dates = returns.index.get_level_values(0)
+            lookback_mask = (
+                (ret_dates <= date) &
+                (returns.index.get_level_values(1).isin(port))
+            )
+            recent = returns.loc[lookback_mask]
+            if isinstance(recent, pd.DataFrame):
+                recent = recent.iloc[:, 0]
+            # Pivot to (date, stock) so we can take per-stock std.
+            wide = recent.unstack(level=1)
+            if wide.empty:
+                return {}
+            # Trail to most recent N rows per the configured window
+            wide = wide.iloc[-self.cost_vol_window:]
+            per_stock_vol = wide.std(axis=0).dropna()
+            per_stock_vol = per_stock_vol[per_stock_vol > 0]
+            if per_stock_vol.empty:
+                return {}
+            avg_vol = float(per_stock_vol.mean())
+            if not (avg_vol > 0):
+                return {}
+        except Exception:
+            return {}
+
+        # per-stock trade dollar value approximation
+        n = max(1, len(port))
+        trade_value = self.portfolio_value * turnover / n
+
+        return {
+            "daily_volatility": avg_vol,
+            "adv": avg_adv,
+            "trade_value": trade_value,
+        }
 
     def run(
         self,
@@ -478,8 +577,20 @@ class PortfolioBacktest:
             else:
                 raw_ret = 0.0
 
-            # Cost: proportional to turnover
-            cost_rate = self.cost.round_trip_rate() * turnover
+            # Cost: proportional to turnover.
+            # When sqrt_adv is enabled AND we have ADV data AND we can
+            # estimate per-stock daily volatility from the returns history,
+            # compute the cost rate using the sqrt-of-fraction-of-ADV
+            # impact model. Otherwise fall back to the static round-trip
+            # rate (backward compatible).
+            cost_kwargs = self._compute_sqrt_adv_cost_kwargs(
+                date=date,
+                target_portfolio=target_portfolio,
+                returns=returns,
+                adv=adv,
+                turnover=turnover,
+            )
+            cost_rate = self.cost.round_trip_rate(**cost_kwargs) * turnover
             net_ret = raw_ret - cost_rate
 
             daily_pnl_raw.append(raw_ret)

@@ -82,6 +82,7 @@ class PaperOMS:
                  commission_rate: float = 0.0003,
                  stamp_tax_rate: float = 0.0005,
                  slippage_rate: float = 0.001,
+                 cost_model=None,
                  execution_mode: str = "buffered_partial",
                  max_turnover: float = 0.10,
                  max_single_weight: float = 0.05,
@@ -98,6 +99,13 @@ class PaperOMS:
         self.commission_rate = commission_rate
         self.stamp_tax_rate = stamp_tax_rate
         self.slippage_rate = slippage_rate
+        # cx code review round 3 P2: sqrt_adv exists in backtest/cost_model.py
+        # but paper OMS computed slippage as `amount * slippage_rate` inline.
+        # Accept an optional CostModel; when supplied with impact_model
+        # "sqrt_adv" plus per-fill (daily_volatility, adv), slippage scales
+        # with sqrt(trade_value / ADV). Default behaviour (cost_model=None)
+        # preserves the bare-rate path.
+        self.cost_model = cost_model
         self.execution_mode = execution_mode
         self.max_turnover = max_turnover
         self.max_single_weight = max_single_weight
@@ -139,6 +147,33 @@ class PaperOMS:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.state, indent=2, ensure_ascii=False))
         os.replace(tmp, path)
+
+    def _compute_slippage(self, amount, daily_volatility=None, adv=None):
+        """Compute slippage cost for a fill.
+
+        When self.cost_model is provided (with impact_model="sqrt_adv")
+        AND we have daily_volatility + ADV for the stock, delegate to
+        CostModel._slippage which uses
+            slip_rate = sigma * sqrt(trade_value / ADV) * coefficient
+
+        Otherwise fall back to the bare-rate path
+        (amount * self.slippage_rate) — identical to pre-fix behaviour.
+
+        Argument convention: daily_volatility is the stock's daily return
+        std (e.g. 0.02 for a 2% sigma); adv is the stock's average daily
+        traded value (yuan). Both default to None so existing callers
+        that don't yet pipe vol/ADV continue to work.
+        """
+        if self.cost_model is not None:
+            try:
+                return self.cost_model._slippage(
+                    amount, daily_volatility=daily_volatility, adv=adv,
+                )
+            except Exception:
+                # Defensive: any cost-model failure falls back to bare rate
+                # so a misconfigured CostModel can never break paper fills.
+                pass
+        return amount * self.slippage_rate
 
     def load_predictions(self) -> dict:
         """Load latest model predictions."""
@@ -364,7 +399,7 @@ class PaperOMS:
             amount = pos["shares"] * sell_price
             commission = max(amount * self.commission_rate, 5.0)
             stamp_tax = amount * self.stamp_tax_rate
-            slippage = amount * self.slippage_rate
+            slippage = self._compute_slippage(amount)
             net = amount - commission - stamp_tax - slippage
 
             cash += net
@@ -404,7 +439,7 @@ class PaperOMS:
 
                 amount = shares * buy_price
                 commission = max(amount * self.commission_rate, 5.0)
-                slippage = amount * self.slippage_rate
+                slippage = self._compute_slippage(amount)
                 total_cost = amount + commission + slippage
 
                 if total_cost > cash:
@@ -805,7 +840,7 @@ class PaperOMS:
             amount = pos["shares"] * sell_price
             commission = max(amount * self.commission_rate, 5.0)
             stamp_tax = amount * self.stamp_tax_rate
-            slippage = amount * self.slippage_rate
+            slippage = self._compute_slippage(amount)
             net = amount - commission - stamp_tax - slippage
 
             cash += net
@@ -850,7 +885,7 @@ class PaperOMS:
 
                 amount = shares * buy_price
                 commission = max(amount * self.commission_rate, 5.0)
-                slippage_cost = amount * self.slippage_rate
+                slippage_cost = self._compute_slippage(amount)
                 total_cost = amount + commission + slippage_cost
 
                 if total_cost > cash:
