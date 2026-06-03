@@ -2,7 +2,7 @@
 """Unified network wrapper for cron jobs.
 
 Usage:
-    python run_network_job.py --network domestic|global|none|llm|push [--timeout N] -- command...
+    python run_network_job.py --network domestic|global|crypto|none|llm|push [--timeout N] -- command...
 """
 import argparse
 import os
@@ -110,6 +110,24 @@ def apply_profile(profile: str, env: dict, timeout: int | None) -> int | None:
         _set_proxy(env)
         _log(f"Profile: global — proxy set to {PROXY_URL}")
 
+    elif profile == "crypto":
+        # Per plans/crypto-data-contract.md §1.5 + config/crypto_network.py:
+        # crypto data fetches MUST traverse ssproxy. The collector
+        # entrypoints call assert_proxy_active() which checks the env
+        # sentinels we set below. If ssproxy preflight fails, exit
+        # network_unreachable; A-share cron is unaffected because each
+        # job is invoked under its own wrapper instance.
+        if not _ensure_proxy():
+            _log("Profile: crypto — ssproxy preflight failed; aborting")
+            sys.exit(2)
+        _set_proxy(env)
+        env["CRYPTO_NETWORK_ACTIVE"] = "crypto"
+        env["CRYPTO_SSPROXY_VERIFIED"] = "1"
+        _log(
+            f"Profile: crypto — proxy set to {PROXY_URL}; sentinels "
+            "CRYPTO_NETWORK_ACTIVE=crypto + CRYPTO_SSPROXY_VERIFIED=1"
+        )
+
     elif profile == "none":
         _unset_proxy(env)
         _log("Profile: none — proxy env vars cleared")
@@ -142,7 +160,7 @@ def main() -> None:
     parser.add_argument(
         "--network",
         required=True,
-        choices=["domestic", "global", "none", "llm", "push"],
+        choices=["domestic", "global", "crypto", "none", "llm", "push"],
         help="Network profile to apply",
     )
     parser.add_argument(

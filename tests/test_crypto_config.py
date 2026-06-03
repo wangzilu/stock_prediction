@@ -191,25 +191,78 @@ def test_universe_matches_contract_section_10():
     assert cu.QUOTE_CURRENCY == "USDT"
 
 
-def test_spot_symbols_default_to_usdt():
+def test_spot_symbols_binance_native_format():
+    """Binance-native variant returns BASEUSDT (no slash)."""
     from config import crypto_universe as cu
+    assert cu.spot_symbols_binance_native() == [
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+    ]
 
-    assert cu.spot_symbols() == ["BTCUSDT", "ETHUSDT", "SOLUSDT",
-                                   "BNBUSDT", "XRPUSDT"]
 
-
-def test_perp_symbols_default_to_usdt():
+def test_perp_symbols_binance_native_format():
     from config import crypto_universe as cu
+    assert cu.perp_symbols_binance_native() == [
+        "BTCUSDT", "ETHUSDT", "SOLUSDT",
+    ]
 
-    assert cu.perp_symbols() == ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
-
-def test_spot_symbols_with_custom_quote():
+def test_spot_symbols_binance_native_with_custom_quote():
     from config import crypto_universe as cu
-
-    assert cu.spot_symbols("USDC") == [
+    assert cu.spot_symbols_binance_native("USDC") == [
         "BTCUSDC", "ETHUSDC", "SOLUSDC", "BNBUSDC", "XRPUSDC",
     ]
+
+
+# -----------------------------------------------------------------------------
+# CCXT variant (cx code review round 4 P2: collector layer takes CCXT
+# form 'BTC/USDT' / 'BTC/USDT:USDT', not Binance-native 'BTCUSDT').
+# Distinct helpers so a naive
+#     for s in spot_symbols(): fetch_recent(s, ...)
+# CANNOT silently mismatch the collector's expected input.
+# -----------------------------------------------------------------------------
+
+def test_spot_symbols_ccxt_format():
+    """CCXT spot variant: 'BTC/USDT'-style — what
+    crypto_market.fetch_recent expects."""
+    from config import crypto_universe as cu
+    assert cu.spot_symbols_ccxt() == [
+        "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
+    ]
+
+
+def test_perp_symbols_ccxt_format():
+    """CCXT perp variant: 'BTC/USDT:USDT'-style — what
+    crypto_derivatives.fetch_funding_recent expects."""
+    from config import crypto_universe as cu
+    assert cu.perp_symbols_ccxt() == [
+        "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
+    ]
+
+
+def test_perp_symbols_ccxt_with_custom_settle():
+    """Inverse perps use a different settle currency."""
+    from config import crypto_universe as cu
+    assert cu.perp_symbols_ccxt(quote="USD", settle="BTC") == [
+        "BTC/USD:BTC", "ETH/USD:BTC", "SOL/USD:BTC",
+    ]
+
+
+def test_ccxt_helpers_are_accepted_by_collector_parsers():
+    """End-to-end contract: each output of *_symbols_ccxt() is parseable
+    by the collector's symbol parser. Without this test the universe
+    helpers could drift from collector expectations again."""
+    from config import crypto_universe as cu
+    from data.collectors.crypto_market import to_canonical_symbol
+    from data.collectors.crypto_derivatives import parse_perp_symbol
+
+    for s in cu.spot_symbols_ccxt():
+        # Must not raise — proves the symbol is in CCXT spot form
+        result = to_canonical_symbol(s, "binance")
+        assert "__" in result
+
+    for s in cu.perp_symbols_ccxt():
+        base, quote, settle = parse_perp_symbol(s)
+        assert base and quote and settle
 
 
 def test_backfill_depth_includes_all_timeframes():
