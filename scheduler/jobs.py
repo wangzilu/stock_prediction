@@ -8,7 +8,9 @@ from dataclasses import is_dataclass, replace
 from datetime import datetime, timedelta
 
 from data.collectors.market import MarketCollector
-from data.collectors.crypto import CryptoCollector
+# data.collectors.crypto is lazy-imported via DailyPipeline._get_crypto_collector
+# when LEGACY_MARKET_CONTEXT_ENABLED is true. Default-off per quarantine
+# (plans/cc-crypto-implementation-spec-2026-05-30.md §6.5).
 from data.collectors.gold import GoldCollector
 from data.collectors.sentiment import SentimentCollector
 from data.collectors.macro import MacroCollector
@@ -68,7 +70,8 @@ class DailyPipeline:
 
     def __init__(self):
         self.market_collector = MarketCollector()
-        self.crypto_collector = CryptoCollector()
+        # Lazy via _get_crypto_collector(); see quarantine §6.5.
+        self._crypto_collector = None
         self.gold_collector = GoldCollector()
         self.sentiment_collector = SentimentCollector()
         self.macro_collector = MacroCollector()
@@ -94,12 +97,48 @@ class DailyPipeline:
         self._mid_model = None
         self._mid_model_checked = False
 
+    def _get_crypto_collector(self):
+        """Lazy accessor for the legacy CryptoCollector.
+
+        Returns None when LEGACY_MARKET_CONTEXT_ENABLED is False (default).
+        Module-level import of data.collectors.crypto has been removed
+        (see §6.5 quarantine); when the flag is off, the module is never
+        loaded and no ccxt/network risk affects A-share startup.
+        """
+        from config.feature_flags import LEGACY_MARKET_CONTEXT_ENABLED
+        if not LEGACY_MARKET_CONTEXT_ENABLED:
+            return None
+        if self._crypto_collector is None:
+            from data.collectors.crypto import CryptoCollector
+            self._crypto_collector = CryptoCollector()
+        return self._crypto_collector
+
+    def _fetch_crypto_market_data(self):
+        """Fetch BTC/ETH realtime market data dict.
+
+        Returns empty dict when legacy crypto is quarantined off. Used
+        by morning/evening report paths that previously inlined the
+        fetch loop.
+        """
+        collector = self._get_crypto_collector()
+        if collector is None:
+            return {}
+        data = {}
+        for symbol in ("BTC/USDT", "ETH/USDT"):
+            q = collector.fetch_realtime(symbol)
+            if q:
+                data[symbol] = q
+        return data
+
     def _get_quote(self, code, market):
         """Get realtime quote based on market type."""
         if market == MARKET_STOCK:
             return self.market_collector.fetch_realtime(to_akshare_code(code))
         elif market == MARKET_CRYPTO:
-            return self.crypto_collector.fetch_realtime(code)
+            collector = self._get_crypto_collector()
+            if collector is None:
+                return {}
+            return collector.fetch_realtime(code)
         elif market == MARKET_GOLD:
             return self.gold_collector.fetch_realtime()
         return {}
@@ -109,7 +148,11 @@ class DailyPipeline:
         if market == MARKET_STOCK:
             return self.market_collector.fetch_daily(to_akshare_code(code), days)
         elif market == MARKET_CRYPTO:
-            return self.crypto_collector.fetch_daily(code, days)
+            collector = self._get_crypto_collector()
+            if collector is None:
+                import pandas as pd
+                return pd.DataFrame()
+            return collector.fetch_daily(code, days)
         elif market == MARKET_GOLD:
             return self.gold_collector.fetch_daily(days)
         import pandas as pd
@@ -202,13 +245,30 @@ class DailyPipeline:
             return _use_cache(str(e))
         return self._lgb_predictions
 
-    def _load_capital_flow_signals(self) -> dict:
-        """Load latest capital flow signals from parquet files.
+    def _load_capital_flow_signals(self, target_date: str | None = None) -> dict:
+        """Load capital flow signals from parquet files.
 
-        Returns dict: {qlib_code: {"net_mf": float, "net_mf_pct": float,
-                                    "net_mf_5d": float, "nb_present": bool}}
+        Args:
+            target_date: optional YYYY-MM-DD as-of date. When None (default,
+                live cron path), returns latest 5 trading days as before —
+                no behavior change. When passed (backfill / snapshot replay /
+                test paths), filters parquet rows to those with
+                trade_date <= target_date, then takes the latest 5 within
+                that window. Per code-review P2 2026-05-31 (cx finding):
+                without this guard, backfill paths that called this method
+                would leak future capital flow into historical
+                morning-recommendation reconstructions.
+
+        Returns dict: {qlib_code: {"net_mf": float, "net_mf_5d": float,
+                                    "nb_present": bool, ...}}
+
+        Cache note: when target_date is None (live), result is cached on
+        self._capital_flow_signals. When target_date is provided (backfill),
+        cache is BYPASSED — different target_dates must return different
+        results, so caching them under one slot would corrupt either live
+        or backfill output.
         """
-        if self._capital_flow_signals is not None:
+        if target_date is None and self._capital_flow_signals is not None:
             return self._capital_flow_signals
 
         signals = {}
@@ -222,7 +282,11 @@ class DailyPipeline:
                 ])
                 df = df.dropna(subset=["net_mf_amount"])
                 df["trade_date"] = df["trade_date"].astype(str)
-                # Latest 5 trading days per stock
+                # PIT-safe slicing per target_date (cx P2 2026-05-31)
+                if target_date is not None:
+                    df = df[df["trade_date"] <= target_date]
+                # Latest 5 trading days per stock within the (optionally
+                # constrained) window
                 latest_dates = sorted(df["trade_date"].unique())[-5:]
                 recent = df[df["trade_date"].isin(latest_dates)]
 
@@ -250,6 +314,9 @@ class DailyPipeline:
                 nb = pd.read_parquet(nb_path)
                 nb = nb.dropna(subset=["trade_date"])
                 nb["trade_date"] = nb["trade_date"].astype(str)
+                # Same PIT-safe slicing applied to northbound (cx P2 2026-05-31)
+                if target_date is not None:
+                    nb = nb[nb["trade_date"] <= target_date]
                 latest_nb_dates = sorted(nb["trade_date"].unique())[-5:]
                 recent_nb = nb[nb["trade_date"].isin(latest_nb_dates)]
 
@@ -292,7 +359,11 @@ class DailyPipeline:
             except Exception as e:
                 logger.warning(f"Failed to load northbound signals: {e}")
 
-        self._capital_flow_signals = signals
+        # Only cache the LIVE-path result (target_date=None). Backfill
+        # paths produce different signals per target_date and must not
+        # share the cache slot.
+        if target_date is None:
+            self._capital_flow_signals = signals
         return signals
 
     def _capital_flow_score(self, qlib_code: str) -> float:
@@ -1392,8 +1463,29 @@ class DailyPipeline:
         )
 
     def _format_crypto_forecast(self, crypto_data, geo_factors: dict) -> str:
-        """Format concise BTC/ETH forecast for evening report."""
+        """Format concise BTC/ETH forecast for evening report.
+
+        Per quarantine §6.5 L6 and code-review I1: distinguish two
+        distinct empty paths:
+          (a) flag off  → "crypto context disabled" stub (quarantine intent)
+          (b) flag on but no data fetched → "暂无实时数据" fallback
+              (network failure / collector returned nothing)
+        Conflating them previously caused flag-on+network-fail runs to
+        emit the quarantine-off text, which is misleading.
+        """
+        from config.feature_flags import LEGACY_MARKET_CONTEXT_ENABLED
         crypto_data = crypto_data or {}
+        if not LEGACY_MARKET_CONTEXT_ENABLED:
+            return (
+                "七、加密货币预测\n"
+                "BTC/ETH：crypto context disabled（legacy quarantine off, "
+                "见 §6.5）。"
+            )
+        if not crypto_data:
+            return (
+                "七、加密货币预测\n"
+                "BTC/ETH：暂无实时数据，先按震荡处理。"
+            )
         policy = _finite_float(geo_factors.get("policy_signal"))
         geo_risk = _finite_float(geo_factors.get("geo_risk_index"))
         safe_haven = _finite_float(geo_factors.get("safe_haven_signal"))
@@ -1412,8 +1504,6 @@ class DailyPipeline:
                 f"{name}：{self._pct_direction(expected)}，{price_text}最近交易日{change:+.2f}%，"
                 f"明日参考{expected:+.2f}%附近"
             )
-        if len(lines) == 1:
-            lines.append("BTC/ETH：暂无实时数据，先按震荡处理。")
         return "\n".join(lines)
 
     def _fallback_world_outlook(self, geo_factors: dict, headlines: list) -> str:
@@ -1808,19 +1898,23 @@ class DailyPipeline:
         else:
             candidates.extend(self._build_stock_candidates(lgb_preds, stock_macro))
 
-        # Add crypto + gold
-        for symbol in ["BTC/USDT", "ETH/USDT"]:
-            q = self.crypto_collector.fetch_realtime(symbol)
-            if q:
-                name = "比特币" if "BTC" in symbol else "以太坊"
-                candidates.append({
-                    "code": symbol, "name": name, "market": MARKET_CRYPTO,
-                    "short_score": _finite_float(q.get("change_pct")) / 10,
-                    "has_lgb": False,
-                    "change_pct": _finite_float(q.get("change_pct")),
-                    "macro_score": _finite_float(geo.get("geo_risk_index")),
-                    "price": _finite_float(q.get("price")),
-                })
+        # Add crypto + gold. Crypto path is quarantine-gated; when
+        # LEGACY_MARKET_CONTEXT_ENABLED is false (default), _get_crypto_collector()
+        # returns None and BTC/ETH never enter the candidate pool.
+        crypto_collector = self._get_crypto_collector()
+        if crypto_collector is not None:
+            for symbol in ["BTC/USDT", "ETH/USDT"]:
+                q = crypto_collector.fetch_realtime(symbol)
+                if q:
+                    name = "比特币" if "BTC" in symbol else "以太坊"
+                    candidates.append({
+                        "code": symbol, "name": name, "market": MARKET_CRYPTO,
+                        "short_score": _finite_float(q.get("change_pct")) / 10,
+                        "has_lgb": False,
+                        "change_pct": _finite_float(q.get("change_pct")),
+                        "macro_score": _finite_float(geo.get("geo_risk_index")),
+                        "price": _finite_float(q.get("price")),
+                    })
         gold_q = self.gold_collector.fetch_realtime()
         if gold_q:
             candidates.append({
@@ -1929,12 +2023,11 @@ class DailyPipeline:
             logger.warning(f"Horizon classification produced 0 recs from {len(recommendations)} candidates — using top 5 by score")
             top_recs = sorted(recommendations, key=lambda r: r.final_score, reverse=True)[:5]
 
-        # Fetch global market data for report
-        crypto_data = {}
-        for symbol in ["BTC/USDT", "ETH/USDT"]:
-            q = self.crypto_collector.fetch_realtime(symbol)
-            if q:
-                crypto_data[symbol] = q
+        # Fetch global market data for report. Crypto path quarantined
+        # behind LEGACY_MARKET_CONTEXT_ENABLED — when off (default), the
+        # helper returns {} and crypto sections of the report degrade
+        # gracefully.
+        crypto_data = self._fetch_crypto_market_data()
         gold_data = self.gold_collector.fetch_realtime()
         global_index_data, global_indices = self._fetch_global_indices()
         morning_market_block, morning_market_records = self._build_morning_final_index_forecast(
@@ -2146,11 +2239,7 @@ class DailyPipeline:
         lgb_preds = self._load_lgb_predictions()
         buy_items = self._build_intraday_buy_candidates(lgb_preds, limit=10)
 
-        crypto_data = {}
-        for symbol in ["BTC/USDT", "ETH/USDT"]:
-            q = self.crypto_collector.fetch_realtime(symbol)
-            if q:
-                crypto_data[symbol] = q
+        crypto_data = self._fetch_crypto_market_data()
         gold_data = self.gold_collector.fetch_realtime()
         global_index_data, _ = self._fetch_global_indices()
         _, index_forecast_text = self._build_intraday_index_forecast(
@@ -2194,11 +2283,7 @@ class DailyPipeline:
         geo = self._fetch_geo_factors()
 
         # Collect market data
-        crypto_data = {}
-        for symbol in ["BTC/USDT", "ETH/USDT"]:
-            q = self.crypto_collector.fetch_realtime(symbol)
-            if q:
-                crypto_data[symbol] = q
+        crypto_data = self._fetch_crypto_market_data()
         gold_data = self.gold_collector.fetch_realtime()
         global_index_data, global_indices = self._fetch_global_indices()
         morning_prediction_report = self._verify_morning_final_predictions(global_index_data)
@@ -2253,11 +2338,7 @@ class DailyPipeline:
         stock_forecast_groups = self._build_evening_stock_forecasts(lgb_preds, limit=10)
         stock_forecast_block = self._format_evening_stock_forecasts(stock_forecast_groups)
 
-        crypto_data = {}
-        for symbol in ["BTC/USDT", "ETH/USDT"]:
-            q = self.crypto_collector.fetch_realtime(symbol)
-            if q:
-                crypto_data[symbol] = q
+        crypto_data = self._fetch_crypto_market_data()
         gold_data = self.gold_collector.fetch_realtime()
         global_index_data, global_indices = self._fetch_global_indices()
 

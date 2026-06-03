@@ -58,6 +58,16 @@ def _make_pipeline():
     must be updated in lockstep — otherwise tests silently break with
     AttributeError deep in production code paths (caught by helpers like
     `except Exception: continue`, which makes diagnosis hard).
+
+    Crypto-quarantine specifics (§6.5): production now accesses the legacy
+    crypto collector via `self._get_crypto_collector()` (lazy, flag-gated)
+    and `self._crypto_collector` (cache slot), not `self.crypto_collector`.
+    To keep legacy test setups like `pipeline.crypto_collector.X` meaningful
+    (so the mock intersects the production read path), this helper wires
+    all three references to the same MagicMock instance. The instance-level
+    `_get_crypto_collector` override bypasses the
+    LEGACY_MARKET_CONTEXT_ENABLED flag so tests exercise the legacy code
+    branches uniformly.
     """
     pipeline = DailyPipeline.__new__(DailyPipeline)
     # Live collectors → MagicMock
@@ -65,7 +75,10 @@ def _make_pipeline():
     pipeline.market_collector._spot_cache = None
     pipeline.market_collector._spot_loaded = False
     pipeline.market_collector._akshare_down = False
-    pipeline.crypto_collector = MagicMock()
+    crypto_mock = MagicMock()
+    pipeline._crypto_collector = crypto_mock
+    pipeline._get_crypto_collector = lambda: crypto_mock
+    pipeline.crypto_collector = crypto_mock  # alias for legacy test setup
     pipeline.gold_collector = MagicMock()
     pipeline.sentiment_collector = MagicMock()
     pipeline.macro_collector = MagicMock()

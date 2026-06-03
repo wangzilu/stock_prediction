@@ -1,6 +1,30 @@
-import pandas as pd
+"""Legacy CryptoCollector integration tests.
+
+Per code review P1 (2026-05-30) + quarantine §6.5: these tests load
+`data.collectors.crypto` at module import and may issue real Binance /
+AKShare network calls. They are inconsistent with the runtime
+quarantine that keeps A-share daily cron clean of legacy crypto.
+
+Default: SKIP. Opt in with `RUN_LEGACY_CRYPTO_TESTS=1` when explicitly
+exercising the legacy collector (e.g. before retiring it).
+"""
+
+from __future__ import annotations
+
+import os
+
 import pytest
-from data.collectors.crypto import CryptoCollector
+
+if os.environ.get("RUN_LEGACY_CRYPTO_TESTS", "").lower() not in ("1", "true", "yes"):
+    pytest.skip(
+        "Legacy crypto collector tests skipped by default (quarantine §6.5). "
+        "Set RUN_LEGACY_CRYPTO_TESTS=1 to enable — these tests import "
+        "data.collectors.crypto and may hit Binance / AKShare network.",
+        allow_module_level=True,
+    )
+
+import pandas as pd  # noqa: E402
+from data.collectors.crypto import CryptoCollector  # noqa: E402
 
 
 def test_fetch_daily_returns_dataframe():

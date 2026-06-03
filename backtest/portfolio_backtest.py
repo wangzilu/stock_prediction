@@ -559,6 +559,16 @@ class PortfolioBacktest:
             tracking_error = float(daily_ex.std() * np.sqrt(250))
             info_ratio = annual_excess / (tracking_error + 1e-8)
 
+        # Index by return realisation dates (T+1), not signal dates (T).
+        # Per code-review P0 2026-05-31: this block was previously inlined
+        # inside PortfolioResult(...) args list with assignment + if statement,
+        # which is Python syntax error. Moved out so the ctor only sees a
+        # finished pnl_index value.
+        pnl_index = [d for d in return_dates_list if d is not None][:n_days]
+        if len(pnl_index) < n_days:
+            # Fallback: if return_dates incomplete, use signal dates
+            pnl_index = dates[:n_days]
+
         result = PortfolioResult(
             total_return=total_ret,
             annual_return=annual_ret,
@@ -582,11 +592,6 @@ class PortfolioBacktest:
             ipo_filtered_count=total_ipo_filtered,
             signal_dates=signal_dates_list,
             return_dates=return_dates_list,
-            # Index by return realisation dates (T+1), not signal dates (T)
-            pnl_index = [d for d in return_dates_list if d is not None][:n_days]
-            if len(pnl_index) < n_days:
-                # Fallback: if return_dates incomplete, use signal dates
-                pnl_index = dates[:n_days]
             daily_pnl=pd.Series(pnl_net, index=pnl_index),
             daily_turnover=pd.Series(turnovers, index=pnl_index),
             daily_cost=pd.Series(costs, index=pnl_index),

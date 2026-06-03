@@ -66,7 +66,20 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                 network="domestic", timeout_sec=600),
         CronJob("risk_check", "35 9-15 * * 1-5", [py, main_py, "--risk-check"], "cron_risk_check.log",
                 network="domestic", timeout_sec=900),
-        CronJob("evening_outlook", "0 22 * * 1-5", [py, main_py, "--evening-outlook"], "cron_evening_outlook.log",
+        # evening_outlook generates the NEXT trading day's strategy /
+        # outlook from current evening's data. Therefore it must fire on
+        # the evening BEFORE each trading day, not on trading-day evenings:
+        #   Sun 22:00 → Mon market  ← was missing under old "1-5" cron
+        #   Mon 22:00 → Tue market
+        #   Tue 22:00 → Wed market
+        #   Wed 22:00 → Thu market
+        #   Thu 22:00 → Fri market
+        #   Fri / Sat → none needed (Sat+Sun closed)
+        # Old schedule "0 22 * * 1-5" (Mon-Fri) missed Sun→Mon, causing
+        # Monday's 9:20 morning_recommendation to read a Friday-22:00
+        # outlook stale by 60+ hours (user-reported bug 2026-05-31).
+        # Fix: 0-4 in cron = Sun-Thu.
+        CronJob("evening_outlook", "0 22 * * 0-4", [py, main_py, "--evening-outlook"], "cron_evening_outlook.log",
                 network="domestic", timeout_sec=900),
         # --- Post-close: LLM / event collection ---
     ]

@@ -147,22 +147,31 @@ def apply_overlay(xgb_predictions: dict, event_alphas: dict,
     return result
 
 
-def backtest_overlay():
-    """Backtest overlay on historical data.
+def exploratory_replay_overlay():
+    """Exploratory replay of overlay on historical event dates.
 
-    WARNING: This is NOT a valid PIT backtest. It uses a single set of latest
-    model predictions (lgb_latest_predictions.json) across all historical event
-    dates. The XGB scores contain future training information relative to earlier
-    dates. Results should be interpreted as "current model × historical events"
-    exploratory analysis, NOT as realistic historical overlay performance.
+    THIS IS NOT A BACKTEST. The output of this function is NOT valid
+    promotion evidence. Per code-review P1 2026-05-31 (cx finding): the
+    previous name `backtest_overlay` + CLI flag `--backtest` led readers
+    to assume PIT-safe backtest output, but it isn't.
 
-    For a valid historical backtest, each date must use as-of predictions from
-    the rolling training pipeline (per-date prediction artifacts via
-    tracker/artifact_contract.py). This requires running the full rolling
-    train → predict → overlay pipeline.
+    What it actually does: uses a single snapshot of the current XGB
+    predictions (lgb_latest_predictions.json) across ALL historical event
+    dates. The XGB scores were trained on data through "today", so for
+    any earlier event date the scores contain future-training info
+    relative to that date. Useful as "current model × historical events"
+    sanity exploration only.
 
-    TODO: Once artifact_contract stores per-split pred.pkl, refactor this to
-    load date-appropriate predictions for each backtest day.
+    For valid historical evidence each date must use as-of predictions
+    from the rolling training pipeline (per-date prediction artifacts via
+    tracker/artifact_contract.py). The full rolling train → predict →
+    overlay pipeline does that work.
+
+    Promotion gate (`tracker/promotion_gate.py`) MUST NOT accept the
+    output of this function as evidence — it's exploratory only.
+
+    TODO: Once artifact_contract stores per-split pred.pkl, refactor this
+    to load date-appropriate predictions for each replay day.
     """
     from config.qlib_runtime import init_qlib
     from qlib.data import D
@@ -172,8 +181,14 @@ def backtest_overlay():
 
     events_dir = DATA_DIR / "llm_events"
     dates = sorted(f.stem for f in events_dir.glob("*.jsonl"))
-    logger.info(f"Backtesting overlay on {len(dates)} dates")
-    logger.warning("  NOTE: Using single latest predictions for ALL dates (not PIT-safe)")
+    logger.warning(
+        "============================================================\n"
+        "  EXPLORATORY REPLAY — NOT A PIT BACKTEST                    \n"
+        "  Using SINGLE latest XGB predictions across ALL %d dates    \n"
+        "  Output is NOT valid promotion evidence (cx review P1)      \n"
+        "============================================================",
+        len(dates),
+    )
 
     # Load XGB predictions — SAME model for all dates (exploratory only)
     xgb_preds = json.loads(open(DATA_DIR / "lgb_latest_predictions.json").read())["predictions"]
@@ -224,11 +239,35 @@ def main():
     parser = argparse.ArgumentParser(description="Event overlay")
     parser.add_argument("--date", default=None)
     parser.add_argument("--alpha", type=float, default=1.0)
-    parser.add_argument("--backtest", action="store_true")
+    parser.add_argument(
+        "--exploratory-replay", action="store_true",
+        help=(
+            "Run exploratory replay (NOT a valid PIT backtest). Uses "
+            "single latest XGB predictions across all historical event "
+            "dates. Output is NOT valid promotion evidence."
+        ),
+    )
+    # Backwards-compat: --backtest is the historical flag name. Per
+    # code-review P1 2026-05-31 the name was misleading. Accept it but
+    # warn loudly and route to the same exploratory_replay_overlay.
+    parser.add_argument(
+        "--backtest", action="store_true",
+        help=(
+            "DEPRECATED: use --exploratory-replay instead. The old name "
+            "misleadingly suggested PIT-safe backtest output. Output is "
+            "NOT valid promotion evidence."
+        ),
+    )
     args = parser.parse_args()
 
-    if args.backtest:
-        backtest_overlay()
+    if args.backtest and not args.exploratory_replay:
+        logger.warning(
+            "--backtest is deprecated (cx review P1 2026-05-31): the name "
+            "misleadingly suggests PIT-safe backtest, but the function only "
+            "does exploratory replay. Use --exploratory-replay going forward."
+        )
+    if args.backtest or args.exploratory_replay:
+        exploratory_replay_overlay()
         return
 
     date = args.date or datetime.now().strftime("%Y-%m-%d")

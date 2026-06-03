@@ -1,9 +1,28 @@
+"""LEGACY market-context crypto collector.
+
+This module is retained only for the LEGACY_MARKET_CONTEXT_ENABLED
+evening-report BTC/ETH background context. It is NOT used by the new
+crypto quant pipeline.
+
+Per `plans/cc-crypto-implementation-spec-2026-05-30.md` §6.5 + §−0.5
+Layer 1, new crypto code must use `data/collectors/crypto_market.py`
+and `data/collectors/crypto_derivatives.py` (planned in Phase A) and
+must NOT import this module.
+
+`scripts/check_namespace_isolation.py` enforces that no file under
+`crypto/`, `data/collectors/crypto_market.py`, or
+`data/collectors/crypto_derivatives.py` imports from here.
+"""
+
 import pandas as pd
 from datetime import datetime, timedelta
 
 
 class CryptoCollector:
-    """Collects cryptocurrency market data via CCXT (Binance)."""
+    """LEGACY collector for BTC/ETH evening-report context.
+
+    Not used by the new crypto quant pipeline. See module docstring.
+    """
 
     def __init__(self):
         try:
