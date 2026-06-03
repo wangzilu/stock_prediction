@@ -10,6 +10,7 @@ crypto work, read THIS file — not the 8 underlying plans.
 | `crypto-quant-literature-and-engineering-review-2026-05-30.md` | Paper-by-paper evidence trail |
 | `cc-crypto-implementation-spec-2026-05-30.md` | File-level implementation spec |
 | `crypto-data-contract.md` | UTC schema + symbol identity |
+| **`crypto-daemon-architecture-2026-06-03.md`** | **24/7 event-driven daemon spec — supersedes Phase D's cron assumption** |
 | `cc-crypto-quant-integration-plan-2026-05-30.md` + `cx-*review*.md` | Original cc/cx design dialogue (archive) |
 
 Memory anchors: [[crypto-quant-research-20260530]] (core conclusions),
@@ -62,26 +63,39 @@ Pure documentation phase. **No trading code.**
 
 ---
 
-## Phase Crypto-A — Data Foundation (1-2 weeks)
+## Phase Crypto-A — Data Foundation (2-3 weeks, was 1-2)
 
-Pull OHLCV + perp funding + open interest. **No alpha. No models.**
+Two parallel data paths: REST for backfill / health (steps 2-3, **done**),
+WebSocket for live event stream (new steps 4a / 4b). **No alpha. No
+models.**
 
 **Deliverables**
-- `data/collectors/crypto_market.py` (OHLCV via CCXT, paper-friendly
-  endpoints first)
-- `data/collectors/crypto_derivatives.py` (funding + OI via exchange
-  REST, anonymous, no API key)
+- ✅ step 2: `data/collectors/crypto_market.py` (REST OHLCV via CCXT)
+- ✅ step 3: `data/collectors/crypto_derivatives.py` (REST funding + OI)
+- **NEW step 4a**: `crypto/market_stream.py` — WS subscribe + append-only
+  event log per `crypto-daemon-architecture-2026-06-03.md` §1 / §2 / §3
+  (replay-safe log, seq-gap detection + REST resync, ssproxy keepalive).
+- **NEW step 4b**: `crypto/replay.py` — consume WS event log, produce
+  byte-identical book/bar/fill state. Contract test pins determinism.
 - `scripts/crypto_update_market_data.py` (idempotent parquet writes to
   `/Volumes/DATA/crypto/...`)
-- `scripts/crypto_data_health.py` (gap report + freshness gate)
-- Cron entries with `ssproxy` wrapper
+- `scripts/crypto_data_health.py` (gap report + freshness gate, reads
+  BOTH REST parquet and WS event log)
+- **Three** cron entries with `ssproxy` wrapper:
+  watchdog (5m), backfill (hourly), daily report (23:55 UTC).
+  NO trading-loop cron (per daemon architecture decision).
 
 **Acceptance**
-- 1h / 4h / 1d OHLCV for 5 symbols, 60+ days history
+- 1h / 4h / 1d OHLCV for 5 symbols, 60+ days history (REST backfill)
+- **1m / 5m / 15m** live bars aggregated from WS for the same 5 symbols,
+  ≥ 24h continuous, all closed bars match REST backfill within 1 bp.
 - Funding + OI history for BTC / ETH / SOL (Binance + Bybit + OKX +
   **Hyperliquid** — see 6/3 delta below)
 - Idempotent writes (re-run yields same parquet)
-- Health file flags any > 2h gap, any spot/perp price divergence > 0.5%
+- WS event log replay produces identical bar / book state vs live
+  (determinism contract test)
+- Health file flags any > 2h gap (REST), any > 5min gap (WS), any
+  spot/perp price divergence > 0.5%
 - A-share cron jobs continue 5/5 GREEN
 
 **Dependencies**
@@ -89,9 +103,13 @@ Pull OHLCV + perp funding + open interest. **No alpha. No models.**
 
 ---
 
-## Phase Crypto-B — Feature and Baseline Backtest (1-2 weeks)
+## Phase Crypto-B — Feature and Baseline Backtest (2-3 weeks, was 1-2)
 
-First non-trivial code. Establishes IC baseline and cost model.
+First non-trivial code. Establishes IC baseline and cost model. Both
+the **batch feature pipeline** (research / historical backtest) and
+the **online feature pipeline** (daemon hot loop) land here, with a
+contract test that they produce the same vector for the same
+(timestamp, symbol).
 
 **Deliverables**
 - `models/crypto_feature_pipeline.py`:
@@ -99,18 +117,27 @@ First non-trivial code. Establishes IC baseline and cost model.
   - **Forced sign validation** at construction time — if A-share sign
     fires opposite of crypto sign, fail loudly (per 6/3 hard-gotcha
     enforcement)
+  - **Timeframes: 1m / 5m / 15m + 1h / 4h / 1d** (was 1h+ only)
+- `crypto/feature_online.py` — rolling-window features computed by
+  daemon from live bar stream. Same math as batch pipeline.
 - `scripts/crypto_build_features.py` (feature cache, weekly walk-forward)
-- `scripts/crypto_backtest_baseline.py` (momentum / reversal baseline)
+- `scripts/crypto_backtest_baseline.py` (momentum / reversal / 1m-bar
+  fast-bar baseline; published Sharpe targets 1.0-2.4 per 6/3 freshness)
 - `backtest/crypto_cost_model.py` reusing `backtest/cost_model.py`
   sqrt_adv + crypto-specific fees (maker / taker per venue, **funding
   cost included in perp legs**)
+- **Online/batch parity test**: same (timestamp, symbol) input → same
+  feature vector from both paths. Blocking gate for Phase D.
 - RankIC / spread / PnL daily report
 
 **Acceptance**
 - Baseline beats buy-and-hold on Sharpe (after-cost) AND beats random
+  on BOTH bar horizons (1m/5m fast-bar AND 1h+ slow-bar)
 - Cost model exhibits sqrt_adv scaling, NOT static slippage
 - Each imported A-share factor's sign is validated in code (assertion)
 - Survivorship bias controlled — dead coins kept in universe
+- Online/batch feature parity test passes (max element-wise relative
+  diff < 1e-6 on a 7-day window)
 - A-share cron jobs continue 5/5 GREEN
 
 **Dependencies**
@@ -145,21 +172,52 @@ The first concrete strategy. Funding rate carry, market-neutral.
 
 ---
 
-## Phase Crypto-D — Paper Trading (30 calendar days minimum)
+## Phase Crypto-D — Paper Trading (21+ calendar days, daemon-driven)
+
+**REVISED 2026-06-03**: Phase D is no longer a cron-driven loop. It
+is a 24/7 event-driven daemon plus three cron entries that handle
+only watchdog / backfill / daily report. Full architecture spec in
+`plans/crypto-daemon-architecture-2026-06-03.md` — read that first
+before writing any Phase D code.
 
 No live keys. No leverage. Paper OMS only.
 
 **Deliverables**
-- `scripts/run_crypto_paper_trading.py` (cron'd)
-- `scripts/crypto_daily_report.py` (PnL, position, basis, risk metrics)
-- Stale-data block (no signal if data > 30min stale on any venue)
-- Position cap enforcement (no single position > 30% paper book)
-- Daily push to user with one-line summary
+- `scripts/run_crypto_daemon.py` (launchd target — Mac-native 24/7
+  supervision; Linux systemd unit as future fallback)
+- `scripts/install_crypto_daemon.py` (installs the launchd plist)
+- `crypto/order_book.py` (in-memory book + WS-gap REST resync)
+- `crypto/bar_aggregator.py` (live → 1m/5m/15m closed bars)
+- `crypto/risk_guard.py` (stale / spread / vol / gap pre-trade gate,
+  fail-closed)
+- `paper/crypto_oms.py` (T+0 paper OMS, own state file,
+  NOT A-share reconcile)
+- `strategies/crypto_fast_bar.py` (1m/5m minute-bar momentum +
+  spread filter; first soak strategy per architecture doc §3.3)
+- `scripts/crypto_daemon_watchdog.py` (cron'd every 5 min: heartbeat
+  + restart on miss)
+- `scripts/crypto_backfill_ohlcv.py` (cron'd hourly: REST closed-bar
+  resync, never the trading source)
+- `scripts/crypto_daily_report.py` (cron'd 23:55 UTC: PnL, position,
+  basis, latency, WS gaps, daemon restart count)
+- Three cron entries (watchdog / backfill / report) — NONE is a
+  trading loop.
 
-**Acceptance**
-- 30 calendar days continuous paper run, zero crashes
-- After-cost Sharpe consistent with backtest (no > 30% degradation)
-- A-share cron jobs continue 5/5 GREEN throughout
+**Acceptance** — per architecture doc §6:
+- **21 calendar days minimum** continuous daemon uptime (was 30, but
+  intraday daemon has more failure modes than a daily cron)
+- At least one calendar day with the primary symbol moving ≥ 5%
+  during the soak (risk-envelope pressure test)
+- WS gap rate ≤ 5/day; P95 RTT ≤ 800ms; daemon restart ≤ 1/day
+- After-cost Sharpe consistent with backtest replay (cumulative PnL
+  within ±50% band; tighter band proves replay determinism)
+- Stale-data block (no signal if last book update > 2s old)
+- Position cap enforcement (no single position > 30% paper book)
+- Spread filter (reject orders when spread > 25 bps per data
+  contract §11)
+- **A-share cron jobs continue 5/5 GREEN throughout** — and daemon
+  CPU is throttled during A-share active windows (09:25-09:31,
+  14:30-14:36, 18:00-18:55, 22:00-22:05 Asia/Shanghai)
 - User reviews logs at least weekly and signs off
 
 **Dependencies**
@@ -172,8 +230,23 @@ No live keys. No leverage. Paper OMS only.
 On-chain factor overlay (Glassnode + CryptoQuant) → cross-section LGB →
 event/sentiment integration → multi-venue → live decision.
 
+**Newly listed E.0 backlog items (moved out of Phase D per 2026-06-03
+architecture pivot)**:
+
+- **E.0a Order book L2 alpha**: book imbalance, micro-price,
+  queue-position features. Phase D uses L1 (best bid/ask + last
+  trade) only — L2 alpha needs separate research after the daemon
+  proves stable on L1.
+- **E.0b Hyperliquid daemon**: the Phase D first daemon targets
+  Binance (rest of pipeline is Binance-anchored). Hyperliquid SDK
+  has the cleanest 2026 Python integration but landing it before
+  Binance soak passes risks double-debugging two venue runtimes.
+- **E.0c LLM factor agent** on crypto (arxiv 2604.26747 path) —
+  44.55% OOS Sharpe 1.55 published; reuse our MiniMax pipeline as
+  the factor proposer, deterministic engine for evaluation.
+
 **Live trading is OUT of scope** until user explicitly lifts paper-only
-constraint AND > 30 days continuous Phase Crypto-D GREEN.
+constraint AND ≥ 21 days continuous Phase Crypto-D GREEN.
 
 ---
 
@@ -295,6 +368,49 @@ Source: [Hummingbot GitHub](https://github.com/hummingbot/hummingbot),
 [Freqtrade vs Hummingbot 2026 comparison](https://gainium.io/compare/freqtrade-vs-hummingbot),
 [Top Hyperliquid bot frameworks](https://coincodecap.com/best-hyperliquid-bot-frameworks-sdks-hummingbot-ccxt).
 
+## Δ7 — Daemon architecture decision (2026-06-03 architectural review)
+
+**5/30 + 6/3 baseline assumption**: Phase D runs `run_crypto_paper_
+trading.py` as a daily cron — same shape as A-share paper.
+
+**2026-06-03 review finding**: cron is the wrong shape for anything
+faster than 1h bars. Process-launch jitter, no continuous state for
+order book / pending orders, no WS reconnect handling, REST polling
+collapses stream data into samples. Crypto WS is event-driven by
+spec (Binance kline 1-2s, futures depth 100-500ms; Bybit 20s
+heartbeat).
+
+**Decision**: Phase D pivots to a 24/7 launchd-supervised daemon
+plus three cron entries that handle watchdog / backfill / daily
+report only. NO trading-loop cron. Full design with seven sharp
+details (WS log replay, seq-gap detection, ssproxy keepalive,
+daemon resource limits during A-share windows, paper fill sim,
+21-day soak bands, daemon/backfill collaboration) is in
+**`plans/crypto-daemon-architecture-2026-06-03.md`**.
+
+This pivot does NOT regress what is already shipped: Crypto-A step 2
+(REST OHLCV collector, commit `12dabb8`) and step 3 (derivatives
+collector, commit `e402a5c`) are kept and re-roled as the backfill
+data path. The daemon runs alongside them, never instead of them.
+
+Action:
+- Phase A: existing REST collectors keep their role. Add step 4a
+  (WS collector) and step 4b (replay engine). See Phase A above.
+- Phase B: feature pipeline timeframes expand to include 1m/5m/15m
+  alongside 1h/4h/1d. Add online/batch parity contract test. See
+  Phase B above.
+- Phase C: funding arb backtest unchanged (event-cadence is exchange-
+  controlled; daemon switch doesn't affect funding-event spacing).
+- Phase D: re-spec to daemon + three cron entries. 21-day soak with
+  explicit acceptance bands. See Phase D above.
+- Phase E.0 backlog: order book L2 alpha + Hyperliquid daemon + LLM
+  factor agent moved here, after Binance L1 daemon proves stable.
+
+Source: deep-research agent run 2026-06-03 plus primary refs:
+[Binance Spot WebSocket](https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md),
+[Binance USD-M Futures Diff Book Depth](https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/Diff-Book-Depth-Streams),
+[Bybit WebSocket Connect](https://bybit-exchange.github.io/docs/v5/ws/connect).
+
 ---
 
 ## Hard Gotcha Catalogue (consolidated, kept here for quick scan)
@@ -347,15 +463,31 @@ a trading bankroll.
 
 ---
 
-## Status (today)
+## Status (2026-06-03 EOD)
 
-- **Crypto quarantine soak**: Day 2 of 3 in progress (2026-06-03).
-  Soak GREEN → merge to master → Phase Crypto-0 may begin.
-- **Frozen sequence**: A-share Batch 3 (#62) + Batch 4 (#63) precede
-  crypto Phase A entry. Crypto-B has hard dependency on Batch 4 P2
-  sqrt_adv being wired (Δ6 action).
-- **No crypto code in production**: only quarantine flag + lazy import
-  + paper collector + tests.
+- **Crypto quarantine**: merged to master 2026-06-03 (`a415605`) after
+  soak Day 1+2 GREEN, Day 3 compressed per user decision.
+- **A-share Batch 3 macro PIT drop**: merged (`5d01629`). Champion
+  models from next train onwards exclude leaked macro_* columns.
+- **A-share Batch 4 sqrt_adv plumbing**: merged (`a82fb4d`).
+  PortfolioBacktest + paper OMS both have the chokepoint; activation
+  is opt-in. cx round-3 P3 docstring fix merged (`2197328`).
+- **Crypto-0**: closed (`9144b9e`).
+- **Crypto-A step 1** (config modules): merged (`ab8dfba`).
+- **Crypto-A step 2** (REST OHLCV collector): merged (`12dabb8`).
+- **Crypto-A step 3** (REST derivatives collector): merged (`e402a5c`).
+- **2026-06-03 architecture pivot**: Phase D shifts from cron to 24/7
+  daemon (this commit). Phase A gains step 4a/4b for WS collector +
+  replay engine. Phase B feature timeframes expand to 1m/5m/15m.
+  Phase E.0 backlog absorbs L2 alpha + Hyperliquid daemon + LLM
+  factor agent.
 
-To start Phase Crypto-0, user signals "开 Crypto-0". This file is the
-roadmap from that moment.
+To start Phase Crypto-A step 4a (WS collector), user signals
+"开 daemon" after this architecture doc is reviewed. Until then,
+Phase A is paused at step 3 (REST collectors complete).
+
+Outstanding A-share PR decisions (none block crypto code work
+technically, but isolation prefers no outstanding A-share PRs while
+crypto daemon is being written):
+- `fix/llm-prefilter-dedup` (3 commits) — independent review pending
+- `fix/train-lgb-use-feature-merger` — paired backtest pending
