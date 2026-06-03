@@ -186,7 +186,15 @@ class PortfolioBacktest:
         drawdown_stop: float = 0.0, # if > 0, force sell all when drawdown exceeds this (e.g. 0.08 = 8%)
         # --- sqrt_adv cost model wiring (cx code review round 3 P2) ---
         enable_sqrt_adv_costs: bool = False,
-        portfolio_value: float = 1_000_000.0,  # USD-ish notional; only matters when sqrt_adv enabled
+        # Account notional, IN THE SAME CURRENCY as ADV and price data.
+        # A-share: RMB (¥). Crypto: USD/USDT. The cost model only uses
+        # the ratio trade_value / ADV so units must match between the
+        # two; they are NOT auto-derived from currency tags. Default
+        # 1_000_000 matches the typical paper-OMS starting equity, but
+        # research scripts that want a different account size MUST
+        # pass this explicitly — capacity / cost sensitivity otherwise
+        # silently anchors to ¥1M (cx review round 3 P3).
+        portfolio_value: float = 1_000_000.0,
         cost_vol_window: int = 20,             # rolling window for per-stock vol estimate
         # --- Optimizer V2 ---
         optimizer=None,             # TurnoverConstrainedOptimizer instance
