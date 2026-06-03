@@ -83,6 +83,7 @@ class PaperOMS:
                  stamp_tax_rate: float = 0.0005,
                  slippage_rate: float = 0.001,
                  cost_model=None,
+                 vol_adv_snapshot=None,
                  execution_mode: str = "buffered_partial",
                  max_turnover: float = 0.10,
                  max_single_weight: float = 0.05,
@@ -106,6 +107,16 @@ class PaperOMS:
         # with sqrt(trade_value / ADV). Default behaviour (cost_model=None)
         # preserves the bare-rate path.
         self.cost_model = cost_model
+        # cx round-3 P2 #84 follow-up: per-stock vol + ADV snapshot fed
+        # into fill sites. Without this dict, _compute_slippage(amount)
+        # at the fill sites passes vol=None,adv=None → CostModel._slippage
+        # falls back to bare slippage_rate → sqrt_adv is dead code in
+        # production paper even with cost_model=CostModel(impact_model=
+        # "sqrt_adv"). The snapshot is a dict {code: {"vol": float,
+        # "adv": float}} typically built by paper.cost_inputs at the
+        # start of a daily run from qlib historical data. None preserves
+        # pre-fix behaviour.
+        self.vol_adv_snapshot = vol_adv_snapshot
         self.execution_mode = execution_mode
         self.max_turnover = max_turnover
         self.max_single_weight = max_single_weight
@@ -147,6 +158,31 @@ class PaperOMS:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.state, indent=2, ensure_ascii=False))
         os.replace(tmp, path)
+
+    def _lookup_vol_adv(self, code) -> tuple:
+        """Look up (daily_volatility, adv) for `code` in the snapshot.
+
+        Returns (None, None) if the snapshot is absent or the code is
+        not in it. The fill sites pass these into _compute_slippage,
+        which itself falls back to bare slippage_rate when either is
+        None — so a missing snapshot or a code that wasn't computed
+        today both gracefully degrade to pre-fix behaviour rather
+        than raising.
+
+        Accepts the snapshot in either of two shapes:
+          {code: {"vol": ..., "adv": ...}}
+          {code: (vol, adv)}
+        """
+        if not self.vol_adv_snapshot:
+            return None, None
+        entry = self.vol_adv_snapshot.get(code)
+        if entry is None:
+            return None, None
+        if isinstance(entry, dict):
+            return entry.get("vol"), entry.get("adv")
+        if isinstance(entry, (tuple, list)) and len(entry) >= 2:
+            return entry[0], entry[1]
+        return None, None
 
     def _compute_slippage(self, amount, daily_volatility=None, adv=None):
         """Compute slippage cost for a fill.
@@ -399,7 +435,8 @@ class PaperOMS:
             amount = pos["shares"] * sell_price
             commission = max(amount * self.commission_rate, 5.0)
             stamp_tax = amount * self.stamp_tax_rate
-            slippage = self._compute_slippage(amount)
+            _vol, _adv = self._lookup_vol_adv(code)
+            slippage = self._compute_slippage(amount, daily_volatility=_vol, adv=_adv)
             net = amount - commission - stamp_tax - slippage
 
             cash += net
@@ -439,7 +476,8 @@ class PaperOMS:
 
                 amount = shares * buy_price
                 commission = max(amount * self.commission_rate, 5.0)
-                slippage = self._compute_slippage(amount)
+                _vol, _adv = self._lookup_vol_adv(code)
+                slippage = self._compute_slippage(amount, daily_volatility=_vol, adv=_adv)
                 total_cost = amount + commission + slippage
 
                 if total_cost > cash:
@@ -840,7 +878,8 @@ class PaperOMS:
             amount = pos["shares"] * sell_price
             commission = max(amount * self.commission_rate, 5.0)
             stamp_tax = amount * self.stamp_tax_rate
-            slippage = self._compute_slippage(amount)
+            _vol, _adv = self._lookup_vol_adv(code)
+            slippage = self._compute_slippage(amount, daily_volatility=_vol, adv=_adv)
             net = amount - commission - stamp_tax - slippage
 
             cash += net
@@ -885,7 +924,8 @@ class PaperOMS:
 
                 amount = shares * buy_price
                 commission = max(amount * self.commission_rate, 5.0)
-                slippage_cost = self._compute_slippage(amount)
+                _vol, _adv = self._lookup_vol_adv(code)
+                slippage_cost = self._compute_slippage(amount, daily_volatility=_vol, adv=_adv)
                 total_cost = amount + commission + slippage_cost
 
                 if total_cost > cash:
