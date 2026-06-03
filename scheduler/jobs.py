@@ -1004,8 +1004,7 @@ class DailyPipeline:
             if not ok:
                 continue
             short_score = _finite_float(item.get("model_score", item.get("lgb_score")))
-            if short_score <= 0:
-                continue
+            # 2026-06-03 P0: do NOT filter on `short_score <= 0`. Per cx code review of the 22:00 0-recommendation incident, the trained model (242 features) is fed only 158 features at inference (no merge_for_inference call in models/short_term.py), so XGBoost follows the missing-value default branch on 84 cols, producing a narrow leaf-set whose sign on any given day is roughly coin-flip. Filtering `<= 0` silently swallows half the days. Rank order is the right signal; let the sort downstream pick top-K.
             has_lgb = bool(item.get("has_lgb", item.get("score_source") == "ml_model"))
             candidate = {
                 "code": code,
@@ -1057,8 +1056,7 @@ class DailyPipeline:
                     volume=volume,
                     macro_score=stock_macro,
                 )
-                if short_score <= 0:
-                    continue
+                # 2026-06-03 P0: do NOT filter on `short_score <= 0`. Per cx code review of the 22:00 0-recommendation incident, the trained model (242 features) is fed only 158 features at inference (no merge_for_inference call in models/short_term.py), so XGBoost follows the missing-value default branch on 84 cols, producing a narrow leaf-set whose sign on any given day is roughly coin-flip. Filtering `<= 0` silently swallows half the days. Rank order is the right signal; let the sort downstream pick top-K.
                 candidate = {
                     "code": code, "name": name, "market": market,
                     "short_score": short_score,
@@ -1100,8 +1098,7 @@ class DailyPipeline:
                     volume=_finite_float(row.get("成交量")),
                     macro_score=stock_macro,
                 )
-                if short_score <= 0:
-                    continue
+                # 2026-06-03 P0: do NOT filter on `short_score <= 0`. Per cx code review of the 22:00 0-recommendation incident, the trained model (242 features) is fed only 158 features at inference (no merge_for_inference call in models/short_term.py), so XGBoost follows the missing-value default branch on 84 cols, producing a narrow leaf-set whose sign on any given day is roughly coin-flip. Filtering `<= 0` silently swallows half the days. Rank order is the right signal; let the sort downstream pick top-K.
 
                 flow_score = self._capital_flow_score(qlib_code)
                 candidate = {
@@ -1292,8 +1289,7 @@ class DailyPipeline:
         rows = []
         for code, score in lgb_preds.items():
             short_score = _finite_float(score)
-            if short_score <= 0:
-                continue
+            # 2026-06-03 P0: do NOT filter on `short_score <= 0`. Per cx code review of the 22:00 0-recommendation incident, the trained model (242 features) is fed only 158 features at inference (no merge_for_inference call in models/short_term.py), so XGBoost follows the missing-value default branch on 84 cols, producing a narrow leaf-set whose sign on any given day is roughly coin-flip. Filtering `<= 0` silently swallows half the days. Rank order is the right signal; let the sort downstream pick top-K.
 
             quote = spot.get(code)
             if quote is None:
