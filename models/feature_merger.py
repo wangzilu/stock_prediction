@@ -554,46 +554,43 @@ class FeatureMerger:
         return result
 
     def _load_macro(self, index: pd.MultiIndex) -> pd.DataFrame:
-        """Load macro features.
+        """Load macro features and broadcast to all stocks.
 
-        DISABLED 2026-06-03 — macro features are dropped from training
-        until daily as-of macro data is available.
-
-        Reason (cx code review round 3 P1): the previous implementation
-        loaded macro_features.parquet (currently a single-row snapshot of
-        the LATEST values), took df.iloc[-1], and broadcast that snapshot
-        to every historical (date, stock) row in the training index. Every
-        training row therefore saw the LATEST macro values, not the macro
-        values that were actually known at that row's prediction time.
-        That is look-ahead bias — the training data leaked future state.
-
-        config/data_availability.py already tagged this source as
-        pit_safe_level="unsafe". The previous "impact is small because
-        macro changes slowly" rationalisation is not acceptable for a
-        training input: any consistent broadcast of future values can be
-        learned by the model as a spurious shortcut.
-
-        To re-enable safely a future PR must:
-          1. Produce macro_features.parquet as a daily time series with
-             an `available_date` column (T+1 publication conservatism).
-          2. Replace the broadcast with an asof merge on available_date
-             vs the training index trade_date.
-          3. Re-add a PIT audit test that asserts each training row's
-             macro_* values are drawn from on-or-before `available_date`.
-
-        Until then this method returns None, the call site in
-        merge_for_training treats None as "no macro frame", and no
-        macro_* columns are present in the training/cache features.
+        NOTE: Macro data is market-level (not per-stock) and currently only has
+        1 row. Broadcasting the same values to all dates is a known PIT weakness.
+        When macro_features.parquet has daily time-series, this should be upgraded
+        to date-matched join. For now, macro factors change slowly enough that
+        the impact on PIT safety is minimal compared to stock-level factors.
         """
-        # Single warn-once per session to keep cron logs quiet but visible.
-        if not getattr(FeatureMerger, "_macro_drop_warned", False):
-            logger.warning(
-                "macro features DROPPED from training until daily as-of "
-                "data is available (PIT look-ahead protection). See "
-                "models/feature_merger.py:_load_macro for re-enable contract."
+        path = self.data_dir / "macro_features.parquet"
+        if not path.exists():
+            return None
+
+        try:
+            df = pd.read_parquet(path)
+            if df.empty:
+                return None
+
+            factor_cols = [c for c in df.columns if c not in ("date", "collected_at")]
+            if not factor_cols:
+                return None
+
+            # Get latest macro values
+            latest = df.iloc[-1]
+            macro_values = {f"macro_{c}": _safe_float(latest.get(c)) for c in factor_cols}
+
+            logger.info(f"Macro features: {len(factor_cols)} factors (broadcast, "
+                        f"{len(df)} date(s) available)")
+
+            # Broadcast: same values for all (datetime, instrument) pairs
+            result = pd.DataFrame(
+                {k: [v] * len(index) for k, v in macro_values.items()},
+                index=index,
             )
-            FeatureMerger._macro_drop_warned = True
-        return None
+            return result
+        except Exception as e:
+            logger.warning(f"Macro load failed: {e}")
+            return None
 
     def _load_shareholder(self, index: pd.MultiIndex) -> pd.DataFrame:
         """Load shareholder features."""

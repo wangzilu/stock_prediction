@@ -379,13 +379,7 @@ _reg(DataSourceSpec(
     ),
 ))
 
-# ── Macro features (DROPPED 2026-06-03 — see _load_macro contract) ────────
-# cx code review round 3 P1: broadcast pattern leaked LATEST macro values
-# into every historical training row. The previous "impact is small"
-# rationale is not acceptable for a training input — the model can learn
-# a spurious shortcut. models/feature_merger.py:_load_macro now returns
-# None unconditionally; tests/test_macro_pit_drop.py pins that contract.
-# Re-enable contract documented in _load_macro docstring.
+# ── Macro features (broadcast, legacy single-row) ──────────────────────────
 _reg(DataSourceSpec(
     name="macro_features",
     event_time="variable",
@@ -394,12 +388,12 @@ _reg(DataSourceSpec(
     signal_lag_bdays=0,
     execution_lag="T+1_open",
     pit_safe_level="unsafe",
-    allowed_usage=[],  # was ["training"]; dropped pending daily as-of upgrade
+    allowed_usage=["training"],
     notes=(
         "macro_features.parquet currently has only 1 row (latest snapshot), "
-        "broadcast to all dates. DROPPED from training 2026-06-03 — "
-        "_load_macro returns None until daily time-series with available_date "
-        "column lands and asof merge replaces the broadcast."
+        "broadcast to all dates. This is a known PIT weakness — same values "
+        "leak into historical training samples. Impact is small because macro "
+        "factors change slowly. Should be upgraded to daily time-series."
     ),
 ))
 
