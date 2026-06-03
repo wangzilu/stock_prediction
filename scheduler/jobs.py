@@ -630,8 +630,14 @@ class DailyPipeline:
                 volume=volume,
                 macro_score=0.0,
             )
-            if model_score <= 0:
-                continue
+            # 2026-06-03 emergency fix: do NOT filter `model_score <= 0`.
+            # When the model has an all-bearish day (every prediction <= 0,
+            # observed today with min=-0.034 / max=-0.003), this filter
+            # produced zero candidates and the 22:00 evening push went
+            # out empty. The evening report's job is to ALWAYS surface
+            # the relatively-best K stocks; defensive mode is the
+            # caller's responsibility (formatter adds a "全市场看空"
+            # banner downstream). The rank order alone is the signal.
             price = _finite_float(quote.get("最新价")) if quote is not None else 0.0
             liquidity_score = min(volume / 1_000_000.0, 1.0)
             short_expected = round(
@@ -670,6 +676,27 @@ class DailyPipeline:
     def _format_evening_stock_forecasts(self, forecast_groups: dict[str, list[dict]]) -> str:
         """Format evening stock forecasts with trading strategy for each horizon."""
         lines = ["五、个股预测"]
+
+        # 2026-06-03 emergency fix: defensive-mode banner when ALL Top K
+        # across every horizon have model_score <= 0. The model is
+        # broadly bearish today; the user still needs to see relatively-
+        # best K names but with explicit warning.
+        all_items = []
+        for items in forecast_groups.values():
+            all_items.extend(items)
+        if all_items and all(
+            it.get("model_score", 0) <= 0 for it in all_items
+        ):
+            lines.append(
+                "  ⚠️ 全市场看空模式：模型对今日所有候选预测为负。以下为"
+                "相对最优 Top K，仅供参考，不代表绝对买入信号。建议优先"
+                "等待大盘情绪修复后再行动。"
+            )
+            logger.warning(
+                "Evening forecasts: ALL %d candidates have model_score<=0 — "
+                "defensive-mode banner emitted",
+                len(all_items),
+            )
 
         # Strategy specs per horizon
         strategy = {
