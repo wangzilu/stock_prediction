@@ -665,15 +665,48 @@ class FeatureMerger:
         merge_for_training treats None as "no macro frame", and no
         macro_* columns are present in the training/cache features.
         """
-        # Single warn-once per session to keep cron logs quiet but visible.
+        # 2026-06-04 final: DIMENSION-PRESERVING zero baseline.
+        # The trained XGBModel expects 242 features = Alpha158(158) +
+        # supp(84) where supp includes 10 macro_* columns. Returning
+        # None drops those 10 cols, so inference matrix is only 232
+        # cols → XGB walks default-direction leaves → predictions
+        # cluster around a single value → 22:00 evening_outlook
+        # produces 0 stock recommendations.
+        #
+        # Returning a ZEROS frame with the trained column names is
+        # PIT-safe (no future information leaks via zeros) AND
+        # dimension-preserving (model sees the 10 columns it expects,
+        # just always as 0). Re-enable contract for real macro values
+        # documented below remains in force.
+        path = self.data_dir / "macro_features.parquet"
+        if not path.exists():
+            # No parquet → no column-name template → cannot synthesise.
+            return None
+        try:
+            df_template = pd.read_parquet(path)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("macro template parquet read failed: %s", e)
+            return None
+        factor_cols = [c for c in df_template.columns
+                       if c not in ("date", "collected_at")]
+        if not factor_cols:
+            return None
+
+        # Single warn-once per session
         if not getattr(FeatureMerger, "_macro_drop_warned", False):
             logger.warning(
-                "macro features DROPPED from training until daily as-of "
-                "data is available (PIT look-ahead protection). See "
-                "models/feature_merger.py:_load_macro for re-enable contract."
+                "macro features DIMENSION-PRESERVED as zero baseline (PIT "
+                "look-ahead drop, but column shape kept so inference does "
+                "not silently bias). See _load_macro contract for re-enable."
             )
             FeatureMerger._macro_drop_warned = True
-        return None
+
+        macro_cols = [f"macro_{c}" for c in factor_cols]
+        return pd.DataFrame(
+            np.zeros((len(index), len(macro_cols)), dtype=np.float32),
+            index=index,
+            columns=macro_cols,
+        )
 
     def _load_shareholder(self, index: pd.MultiIndex) -> pd.DataFrame:
         """Load shareholder features."""
