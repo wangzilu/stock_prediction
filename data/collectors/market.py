@@ -229,9 +229,49 @@ class MarketCollector:
             return None
 
     def _write_spot_disk_cache(self, df: pd.DataFrame, source: str) -> None:
-        """Persist a full A-share spot snapshot for later one-shot runs."""
+        """Persist a full A-share spot snapshot for later one-shot runs.
+
+        cx code review 2026-06-04 P0: a partial source MUST NOT
+        overwrite a healthy full cache. The 2026-06-03 22:00 incident
+        was triggered by Tencent's 300-stock partial cache silently
+        replacing AKShare's 5000-stock full cache. Block that here.
+
+        Coverage contract:
+          - Sources ending in '_partial' are considered partial.
+          - A partial write refuses to replace an existing cache with
+            row_count >= 4500 written within the same trading day.
+          - Same-source overwrites are always allowed (e.g. AKShare
+            refreshes itself).
+        """
         if df is None or df.empty:
             return
+
+        is_partial = source.endswith("_partial")
+        if is_partial and self._spot_cache_path.exists() and \
+                self._spot_cache_meta_path.exists():
+            try:
+                existing_meta = json.loads(
+                    self._spot_cache_meta_path.read_text(encoding="utf-8")
+                )
+                existing_row_count = int(existing_meta.get("row_count", 0))
+                existing_source = existing_meta.get("source", "")
+                existing_created_at = datetime.fromisoformat(
+                    existing_meta.get("created_at", "1970-01-01T00:00:00")
+                )
+                same_day = existing_created_at.date() == datetime.now().date()
+                if existing_row_count >= 4500 and same_day and not existing_source.endswith("_partial"):
+                    logger.error(
+                        "REFUSING to overwrite healthy full-market spot cache "
+                        "(source=%s, %d rows, %s) with PARTIAL source=%s "
+                        "(%d rows). Keeping existing cache.",
+                        existing_source, existing_row_count,
+                        existing_created_at.isoformat(timespec="seconds"),
+                        source, len(df),
+                    )
+                    return
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Cache overwrite-protection check failed: %s", e)
+
         try:
             self._spot_cache_path.parent.mkdir(parents=True, exist_ok=True)
             tmp_csv = self._spot_cache_path.with_name(f"{self._spot_cache_path.name}.tmp")
@@ -241,6 +281,7 @@ class MarketCollector:
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "source": source,
                 "row_count": int(len(df)),
+                "is_partial": is_partial,
             }
             tmp_meta.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(tmp_csv, self._spot_cache_path)
@@ -274,19 +315,39 @@ class MarketCollector:
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(RETRY_DELAY)
 
-        # Fallback to Tencent batch API.
-        # IMPORTANT: Tencent fallback only covers WATCHLIST (~50 stocks),
-        # whereas AKShare returns the full 5000+ market. Upstream callers
-        # (scheduler/jobs.py screening) treat the spot cache as full-market,
-        # so a silent fallback silently shrinks the candidate universe.
-        # Mark the cache as PARTIAL and emit an ERROR so the downstream
-        # screener can detect coverage degradation and either reject the
-        # run or warn the user instead of silently recommending from a
-        # 50-stock pool.
+        # Fallback Layer 2: ST_CLIENT / TuShare realtime_list (FULL MARKET).
+        # cx code review 2026-06-04 P0: AKShare→Tencent skipped the
+        # available ST_CLIENT realtime path, causing the 2026-06-03 22:00
+        # incident where universe silently shrank to 300 stocks (Tencent
+        # watchlist). ST_CLIENT returns the full 5000+ universe.
+        logger.warning(
+            "AKShare spot failed after %d retries — trying ST_CLIENT realtime_list fallback...",
+            MAX_RETRIES,
+        )
+        st_df = self._load_spot_stclient()
+        if st_df is not None and len(st_df) >= 4500:
+            logger.info("ST_CLIENT spot fallback succeeded: %d stocks (full)", len(st_df))
+            self._spot_cache = st_df
+            self._write_spot_disk_cache(st_df, "stclient_realtime")
+            self._spot_loaded = True
+            return
+        elif st_df is not None:
+            logger.warning(
+                "ST_CLIENT spot returned %d stocks (< 4500 full-market threshold); "
+                "treating as partial and continuing fallback chain",
+                len(st_df),
+            )
+
+        # Fallback Layer 3: Tencent batch (WATCHLIST partial).
+        # Per cx P0: Tencent partial MUST NOT overwrite an existing
+        # healthy full-market cache. The write below uses source =
+        # "tencent_partial" and _write_spot_disk_cache refuses to
+        # overwrite a > 4500-row existing cache.
         logger.error(
-            "AKShare spot failed after %d retries — falling back to Tencent (WATCHLIST-only, ~%d stocks). "
-            "Downstream screeners will see a SHRUNK universe; set _spot_partial=True flag.",
-            MAX_RETRIES, 50,
+            "Both AKShare AND ST_CLIENT spot failed — falling back to Tencent "
+            "(WATCHLIST-only, ~%d stocks). Downstream screeners must treat "
+            "this as PARTIAL coverage.",
+            50,
         )
         self._spot_cache = self._load_spot_tencent()
         self._spot_partial = True
@@ -312,6 +373,85 @@ class MarketCollector:
             "created_at": meta.get("created_at", ""),
             "cache_path": str(self._spot_cache_path),
         }
+
+    def _load_spot_stclient(self) -> Optional[pd.DataFrame]:
+        """Fallback 2: load FULL-MARKET realtime quotes via ST_CLIENT
+        (TuShare-compatible). Tries before Tencent because it returns
+        the full 5000+ universe, not a 50-stock watchlist.
+
+        cx code review 2026-06-04: ST_CLIENT.realtime_list() and
+        realtime_quote() have existed since project inception but
+        were never wired into MarketCollector — historical tech debt.
+        AKShare→Tencent skipped this layer entirely, causing the
+        2026-06-03 22:00 incident where AKShare failed and the
+        universe silently shrank from 5000+ to 300.
+        """
+        try:
+            import os
+            try:
+                from ST_CLIENT import StockToday
+            except ImportError as e:
+                logger.warning("ST_CLIENT not importable for spot fallback: %s", e)
+                return None
+
+            token = None
+            try:
+                from config.settings import ST_TOKEN
+                token = ST_TOKEN
+            except Exception:
+                pass
+            if not token:
+                token_file = Path(__file__).resolve().parents[2] / ".st_token"
+                if token_file.exists():
+                    token = token_file.read_text().strip()
+            if not token:
+                logger.warning("ST_CLIENT token unavailable; skipping realtime spot fallback")
+                return None
+
+            st = StockToday(token=token)
+            try:
+                raw = st.realtime_list()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("ST_CLIENT realtime_list failed: %s", e)
+                return None
+
+            # Normalize shape — server may return list of dicts OR
+            # {data: list, columns: [...]} envelope.
+            rows = raw
+            if isinstance(raw, dict):
+                rows = raw.get("data") or raw.get("items") or []
+            if not rows:
+                return None
+            df = pd.DataFrame(rows)
+            if df.empty:
+                return None
+
+            # Normalize column names to MarketCollector's expected
+            # Chinese keys (代码 / 名称 / 最新价 / 涨跌幅 / 成交量).
+            col_map = {
+                "ts_code": "代码", "code": "代码", "symbol": "代码",
+                "name": "名称", "stock_name": "名称",
+                "price": "最新价", "close": "最新价", "current": "最新价",
+                "pct_change": "涨跌幅", "change_pct": "涨跌幅", "chg_pct": "涨跌幅",
+                "volume": "成交量", "vol": "成交量",
+                "high": "最高", "low": "最低",
+            }
+            df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+
+            # Strip exchange suffix if ts_code form
+            if "代码" in df.columns:
+                df["代码"] = df["代码"].astype(str).str.replace(
+                    r"\.(SH|SZ|BJ)$", "", regex=True,
+                )
+
+            logger.info(
+                "Loaded %d stocks via ST_CLIENT realtime_list (full-market)",
+                len(df),
+            )
+            return df
+        except Exception as e:  # noqa: BLE001
+            logger.warning("ST_CLIENT spot fallback raised: %s", e)
+            return None
 
     def _load_spot_tencent(self) -> pd.DataFrame:
         """Fallback: load realtime quotes from Tencent Finance API.

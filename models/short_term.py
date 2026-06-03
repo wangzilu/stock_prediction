@@ -302,6 +302,52 @@ class ShortTermModel:
             },
         }
         instance._dataset = init_instance_by_config(dataset_config)
+
+        # 2026-06-03 P0 fix (cx code review of all-negative incident):
+        # The booster was trained INCLUDING supplementary features
+        # (capital flow / valuation / quality / ST / cross-market / etc.
+        # — ~84 columns) via train_lgb.py's manual injection into the
+        # handler. Without this same injection at inference, the
+        # rebuilt dataset only contains Alpha158 (158 cols) and the
+        # booster's predict() walks default-direction branches on
+        # the missing 84 cols → predictions cluster around a single
+        # leaf and on bearish days every stock ends up negative.
+        try:
+            from models.feature_merger import FeatureMerger
+            handler = instance._dataset.handler
+            merger = FeatureMerger()
+            n_supp = merger.inject_supplementary_into_handler(
+                handler, preprocess=False,
+            )
+            print(f"[short_term] injected {n_supp} supplementary cols at inference")
+        except Exception as e:  # noqa: BLE001
+            print(f"[short_term] supplementary injection failed (non-fatal): {e}")
+
+        # Sanity gate: booster feature count must match the prepared
+        # feature matrix width, or predictions are silent garbage.
+        try:
+            from qlib.data.dataset.handler import DataHandlerLP as _DK
+            _xtest = instance._dataset.prepare(
+                "test", col_set="feature", data_key=_DK.DK_I,
+            )
+            _booster = getattr(instance._model, "model", None)
+            if _booster is not None and hasattr(_booster, "num_features"):
+                booster_n = int(_booster.num_features())
+                dataset_n = int(_xtest.shape[1])
+                if booster_n != dataset_n:
+                    raise RuntimeError(
+                        f"[short_term] FATAL: trained model expects "
+                        f"{booster_n} features but inference dataset has "
+                        f"{dataset_n}. Predictions would be silent "
+                        f"default-leaf garbage (cx review 2026-06-03 "
+                        f"incident). Retrain or wire supplementary "
+                        f"injection."
+                    )
+        except RuntimeError:
+            raise
+        except Exception as _e:  # noqa: BLE001
+            print(f"[short_term] dim sanity gate skipped: {_e}")
+
         return instance
 
     def predict_batch(self) -> dict:

@@ -24,6 +24,86 @@ class FeatureMerger:
     def __init__(self, data_dir: Path = DATA_DIR):
         self.data_dir = data_dir
 
+    def inject_supplementary_into_handler(
+        self,
+        handler,
+        preprocess: bool = False,
+    ) -> int:
+        """Inject supplementary features into a Qlib handler's internal
+        _data / _learn / _infer frames.
+
+        This is the SAME injection that `scripts/train_lgb.py` does at
+        train time. The trained model expects to find these supp
+        columns at inference, so `ShortTermModel.load_from_pickle`
+        must call this method on the freshly-rebuilt inference dataset
+        to avoid the 158 vs 242 column mismatch that caused the
+        2026-06-03 22:00 all-negative-prediction incident.
+
+        Args:
+            handler: a Qlib DataHandlerLP with `_data` / `_learn` /
+                `_infer` attributes (or any subset).
+            preprocess: If True, apply `_preprocess_supplementary`
+                (mode="rank") before injection. The CURRENT production
+                model was trained with `preprocess=False` (raw values),
+                so inference must also use False to match training
+                distribution. When the train_lgb branch
+                (`fix/train-lgb-use-feature-merger`) lands, both will
+                switch to True simultaneously.
+
+        Returns:
+            Number of supplementary columns injected.
+        """
+        # The handler should have at least one of these frames
+        for attr in ("_data", "_learn", "_infer"):
+            df = getattr(handler, attr, None)
+            if df is not None and len(df) > 0:
+                base_index = df.index
+                break
+        else:
+            logger.warning(
+                "inject_supplementary_into_handler: no _data/_learn/_infer "
+                "found on handler — nothing to inject"
+            )
+            return 0
+
+        supp = self._load_supplementary(base_index)
+        if supp is None or supp.empty:
+            logger.warning(
+                "inject_supplementary_into_handler: supplementary frame "
+                "empty — handler unchanged (this WILL cause train/serve "
+                "feature mismatch on a model trained with supp)"
+            )
+            return 0
+        # Drop inf so XGB doesn't crash
+        supp = supp.replace([np.inf, -np.inf], np.nan)
+
+        if preprocess:
+            supp = self._preprocess_supplementary(
+                supp, base_index, mode="rank",
+            )
+
+        n_supp = supp.shape[1]
+        # Inject into every frame that exists on the handler so all
+        # data_keys (DK_R / DK_L / DK_I) see the same columns.
+        for attr in ("_data", "_learn", "_infer"):
+            df = getattr(handler, attr, None)
+            if df is None or len(df) == 0:
+                continue
+            attr_common = supp.index.intersection(df.index)
+            for col in supp.columns:
+                df[("feature", col)] = np.nan
+                if len(attr_common):
+                    df.loc[attr_common, ("feature", col)] = supp.loc[
+                        attr_common, col
+                    ].values
+
+        logger.info(
+            "inject_supplementary_into_handler: %d supp cols injected "
+            "into handler (preprocess=%s)",
+            n_supp, preprocess,
+        )
+        return n_supp
+
     def merge_for_training(self, dataset, segment: str = "train",
                            preprocess: str = "rank") -> tuple:
         """Merge Alpha158 features with supplementary factors.

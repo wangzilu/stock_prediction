@@ -773,8 +773,37 @@ class DailyPipeline:
         """Persist the 22:00 stock candidate pool for the next 9:20 correction."""
         items = self._flatten_stock_forecast_groups(forecast_groups)
         if not items:
-            logger.info("Skip overnight stock snapshot: no stock candidates")
-            return
+            # cx code review 2026-06-04 P0: the previous behaviour
+            # silently returned, leaving the cron status GREEN while
+            # the user got an empty 22:00 push. Now: write a failure
+            # snapshot the morning loader can detect, log ERROR, and
+            # raise so the cron wrapper marks the job FAILED.
+            try:
+                path = OVERNIGHT_STOCK_SNAPSHOT_PATH
+                path.parent.mkdir(parents=True, exist_ok=True)
+                failure_payload = {
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "source_date": datetime.now().strftime("%Y-%m-%d"),
+                    "target_date": target_date,
+                    "status": "failure",
+                    "reason": "no_stock_candidates_from_evening_forecast",
+                    "items": [],
+                    "lgb_status": getattr(self, "_lgb_status", {}),
+                }
+                path.write_text(
+                    json.dumps(failure_payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Failed to write failure snapshot: %s", e)
+            logger.error(
+                "Evening forecast produced ZERO stock candidates — pushing "
+                "FAILURE health and raising to mark cron job failed."
+            )
+            raise RuntimeError(
+                "Evening outlook stock candidate pool is EMPTY. Check spot "
+                "cache coverage and LGB prediction freshness."
+            )
 
         payload = {
             "created_at": datetime.now().isoformat(timespec="seconds"),
