@@ -611,7 +611,22 @@ class DailyPipeline:
         # lets the ST/code rules still apply while skipping suspended/一字板.
         sanitizer = self._make_sanitizer(require_quote=False)
         rows = []
-        if spot:
+
+        # cx code review 2026-06-04 P0: partial spot cache (e.g. Tencent
+        # 300-stock watchlist after AKShare failed) MUST NOT serve as
+        # universe. Detect by row_count vs the 4500-stock full-market
+        # threshold. When partial, the LGB-prediction universe (5000+)
+        # is the canonical full-market list; spot is only used for
+        # quote lookup (price/change_pct/volume).
+        is_partial = spot is not None and len(spot) < 4500 and len(lgb_preds) >= 4500
+        if is_partial:
+            logger.warning(
+                "Spot cache is PARTIAL (%d stocks); using lgb_preds (%d) as "
+                "universe and spot as quote lookup only.",
+                len(spot), len(lgb_preds),
+            )
+            universe = [(code, spot.get(code)) for code in lgb_preds]
+        elif spot:
             universe = [(code, quote) for code, quote in spot.items()]
         else:
             universe = [(code, None) for code in lgb_preds]
