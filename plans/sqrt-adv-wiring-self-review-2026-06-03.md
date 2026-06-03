@@ -78,3 +78,36 @@ tests/test_sqrt_adv_wiring.py   | 251 ++ 12 tests, new file
 3. **Crypto cost model uses this**: `models/crypto_feature_pipeline.py`
    (Phase Crypto-B) will instantiate `CostModel(impact_model="sqrt_adv")`
    and pass it to whichever execution layer crypto uses.
+
+## Honest scope clarification — cx review round 3 (2026-06-03)
+
+cx independently reviewed this PR after merge and called out that the
+original commit title "wire sqrt_adv cost model into portfolio
+backtest + paper OMS" overstated closure. The honest scope is:
+
+**Backtest side**: a portfolio-MEAN approximation of vol + ADV + a
+uniform per-stock trade value. Not a per-stock cost attribution.
+A mixed large+small-cap portfolio will dilute small-cap impact
+through the portfolio-average ADV, so paper Sharpe may still be
+optimistic on small-cap-heavy strategies. This PR proves the wiring
+is not dead code; it does NOT promise faithful per-trade cost.
+
+**Paper OMS side**: `_compute_slippage(amount)` is now the chokepoint,
+but the four real fill sites all pass `vol=None, adv=None`. With
+the current call sites, even `cost_model=CostModel(impact_model=
+"sqrt_adv")` falls back to bare slippage_rate. Production paper is
+still effectively fixed 0.1% — by design, because we don't have
+per-fill vol/ADV plumbed in yet. The chokepoint is ready for that
+plumbing to land in a follow-up.
+
+cx round-3 findings tracked separately:
+  - P2: Paper OMS — pipe vol/ADV into the 4 fill sites + into the
+    paper_trading runner / shadow runner (Task #84).
+  - P2: Backtest — per-trade attribution by (buy, sell, weight delta,
+    per-stock ADV) instead of portfolio-mean (Task #85).
+  - P3: portfolio_value docstring — call out RMB-vs-USD-vs-USDT
+    semantics + that research scripts MUST pass explicitly (FIXED
+    in commit on `fix/sqrt-adv-cx-round3`).
+
+This honest framing is what should land in any future "sqrt_adv
+fully closed" PR title.
