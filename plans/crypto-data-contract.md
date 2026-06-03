@@ -44,6 +44,41 @@ Every crypto entrypoint MUST call
 action. Silent fallback to repo path is **forbidden** — CI lint
 rejects `data/storage/crypto/` references.
 
+## §1.5. Network Profile (ssproxy MANDATORY)
+
+Per user direction 2026-05-30: **all crypto data fetches MUST traverse
+`ssproxy`**. Direct egress to exchange / chain endpoints from the
+mainland network is not allowed. This is a network-policy invariant,
+not a "best effort" preference.
+
+Enforcement (deliverable in Phase 0b):
+
+1. **Cron wrapper**: every crypto job in `scripts/install_crontab.py`
+   is wired through `run_network_job.py --network crypto`. The
+   `crypto` profile activates ssproxy and verifies reachability of
+   the upstream endpoint before the job body runs. Failure → job
+   abort with `network_unreachable` exit; A-share cron continues
+   unaffected per the isolation invariant.
+
+2. **Collector contract**: every `data/collectors/crypto_*.py`
+   module's entrypoint calls
+   `config.crypto_network.assert_proxy_active()` as its first
+   action. The function checks an env var set by the wrapper; if
+   missing, the collector raises `RuntimeError("ssproxy not active")`
+   immediately — no silent fallback, no partial fetch.
+
+3. **Tests**: a namespace-isolation lint test asserts that no crypto
+   module performs a direct `requests`/`urllib`/`ccxt` call without
+   the wrapper env-check in front of it.
+
+Forbidden:
+- `requests.get(...exchange-url...)` directly in any crypto module
+- `ccxt.binance().fetch_ohlcv(...)` without the wrapper's env check
+- Reading from network at module-import time (must be lazy)
+
+A-share modules are not affected by this section — they continue
+using the existing `--network domestic` profile.
+
 ## §2. Symbol Identifier
 
 Single canonical form across the entire system:
