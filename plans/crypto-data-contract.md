@@ -55,17 +55,28 @@ Enforcement (deliverable in Phase 0b):
 
 1. **Cron wrapper**: every crypto job in `scripts/install_crontab.py`
    is wired through `run_network_job.py --network crypto`. The
-   `crypto` profile activates ssproxy and verifies reachability of
-   the upstream endpoint before the job body runs. Failure → job
-   abort with `network_unreachable` exit; A-share cron continues
-   unaffected per the isolation invariant.
+   `crypto` profile (added 2026-06-03 in
+   `scripts/run_network_job.py:apply_profile`) does:
+   - `_ensure_proxy()` — verifies ssproxy is listening; starts it
+     if not; aborts with `sys.exit(2)` if proxy doesn't come up
+     within 10s
+   - `_set_proxy(env)` — sets http_proxy / https_proxy / HTTP_PROXY
+     / HTTPS_PROXY / ALL_PROXY in the child env
+   - `env["CRYPTO_NETWORK_ACTIVE"] = "crypto"`
+   - `env["CRYPTO_SSPROXY_VERIFIED"] = "1"`
+
+   Failure → exit code 2 (distinct from generic profile errors); the
+   cron `run_with_status.py` wrapper marks the job failed.  A-share
+   cron continues unaffected per the isolation invariant.
 
 2. **Collector contract**: every `data/collectors/crypto_*.py`
    module's entrypoint calls
    `config.crypto_network.assert_proxy_active()` as its first
-   action. The function checks an env var set by the wrapper; if
-   missing, the collector raises `RuntimeError("ssproxy not active")`
-   immediately — no silent fallback, no partial fetch.
+   action. The function checks BOTH `CRYPTO_NETWORK_ACTIVE=="crypto"`
+   AND `CRYPTO_SSPROXY_VERIFIED` truthy; if either is missing or
+   the network value is wrong, the collector raises
+   `CryptoProxyNotActiveError` immediately — no silent fallback, no
+   partial fetch.
 
 3. **Tests**: a namespace-isolation lint test asserts that no crypto
    module performs a direct `requests`/`urllib`/`ccxt` call without
@@ -91,14 +102,20 @@ Examples:
 
 | Symbol | canonical |
 |---|---|
-| Binance BTC/USDT spot | `binance__BTC_USDT__spot` |
-| Binance BTC/USDT perp | `binance__BTC_USDT__perp` |
-| OKX BTC/USDT spot | `okx__BTC_USDT__spot` |
+| Binance BTC/USDT spot | `binance__btc_usdt__spot` |
+| Binance BTC/USDT perp | `binance__btc_usdt__perp` |
+| OKX BTC/USDT spot | `okx__btc_usdt__spot` |
 
 Rules:
 
 - venue lowercase (`binance` / `okx` / `bybit`)
-- base / quote uppercase (`BTC` / `USDT` / `ETH`)
+- base / quote **lowercase** (`btc` / `usdt` / `eth`) — chosen 2026-06-03
+  per cx code review round 4 P2 #3: implementation was already
+  lowercase and case-insensitive filesystems (macOS default) would
+  silently merge case-different paths. Anyone reading the canonical
+  out of a log MUST lowercase before constructing a parquet path /
+  dict key / report column. The `to_canonical_symbol` and
+  `to_canonical_perp_symbol` helpers do this automatically.
 - instrument_class enum: `spot` / `perp` / `future` / `option`
 - filesystem-safe by construction (no `/`, no `:`, no `@`)
 - used as parquet partition key, dict key, report column, log identifier
@@ -248,7 +265,7 @@ JSON shape (FROZEN):
     "bybit": true
   },
   "ohlcv": {
-    "binance__BTC_USDT__spot/1h": {
+    "binance__btc_usdt__spot/1h": {
       "latest_bar_ts": 1748600000000,
       "latest_bar_age_sec": 3245,
       "stale": false,
@@ -258,7 +275,7 @@ JSON shape (FROZEN):
     }
   },
   "funding": {
-    "binance__BTC_USDT__perp": {
+    "binance__btc_usdt__perp": {
       "latest_funding_ts": 1748592000000,
       "latest_funding_age_sec": 12000,
       "stale": false
@@ -266,7 +283,7 @@ JSON shape (FROZEN):
   },
   "open_interest": {},
   "cross_source": {
-    "binance__BTC_USDT__spot/1h": {
+    "binance__btc_usdt__spot/1h": {
       "primary_close": 65432.10,
       "okx_close": 65430.50,
       "bybit_close": 65433.20,

@@ -76,16 +76,47 @@ universe expansion (top-20 / top-30) is allowed. See spec §4.2."""
 
 
 # ---- Helpers (small + pure) ---------------------------------------------
+#
+# Two ticker conventions are used in the pipeline (cx code review round 4
+# P2 #2 — distinct helpers so naive `for s in spot_symbols(): fetch(s)`
+# cannot silently mismatch the collector's CCXT-form expectation):
+#
+#   - CCXT pair form (`BTC/USDT`, `BTC/USDT:USDT`) — what
+#     `data/collectors/crypto_market.py` and `crypto_derivatives.py`
+#     accept. Use these `*_symbols_ccxt()` helpers when feeding the
+#     collector layer.
+#
+#   - Binance-native ticker (`BTCUSDT`) — what the Binance REST URL path
+#     uses internally. Phase A primary venue. Use these
+#     `*_symbols_binance_native()` helpers when constructing direct
+#     Binance REST URLs (rare; CCXT handles the translation usually).
+#
+# Other venues' native ticker forms (OKX, Bybit) are the collector
+# layer's job to translate from the CCXT form.
 
-def spot_symbols(quote: str = QUOTE_CURRENCY) -> list[str]:
-    """Return the spot ticker list in the venue-native form
-    `BASEUSDT` (Binance style). Other venues that use different
-    formatting do so in their own collector layer."""
+def spot_symbols_ccxt(quote: str = QUOTE_CURRENCY) -> list[str]:
+    """CCXT spot ticker list (`BTC/USDT`-style). This is what
+    `crypto_market.fetch_recent` and `fetch_historical` accept."""
+    return [f"{base}/{quote}" for base in PHASE_A_SPOT_BASES]
+
+
+def perp_symbols_ccxt(quote: str = QUOTE_CURRENCY,
+                       settle: str | None = None) -> list[str]:
+    """CCXT perp ticker list (`BTC/USDT:USDT`-style). Settle defaults
+    to the same as quote (linear perps). This is what
+    `crypto_derivatives.fetch_funding_recent` etc. accept."""
+    if settle is None:
+        settle = quote
+    return [f"{base}/{quote}:{settle}" for base in PHASE_A_PERP_BASES]
+
+
+def spot_symbols_binance_native(quote: str = QUOTE_CURRENCY) -> list[str]:
+    """Binance-native spot ticker (`BTCUSDT`, no slash). For direct
+    REST URL construction against Binance only."""
     return [f"{base}{quote}" for base in PHASE_A_SPOT_BASES]
 
 
-def perp_symbols(quote: str = QUOTE_CURRENCY) -> list[str]:
-    """Return the perp ticker list. Binance perp is `BASEUSDT` (same as
-    spot string but different market); the venue-specific endpoint
-    selection is the collector's responsibility."""
+def perp_symbols_binance_native(quote: str = QUOTE_CURRENCY) -> list[str]:
+    """Binance-native perp ticker (`BTCUSDT`, no slash). For direct
+    REST URL construction against Binance USD-M futures only."""
     return [f"{base}{quote}" for base in PHASE_A_PERP_BASES]
