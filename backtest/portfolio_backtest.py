@@ -22,6 +22,7 @@ Usage:
     result = bt.run(predictions, price_data)
 """
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -312,6 +313,156 @@ class PortfolioBacktest:
             "trade_value": trade_value,
         }
 
+    def _per_stock_vol_adv_snapshot(
+        self, *, date, codes, returns, adv,
+    ) -> dict:
+        """Return {code: (vol, adv)} for the given codes as of `date`.
+
+        Computes the same lookback-stdev of daily returns + ADV pickup
+        as `_compute_sqrt_adv_cost_kwargs`, but PER STOCK rather than
+        averaged. Codes that lack vol or ADV are simply omitted from
+        the dict — the caller treats a missing code as "use static
+        slippage_rate" so partial coverage degrades gracefully.
+
+        cx review round 3 P2 #85: the portfolio-mean approximation
+        diluted small-cap impact in mixed-cap portfolios. Per-trade
+        attribution computes impact for each leg using its own
+        ADV / vol, then sums.
+        """
+        if adv is None:
+            return {}
+        codes = [c for c in codes if c is not None]
+        if not codes:
+            return {}
+
+        # Per-stock ADV on `date`
+        try:
+            day_adv = adv.loc[date]
+            if isinstance(day_adv, pd.DataFrame):
+                day_adv = day_adv.iloc[:, 0]
+            day_adv = day_adv.reindex(codes).dropna()
+        except Exception:
+            day_adv = pd.Series(dtype=float)
+        if day_adv.empty:
+            return {}
+
+        # Per-stock vol over the cost_vol_window window
+        try:
+            ret_dates = returns.index.get_level_values(0)
+            lookback_mask = (
+                (ret_dates <= date) &
+                (returns.index.get_level_values(1).isin(codes))
+            )
+            recent = returns.loc[lookback_mask]
+            if isinstance(recent, pd.DataFrame):
+                recent = recent.iloc[:, 0]
+            wide = recent.unstack(level=1)
+            wide = wide.iloc[-self.cost_vol_window:]
+            per_stock_vol = wide.std(axis=0).dropna()
+        except Exception:
+            per_stock_vol = pd.Series(dtype=float)
+
+        out: dict = {}
+        for code in codes:
+            v = float(per_stock_vol.get(code)) if code in per_stock_vol.index else None
+            a = float(day_adv.get(code)) if code in day_adv.index else None
+            if v is None or a is None or not (v > 0) or not (a > 0):
+                continue
+            out[code] = (v, a)
+        return out
+
+    def _per_trade_cost_dollars(
+        self,
+        *,
+        date,
+        buys,
+        sells,
+        target_weights: Optional[dict],
+        prev_weights: Optional[dict],
+        returns: pd.DataFrame,
+        adv: Optional[pd.DataFrame],
+    ) -> Optional[float]:
+        """Compute total trade cost in dollars by summing per-leg costs.
+
+        cx review round 3 P2 #85: replaces the portfolio-mean
+        approximation that diluted small-cap impact. For each buy leg
+        and each sell leg:
+
+          trade_value_leg  = portfolio_value * |weight_delta|  (optimizer)
+                              OR portfolio_value / top_k        (equal-weight)
+          slip_rate_leg    = vol_leg * sqrt(trade_value_leg / adv_leg) * coeff
+                              (per-stock vol + ADV — NOT portfolio-mean)
+          cost_leg         = trade_value_leg * (commission_rate
+                                                  + slip_rate_leg
+                                                  + impact_rate
+                                                  + stamp_tax_rate if sell)
+
+        Returns total $ cost across all legs, or None when no leg has
+        enough data (caller falls back to the portfolio-mean or static
+        path).
+
+        Behavioural notes:
+          - Only available when enable_sqrt_adv_costs AND cost_model is
+            in 'sqrt_adv' mode AND ADV data is supplied.
+          - Stocks without per-stock vol/ADV use the bare slippage_rate
+            for their leg, so partial coverage degrades to a hybrid
+            (per-trade where possible, bare elsewhere).
+        """
+        if not self.enable_sqrt_adv_costs:
+            return None
+        if adv is None or self.cost.impact_model != "sqrt_adv":
+            return None
+        if not buys and not sells:
+            return 0.0
+
+        # Per-stock vol/adv snapshot for all legs we may need
+        codes_needed = set(buys) | set(sells)
+        snap = self._per_stock_vol_adv_snapshot(
+            date=date, codes=list(codes_needed),
+            returns=returns, adv=adv,
+        )
+        if not snap and not buys and not sells:
+            return None
+
+        coeff = self.cost.impact_coefficient
+        commission_rate = self.cost.commission_rate
+        stamp_tax_rate = self.cost.stamp_tax_rate
+        impact_rate = self.cost.impact_rate
+        bare_slip = self.cost.slippage_rate
+
+        # Weights delta determines per-leg trade dollar
+        weights_d = target_weights or {}
+        prev_d = prev_weights or {}
+
+        def _leg_tv(code) -> float:
+            if weights_d or prev_d:
+                w_new = float(weights_d.get(code, 0.0))
+                w_old = float(prev_d.get(code, 0.0))
+                return self.portfolio_value * abs(w_new - w_old)
+            return self.portfolio_value / max(1, self.top_k)
+
+        def _leg_cost(code, is_sell: bool) -> float:
+            tv = _leg_tv(code)
+            if tv <= 0:
+                return 0.0
+            if code in snap:
+                v, a = snap[code]
+                ratio = min(tv / a, 1.0)
+                slip = v * math.sqrt(ratio) * coeff
+            else:
+                slip = bare_slip
+            rate = commission_rate + slip + impact_rate
+            if is_sell:
+                rate += stamp_tax_rate
+            return tv * rate
+
+        total = 0.0
+        for code in buys:
+            total += _leg_cost(code, is_sell=False)
+        for code in sells:
+            total += _leg_cost(code, is_sell=True)
+        return total
+
     def run(
         self,
         predictions: pd.DataFrame,
@@ -526,9 +677,26 @@ class PortfolioBacktest:
             forced_keep_final = prev_portfolio & cannot_sell
             target_portfolio = target_portfolio | forced_keep_final
 
-            # Compute turnover
+            # Compute turnover. Always define buys/sells (default empty)
+            # so the per-trade cost path downstream can rely on them
+            # being in scope. The turnover_override branch (used by
+            # optimizer_v2) does not produce its own buy/sell lists —
+            # in that mode, per-leg trade values come from target_weights
+            # vs prev_weights delta instead.
+            buys = set()
+            sells = set()
             if turnover_override is not None:
                 turnover = turnover_override
+                # optimizer_v2: derive buy/sell from weight delta
+                if target_weights or prev_weights:
+                    all_codes = set(target_weights or {}) | set(prev_weights or {})
+                    for code in all_codes:
+                        w_new = float((target_weights or {}).get(code, 0.0))
+                        w_old = float((prev_weights or {}).get(code, 0.0))
+                        if w_new > w_old:
+                            buys.add(code)
+                        elif w_new < w_old:
+                            sells.add(code)
             elif prev_portfolio:
                 sells = prev_portfolio - target_portfolio
                 buys = target_portfolio - prev_portfolio
@@ -585,20 +753,35 @@ class PortfolioBacktest:
             else:
                 raw_ret = 0.0
 
-            # Cost: proportional to turnover.
-            # When sqrt_adv is enabled AND we have ADV data AND we can
-            # estimate per-stock daily volatility from the returns history,
-            # compute the cost rate using the sqrt-of-fraction-of-ADV
-            # impact model. Otherwise fall back to the static round-trip
-            # rate (backward compatible).
-            cost_kwargs = self._compute_sqrt_adv_cost_kwargs(
+            # Cost: prefer per-trade attribution (cx round 3 P2 #85) over
+            # the portfolio-mean approximation. The per-trade path sums
+            # each buy/sell leg's own (vol_i × sqrt(tv_i / adv_i)) cost,
+            # so a small-cap leg's impact is not diluted by mixing in
+            # mega-cap ADV. If per-trade data is unavailable (sqrt_adv
+            # disabled, no ADV, or no legs), fall back to the prior
+            # portfolio-mean × turnover formula (which itself falls back
+            # to the static round-trip rate when even that data is
+            # missing — three-level graceful degradation).
+            per_trade_dollars = self._per_trade_cost_dollars(
                 date=date,
-                target_portfolio=target_portfolio,
+                buys=buys,
+                sells=sells,
+                target_weights=target_weights if self.mode == "optimizer_v2" else None,
+                prev_weights=prev_weights if self.mode == "optimizer_v2" else None,
                 returns=returns,
                 adv=adv,
-                turnover=turnover,
             )
-            cost_rate = self.cost.round_trip_rate(**cost_kwargs) * turnover
+            if per_trade_dollars is not None:
+                cost_rate = per_trade_dollars / max(self.portfolio_value, 1e-9)
+            else:
+                cost_kwargs = self._compute_sqrt_adv_cost_kwargs(
+                    date=date,
+                    target_portfolio=target_portfolio,
+                    returns=returns,
+                    adv=adv,
+                    turnover=turnover,
+                )
+                cost_rate = self.cost.round_trip_rate(**cost_kwargs) * turnover
             net_ret = raw_ret - cost_rate
 
             daily_pnl_raw.append(raw_ret)
