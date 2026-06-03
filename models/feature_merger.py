@@ -554,68 +554,46 @@ class FeatureMerger:
         return result
 
     def _load_macro(self, index: pd.MultiIndex) -> pd.DataFrame:
-        """Load macro features — DIMENSION-PRESERVING zero baseline.
+        """Load macro features.
 
-        2026-06-03 revised: previously returned None which dropped 10
-        macro_* columns from the supplementary frame entirely. The
-        XGBModel trained 6-02 18:39 INCLUDING macro features then saw
-        a feature matrix missing those 10 columns at predict time,
-        biasing every prediction toward negative (production incident:
-        22:00 evening_outlook pushed ZERO recommendations).
+        DISABLED 2026-06-03 — macro features are dropped from training
+        until daily as-of macro data is available.
 
-        New behaviour: return a frame with the SAME macro_* column
-        names that the trained model expects, populated with ZEROS.
-        This is:
-          - dimension-preserving (model receives 84 supp columns again)
-          - PIT-safe (zeros leak no future information)
-          - re-train-friendly (the next train_lgb learns macro_* as
-            constant-zero, so post-retrain inference doesn't depend
-            on macro at all and can drop them later)
+        Reason (cx code review round 3 P1): the previous implementation
+        loaded macro_features.parquet (currently a single-row snapshot of
+        the LATEST values), took df.iloc[-1], and broadcast that snapshot
+        to every historical (date, stock) row in the training index. Every
+        training row therefore saw the LATEST macro values, not the macro
+        values that were actually known at that row's prediction time.
+        That is look-ahead bias — the training data leaked future state.
 
-        Look-ahead bias from the OLD `df.iloc[-1]` broadcast is
-        eliminated. The model has access to 10 always-zero columns
-        instead of 10 LATEST-value columns.
+        config/data_availability.py already tagged this source as
+        pit_safe_level="unsafe". The previous "impact is small because
+        macro changes slowly" rationalisation is not acceptable for a
+        training input: any consistent broadcast of future values can be
+        learned by the model as a spurious shortcut.
 
-        When daily as-of macro data lands, replace the zero-frame with
-        the asof-joined values via the re-enable contract:
-          1. macro_features.parquet has daily rows + an `available_date` column
-          2. asof merge available_date <= trade_date
-          3. PIT audit test asserts no future leak
+        To re-enable safely a future PR must:
+          1. Produce macro_features.parquet as a daily time series with
+             an `available_date` column (T+1 publication conservatism).
+          2. Replace the broadcast with an asof merge on available_date
+             vs the training index trade_date.
+          3. Re-add a PIT audit test that asserts each training row's
+             macro_* values are drawn from on-or-before `available_date`.
+
+        Until then this method returns None, the call site in
+        merge_for_training treats None as "no macro frame", and no
+        macro_* columns are present in the training/cache features.
         """
-        path = self.data_dir / "macro_features.parquet"
-        if not path.exists():
-            return None
-
-        try:
-            df = pd.read_parquet(path)
-            if df.empty:
-                return None
-            factor_cols = [c for c in df.columns
-                           if c not in ("date", "collected_at")]
-            if not factor_cols:
-                return None
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Macro parquet load failed: %s", e)
-            return None
-
-        # Single warn-once per session
+        # Single warn-once per session to keep cron logs quiet but visible.
         if not getattr(FeatureMerger, "_macro_drop_warned", False):
             logger.warning(
-                "macro features DIMENSION-PRESERVED as zero baseline "
-                "(PIT look-ahead drop, but column shape kept so "
-                "model.predict does not silently bias). See "
+                "macro features DROPPED from training until daily as-of "
+                "data is available (PIT look-ahead protection). See "
                 "models/feature_merger.py:_load_macro for re-enable contract."
             )
             FeatureMerger._macro_drop_warned = True
-
-        # All-zero frame with the same macro_* column names the model
-        # was trained on.
-        macro_cols = [f"macro_{c}" for c in factor_cols]
-        return pd.DataFrame(
-            np.zeros((len(index), len(macro_cols)), dtype=np.float32),
-            index=index,
-            columns=macro_cols,
-        )
+        return None
 
     def _load_shareholder(self, index: pd.MultiIndex) -> pd.DataFrame:
         """Load shareholder features."""
