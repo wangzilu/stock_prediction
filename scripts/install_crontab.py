@@ -206,9 +206,15 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("factor_decay_monitor", "49 18 * * 1-5",
                 [py, str(scripts / "monitor_factor_decay.py")], "factor_decay.log",
                 network="none", timeout_sec=600),
+        # brinson_attribution: timeout bumped 600 → 1200 (Task #76).
+        # The window itself is a fixed 29 days (run_brinson_attribution.py
+        # line 53), but Alpha158 dataset preparation has grown past 600s on
+        # the current universe — 06-02 took 417s, 06-03 exceeded 600s and
+        # was killed by the wrapper. 1200s gives a 2x headroom and still
+        # finishes long before the 22:00 evening_outlook gate.
         CronJob("brinson_attribution", "50 18 * * 1-5",
                 [py, str(scripts / "run_brinson_attribution.py")], "brinson_attribution.log",
-                network="none", timeout_sec=600),
+                network="none", timeout_sec=1200),
         # --- LLM 429 retry queue drain (after main pipeline + evening) ---
         # Deliberately NOT enforce_deps. This is a recovery job — gating it
         # on the main pipeline's success would defeat its purpose when the
