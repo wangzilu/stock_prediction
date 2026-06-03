@@ -1327,16 +1327,40 @@ class DailyPipeline:
         return self.index_predictor.format_segment_predictions(segments, title=title), records
 
     def _build_intraday_buy_candidates(self, lgb_preds: dict, limit: int = 10) -> list[dict]:
-        """Build 14:30 strong-buy candidates from model scores plus live tape."""
+        """Build 14:30 strong-buy candidates from model scores plus live tape.
+
+        cx code review 2026-06-04 P1 #4/#5: previously filtered
+        `expected <= 0` and labelled `强烈推荐` only when
+        `short_score >= 0.04`. On bearish all-negative days (and given
+        the standing 158-vs-242 inference mismatch — raw scores often
+        in [-0.03, 0.03]), every candidate was filtered out and even
+        relative-best ones never reached the 0.04 absolute threshold.
+        Switch to relative ranking: keep all candidates, label by
+        cross-sectional rank percentile.
+        """
         spot = self._spot_lookup()
         sanitizer = self._make_sanitizer(require_quote=True)
         rows = []
+
+        # cx P0: partial spot must not serve as universe. When spot is
+        # partial (< 4500) and lgb_preds is healthy (>= 4500), prefer
+        # the LGB universe.
+        is_partial = spot and len(spot) < 4500 and len(lgb_preds) >= 4500
+        if is_partial:
+            logger.warning(
+                "intraday: spot is PARTIAL (%d); intersecting with lgb_preds "
+                "(%d) for candidate iteration.",
+                len(spot), len(lgb_preds),
+            )
+
         for code, score in lgb_preds.items():
             short_score = _finite_float(score)
-            # 2026-06-03 P0: do NOT filter on `short_score <= 0`. Per cx code review of the 22:00 0-recommendation incident, the trained model (242 features) is fed only 158 features at inference (no merge_for_inference call in models/short_term.py), so XGBoost follows the missing-value default branch on 84 cols, producing a narrow leaf-set whose sign on any given day is roughly coin-flip. Filtering `<= 0` silently swallows half the days. Rank order is the right signal; let the sort downstream pick top-K.
 
-            quote = spot.get(code)
+            quote = spot.get(code) if spot else None
             if quote is None:
+                # On partial-spot days, missing quote is expected for
+                # most lgb_preds. Skip silently — sanitizer log_summary
+                # below records the count.
                 continue
             ok, _reason = sanitizer.check(code, str(quote.get("名称", "")), quote=quote)
             if not ok:
@@ -1353,8 +1377,8 @@ class DailyPipeline:
                     "has_lgb": True,
                 }
             )
-            if expected <= 0:
-                continue
+            # cx P1 #4: do NOT filter `expected <= 0` here either —
+            # rank-best is the right signal on bearish-model days.
 
             strength = round(
                 short_score * 0.70
@@ -1371,20 +1395,32 @@ class DailyPipeline:
                     "expected_change_pct": expected,
                     "model_score": short_score,
                     "strength": strength,
-                    "label": "强烈推荐" if expected >= 1.0 and short_score >= 0.04 else "重点关注",
+                    "_rank_score": short_score,  # cross-sectional rank key
                 }
             )
 
         sanitizer.log_summary(label="intraday_buy_candidates")
-        return sorted(
-            rows,
-            key=lambda item: (
-                item["label"] == "强烈推荐",
-                item["expected_change_pct"],
-                item["strength"],
-            ),
-            reverse=True,
-        )[:limit]
+
+        # cx P1 #5: rank-based label instead of absolute >= 0.04
+        # threshold. Top-N% of THE DAY'S surviving candidates earn
+        # `强烈推荐` regardless of raw score sign.
+        rows.sort(key=lambda r: r["_rank_score"], reverse=True)
+        n = len(rows)
+        if n == 0:
+            return []
+        strong_cutoff = max(1, n // 5)  # top 20% labelled strong
+        all_negative = all(r["model_score"] <= 0 for r in rows)
+        for i, item in enumerate(rows):
+            if i < strong_cutoff and not all_negative:
+                item["label"] = "强烈推荐"
+            elif i < strong_cutoff and all_negative:
+                # Bearish defensive: keep label conservative
+                item["label"] = "相对优选(防御)"
+            else:
+                item["label"] = "重点关注"
+            item.pop("_rank_score", None)
+
+        return rows[:limit]
 
     def _format_intraday_buy_candidates(self, buy_items: list[dict]) -> str:
         """Format 14:30 buy candidates."""
@@ -1435,9 +1471,23 @@ class DailyPipeline:
             if gain_pct <= -STOP_LOSS_PCT:
                 reasons.append(f"止损触发，跌{abs(gain_pct):.1f}%")
 
-            lgb_score = _finite_float(lgb_preds.get(code, 0))
-            if lgb_score < LGB_FLIP_THRESHOLD:
-                reasons.append(f"短线模型翻空，模型分{lgb_score:.3f}")
+            # cx code review 2026-06-04 P1 #6: differentiate "model
+            # has no coverage for this code" from "model says bearish".
+            # Previously `lgb_preds.get(code, 0)` defaulted missing
+            # codes to 0, which (a) silently skipped the flip-check
+            # AND (b) on a future threshold change could classify a
+            # missing-code as 翻空. Now: skip the flip-check entirely
+            # when the code is not in lgb_preds, surfacing the gap
+            # explicitly in the audit log.
+            if code in lgb_preds:
+                lgb_score = _finite_float(lgb_preds.get(code))
+                if lgb_score < LGB_FLIP_THRESHOLD:
+                    reasons.append(f"短线模型翻空，模型分{lgb_score:.3f}")
+            else:
+                logger.info(
+                    "sell-check: %s missing from lgb_preds — flip check skipped",
+                    code,
+                )
 
             if reasons:
                 sell_items.append(

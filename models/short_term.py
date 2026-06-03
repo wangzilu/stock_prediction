@@ -137,6 +137,21 @@ class ShortTermModel:
         latest.index = latest["_instrument"]
         latest = latest[~latest.index.duplicated(keep="last")]
         selected_dates = latest["_datetime"].copy()
+
+        # cx code review 2026-06-04 P1 #7: do NOT mix per-stock stale
+        # predictions into the production output. Previously the
+        # groupby+tail(1) silently used an OLDER day's prediction
+        # for any stock whose latest date had no finite prediction,
+        # contaminating the production score set with stale signal.
+        # Drop stale rows here; record the count in attrs so the cron
+        # health gate can surface the gap explicitly.
+        latest_ts = pd.Timestamp(latest_date)
+        stale_mask = selected_dates < latest_ts
+        n_stale = int(stale_mask.sum())
+        if n_stale:
+            latest = latest.loc[~stale_mask]
+            selected_dates = selected_dates.loc[~stale_mask]
+
         latest = latest[["score"]]
         if latest.empty:
             raise RuntimeError("Qlib model produced no finite latest-date predictions")
