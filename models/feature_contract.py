@@ -49,10 +49,27 @@ class FeatureContractViolation(RuntimeError):
     from the same broken shape."""
 
 
-CONTRACT_FILENAME = "production_feature_contract.json"
+# 2026-06-04 cx round 22 P0-1: contract filename moved to the
+# profile-aware helper in config.production_features. The legacy
+# constant stays only as the SYMLINK target so callers that still
+# read ``production_feature_contract.json`` see the active profile's
+# contract (via the legacy alias maintained by train_lgb).
+CONTRACT_FILENAME = "production_feature_contract.json"  # legacy symlink target
 
 
-def contract_path(data_dir: Path) -> Path:
+def contract_path(data_dir: Path, profile: str | None = None) -> Path:
+    """Path to the contract artifact for ``profile``.
+
+    Pre-fix this returned the legacy single filename regardless of
+    profile, so training xgb_174 would overwrite the 242 contract.
+    Now resolves to ``production_feature_contract_{profile}.json``.
+    """
+    from config.production_features import production_contract_filename
+    return Path(data_dir) / production_contract_filename(profile)
+
+
+def legacy_contract_path(data_dir: Path) -> Path:
+    """Legacy ``production_feature_contract.json`` alias (symlink)."""
     return Path(data_dir) / CONTRACT_FILENAME
 
 
@@ -65,6 +82,7 @@ def write_contract(
     supplementary_count: int,
     production_groups: Iterable[str],
     booster_num_features: int | None = None,
+    profile: str | None = None,
 ) -> Path:
     """Atomically write the production feature contract.
 
@@ -114,30 +132,60 @@ def write_contract(
         "supplementary_count": int(supplementary_count),
         "production_groups": list(production_groups),
         "features": features,
+        "profile": (profile or "").strip().lower(),  # cx round 22 P0-1
         # cx round 2: write a flag so ``verify_inference_dataset``
         # knows this artifact has real-name granularity in the supp
         # segment (older / placeholder-Alpha158 artifacts can still be
         # loaded but with reduced strictness on the alpha segment).
         "schema_version": 2,
     }
-    out = contract_path(data_dir)
+    out = contract_path(data_dir, profile)
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(out.suffix + ".tmp")
     tmp.write_text(json.dumps(contract, ensure_ascii=False, indent=2))
     tmp.replace(out)
-    logger.info("Wrote feature contract: %s (%d features, schema v2)",
-                out, expected)
+
+    # cx round 22 P0-1: maintain the legacy symlink so consumers that
+    # still read ``production_feature_contract.json`` see the active
+    # profile's contract. Use atomic flip via .tmp + os.replace.
+    import os as _os
+    legacy = legacy_contract_path(data_dir)
+    tmp_link = legacy.with_suffix(legacy.suffix + ".symlink.tmp")
+    try:
+        if tmp_link.exists() or tmp_link.is_symlink():
+            tmp_link.unlink()
+        _os.symlink(out.name, tmp_link)
+        _os.replace(tmp_link, legacy)
+    except OSError as link_exc:
+        import shutil
+        shutil.copy2(out, legacy)
+        logger.warning("Contract symlink unsupported (%s); copied instead", link_exc)
+
+    logger.info("Wrote feature contract: %s (%d features, schema v2, profile=%s)",
+                out, expected, contract["profile"] or "<unset>")
     return out
 
 
-def load_contract(data_dir: Path) -> dict | None:
+def load_contract(data_dir: Path, profile: str | None = None) -> dict | None:
     """Return the parsed contract dict, or None if the artifact does
     not exist. Callers should treat None as "no gate yet — log and
     continue" rather than as a fatal error, because there is a
     bootstrap window between the first deploy of this module and the
     first retrain that writes a contract."""
-    path = contract_path(data_dir)
+    path = contract_path(data_dir, profile)
     if not path.exists():
+        # Fall back to the legacy single-file location for back-compat
+        # during migration. After train_lgb runs once with the new
+        # writer, the profile-specific contract exists and this fallback
+        # is no longer hit.
+        legacy = legacy_contract_path(data_dir)
+        if legacy.exists():
+            logger.warning(
+                "load_contract: profile contract %s missing; using legacy %s. "
+                "Re-run scripts/train_lgb.py to populate the profile contract.",
+                path.name, legacy.name,
+            )
+            return json.loads(legacy.read_text())
         return None
     return json.loads(path.read_text())
 

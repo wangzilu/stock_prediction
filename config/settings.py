@@ -55,7 +55,16 @@ LGB_CACHE_MAX_AGE_DAYS = int(os.environ.get("LGB_CACHE_MAX_AGE_DAYS", "1"))
 
 # Model paths
 RL_MODEL_PATH = DATA_DIR / "rl_model.pt"
-LGB_MODEL_PATH = DATA_DIR / "lgb_model.pkl"
+# 2026-06-04 cx round 10 Option B: LGB_MODEL_PATH now resolves through
+# the profile machinery. The active profile's binary lives at
+# ``data/storage/lgb_model_{profile}.pkl``. A legacy symlink at
+# ``lgb_model.pkl`` points to the active profile so any caller that
+# still hardcodes the legacy filename keeps working during migration.
+def _resolve_lgb_model_path():
+    from config.production_features import production_model_filename
+    return DATA_DIR / production_model_filename()
+LGB_MODEL_PATH = _resolve_lgb_model_path()
+LGB_LEGACY_MODEL_PATH = DATA_DIR / "lgb_model.pkl"  # legacy alias / symlink target
 LGB_PREDICTION_CACHE_PATH = DATA_DIR / "lgb_latest_predictions.json"
 MID_MODEL_PATH = DATA_DIR / "mid_model.pt"
 OVERNIGHT_STOCK_SNAPSHOT_PATH = DATA_DIR / "overnight_stock_forecasts.json"

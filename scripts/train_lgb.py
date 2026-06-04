@@ -26,8 +26,19 @@ from scripts.check_qlib_data_health import check_qlib_dir
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "storage")
 QLIB_DATA = QLIB_PROVIDER_URI
-MODEL_PATH = os.path.join(DATA_DIR, "lgb_model.pkl")
-DATASET_PATH = os.path.join(DATA_DIR, "lgb_dataset.pkl")
+# 2026-06-04 cx round 10 Option B: profile-aware. The profile's
+# binary lives at lgb_model_{profile}.pkl; a legacy symlink at
+# lgb_model.pkl points to the active profile after every successful
+# train.
+from config.production_features import (
+    production_model_filename as _prod_model_fname,
+    LEGACY_MODEL_FILENAME as _LEGACY_FNAME,
+)
+MODEL_PATH = os.path.join(DATA_DIR, _prod_model_fname())
+LEGACY_MODEL_PATH = os.path.join(DATA_DIR, _LEGACY_FNAME)
+DATASET_PATH = os.path.join(
+    DATA_DIR, f"lgb_dataset_{_prod_model_fname().rsplit('.pkl', 1)[0].split('lgb_model_', 1)[-1]}.pkl"
+)  # cx round 10 Option B: profile-specific dataset cache too
 
 
 def _prediction_score_series(predictions) -> pd.Series:
@@ -400,22 +411,22 @@ def main():
     # --- Evaluate: RankIC on test set + compare with previous ---
     train_report = _evaluate_and_compare(pred, dataset, stats)
 
-    # 2026-06-04 cx round 8 P1-7 + round 10 (2): contract must be
-    # written BEFORE the model artifact is replaced. Pre-fix the
-    # order was:
-    #   1. _save_artifacts_atomically(model, ...)
-    #   2. try write_contract; except: print "non-fatal"
-    # which meant a model could land in production with NO matching
-    # contract — the next inference cycle would then either (a) hit
-    # the OLD contract's NAME gate (now stricter, would refuse) or
-    # (b) hit a count-only path under a stale contract.
-    # New order:
-    #   1. Write contract to a TEMP path
-    #   2. Atomic-promote BOTH (model.pkl, contract.json) together
-    # so a failed contract write rolls the whole step back.
-    from models.feature_contract import write_contract, contract_path
-    _contract_tmp = contract_path(Path(DATA_DIR)).with_suffix(
-        ".pretrain.tmp.json"
+    # 2026-06-04 cx round 8 P1-7 + round 10 + round 24 cleanup:
+    # contract is written BEFORE the model artifact is replaced. If
+    # the contract write fails, we abort — the model file is NOT
+    # touched so the existing production model and existing contract
+    # remain in sync.
+    # The original "two-phase atomic promote" comment was aspirational;
+    # current behavior is: profile-specific contract is written
+    # atomically (write_contract uses .tmp + os.replace internally),
+    # THEN the model is atomically saved by _save_artifacts_atomically.
+    # If the process dies between contract-write and model-save, the
+    # next train detects the orphan contract via model_pkl_path
+    # comparison and rewrites.
+    from models.feature_contract import (
+        write_contract,
+        contract_path,
+        legacy_contract_path,
     )
     try:
         # write_contract writes to its canonical path; we redirect
@@ -429,6 +440,7 @@ def main():
         # we passed supp_cols only, so the contract validator
         # ``alpha158_count + supplementary_count == n_features`` failed
         # with 158+3=161 vs n_features=174. Now pass supp+custom.
+        # cx round 22 P0-1: contract path is profile-aware.
         non_alpha_count = int(supp_cols or 0) + int(custom_cols or 0)
         write_contract(
             Path(DATA_DIR),
@@ -437,6 +449,7 @@ def main():
             alpha158_count=158,
             supplementary_count=non_alpha_count,
             production_groups=PRODUCTION_SUPPLEMENTARY_GROUPS,
+            profile=PRODUCTION_MODEL_PROFILE,
         )
     except Exception as contract_exc:
         # Contract write failed — model artifact NOT yet touched.
@@ -452,15 +465,49 @@ def main():
     _save_artifacts_atomically(model, dataset)
     print(f"Model saved to {MODEL_PATH}")
 
+    # cx round 10 Option B + round 22 P1-2: atomically flip the legacy
+    # ``lgb_model.pkl`` symlink to point at the just-trained binary.
+    # Pre-fix used ``os.remove`` + ``os.symlink`` which has a race
+    # window where lgb_model.pkl doesn't exist — any concurrent
+    # ShortTermModel.load_from_pickle() reader would crash. Now uses
+    # ``os.replace(tmp_link, dst)`` which IS atomic on POSIX.
+    def _atomic_symlink(target: str, link_path: str) -> None:
+        tmp = link_path + ".symlink.tmp"
+        try:
+            if os.path.lexists(tmp):
+                os.remove(tmp)
+            os.symlink(target, tmp)
+            os.replace(tmp, link_path)  # atomic
+        except OSError as link_exc:
+            # symlink not supported (rare). Fall back to a copy + atomic
+            # replace via .tmp so legacy_path is never absent.
+            import shutil
+            tmp_copy = link_path + ".copy.tmp"
+            shutil.copy2(target if os.path.isabs(target) else os.path.join(
+                os.path.dirname(link_path), target), tmp_copy)
+            os.replace(tmp_copy, link_path)
+            print(f"WARNING: symlink unsupported ({link_exc}); fell back to "
+                  f"atomic copy. Reads from lgb_model.pkl will lag retrains "
+                  f"until this is fixed.")
+
+    _atomic_symlink(os.path.basename(MODEL_PATH), LEGACY_MODEL_PATH)
+    print(f"Legacy model alias updated atomically: "
+          f"{LEGACY_MODEL_PATH} → {os.path.basename(MODEL_PATH)}")
+
     # Save feature contract to experiment artifact
+    # 2026-06-04 cx round 23 P1-2: model_name + feature_set now come
+    # from PRODUCTION_MODEL_PROFILE + n_features. Pre-fix they were
+    # hard-coded as "xgb_174"/"FS-174", so a 242 retrain would
+    # register itself as champion=xgb_174 — the registry lied about
+    # what was actually deployed.
     try:
         from tracker.artifact_contract import ExperimentArtifact
-        exp_id = f"train_lgb_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        exp_id = f"train_lgb_{PRODUCTION_MODEL_PROFILE}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         art = ExperimentArtifact.create(
             experiment_id=exp_id,
-            model_name="xgb_174",
-            feature_set="FS-174",
-            description="Production LGB training run",
+            model_name=PRODUCTION_MODEL_PROFILE,
+            feature_set=f"FS-{n_features}",
+            description=f"Production LGB training run (profile={PRODUCTION_MODEL_PROFILE})",
             # Per code-review P2 2026-05-31: this used to be
             #   feature_cols if 'feature_cols' in dir() else []
             # but `feature_cols` was never defined → always [], artifact
@@ -482,16 +529,18 @@ def main():
         print(f"Artifact save failed (non-fatal): {e}")
 
     # Update registry — keep production artifact path in sync with research
+    # cx round 23 P1-2: registry name is the active profile, not a literal.
     try:
         from models.registry import ModelRegistry
         reg = ModelRegistry()
-        reg.register("xgb_174", role="champion", feature_set="FS-174",
+        reg.register(PRODUCTION_MODEL_PROFILE, role="champion",
+                      feature_set=f"FS-{n_features}",
                       model_path=MODEL_PATH, n_features=n_features,
                       train_start=train_start, train_end=train_end,
                       metrics={"rank_ic": train_report.get("rank_ic"),
                                "prediction_count": stats.get("latest_finite_prediction_count", 0),
                                "train_date": datetime.now().strftime("%Y-%m-%d")})
-        print("Registry updated: champion=xgb_174")
+        print(f"Registry updated: champion={PRODUCTION_MODEL_PROFILE}")
     except Exception as e:
         print(f"Registry update failed (non-fatal): {e}")
 

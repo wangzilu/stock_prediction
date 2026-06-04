@@ -176,6 +176,63 @@ PROFILE_EXPECTED_COUNTS: dict[str, dict[str, int]] = {
 }
 
 
+# 2026-06-04 cx round 10 Option B: profile-aware model file naming.
+# Pre-fix every profile wrote to the same ``lgb_model.pkl`` so a
+# retrain at one profile overwrote another profile's deployable
+# binary (that's how the 5-23 weekly retrain destroyed xgb_174).
+# Now: each profile lives at ``lgb_model_{profile}.pkl``. A legacy
+# symlink ``lgb_model.pkl`` points at the currently-active profile
+# so any hardcoded paths in tests / monitoring scripts keep working
+# during migration.
+LEGACY_MODEL_FILENAME: str = "lgb_model.pkl"
+
+
+def production_model_filename(profile: str | None = None) -> str:
+    """Filename (NOT path) for the production model of ``profile``.
+
+    Args:
+        profile: profile name. None → PRODUCTION_MODEL_PROFILE.
+
+    Returns:
+        e.g. ``"lgb_model_xgb_242.pkl"`` / ``"lgb_model_xgb_174.pkl"``.
+
+    Raises:
+        RuntimeError: when ``profile`` is not a known profile.
+    """
+    p = (profile or PRODUCTION_MODEL_PROFILE).strip().lower()
+    if p not in SUPPLEMENTARY_GROUPS_BY_PROFILE:
+        raise RuntimeError(
+            f"Unknown profile {p!r}. Allowed: "
+            f"{list(SUPPLEMENTARY_GROUPS_BY_PROFILE)}"
+        )
+    return f"lgb_model_{p}.pkl"
+
+
+LEGACY_CONTRACT_FILENAME: str = "production_feature_contract.json"
+
+
+def production_contract_filename(profile: str | None = None) -> str:
+    """Filename (NOT path) for the contract artifact of ``profile``.
+
+    2026-06-04 cx round 22 P0-1: model files were split per profile in
+    the Option B refactor, but ``production_feature_contract.json``
+    stayed single — training xgb_174 would overwrite the 242 contract
+    even though the 242 model binary still existed alongside the new
+    174 binary. Now both ARE profile-specific:
+        production_feature_contract_xgb_242.json
+        production_feature_contract_xgb_174.json
+    The legacy ``production_feature_contract.json`` filename is
+    maintained as a symlink to the active profile's contract.
+    """
+    p = (profile or PRODUCTION_MODEL_PROFILE).strip().lower()
+    if p not in SUPPLEMENTARY_GROUPS_BY_PROFILE:
+        raise RuntimeError(
+            f"Unknown profile {p!r}. Allowed: "
+            f"{list(SUPPLEMENTARY_GROUPS_BY_PROFILE)}"
+        )
+    return f"production_feature_contract_{p}.json"
+
+
 def assert_profile_dimensions(
     *, alpha_count: int, supp_count: int, custom_count: int,
     profile: str | None = None,

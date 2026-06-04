@@ -289,7 +289,20 @@ class ShortTermModel:
         from datetime import datetime, timedelta
         from config.settings import DATA_DIR
 
-        model_path = model_path or str(DATA_DIR / "lgb_model.pkl")
+        # cx round 10 Option B: profile-aware default. When the caller
+        # doesn't override, load the active profile's binary directly
+        # (lgb_model_xgb_242.pkl / lgb_model_xgb_174.pkl). The legacy
+        # ``lgb_model.pkl`` symlink keeps any hardcoded callers working.
+        if model_path is None:
+            from config.production_features import production_model_filename
+            profile_filename = production_model_filename()
+            preferred = DATA_DIR / profile_filename
+            if preferred.exists():
+                model_path = str(preferred)
+            else:
+                # Fall back to legacy alias (might be a symlink to the
+                # active profile, or the pre-migration single-file).
+                model_path = str(DATA_DIR / "lgb_model.pkl")
 
         instance = cls()
         instance.initialize()
