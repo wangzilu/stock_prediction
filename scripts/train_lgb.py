@@ -369,6 +369,29 @@ def main():
     _save_artifacts_atomically(model, dataset)
     print(f"Model saved to {MODEL_PATH}")
 
+    # cx round 2 P1-3: write the production feature contract artifact
+    # alongside the model. ``models.feature_contract.load_contract``
+    # reads this at every inference (via ShortTermModel.load_from_pickle)
+    # and refuses to serve when supp segment NAMES drift, not just
+    # when the COUNT drifts. ``feature_cols`` is the actual list the
+    # handler produced after PRODUCTION_SUPPLEMENTARY_GROUPS injection.
+    try:
+        from models.feature_contract import write_contract
+        write_contract(
+            Path(DATA_DIR),
+            model_pkl_path=str(MODEL_PATH),
+            feature_names=list(feature_cols),
+            alpha158_count=158,
+            supplementary_count=int(supp_cols),
+            production_groups=PRODUCTION_SUPPLEMENTARY_GROUPS,
+        )
+    except Exception as contract_exc:
+        # Train succeeded; failing to write the contract is a soft
+        # signal (next inference will COUNT-gate only) but should not
+        # roll back the model. Log loudly so the on-call notices.
+        print(f"Feature contract write FAILED (non-fatal but please "
+              f"investigate): {contract_exc}")
+
     # Save feature contract to experiment artifact
     try:
         from tracker.artifact_contract import ExperimentArtifact

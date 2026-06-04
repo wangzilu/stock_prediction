@@ -16,13 +16,14 @@ from config.settings import (
 from config.watchlist import WATCHLIST_STOCK
 
 
-class FeatureContractViolation(RuntimeError):
-    """Raised when the loaded XGBModel's feature count does NOT match
-    the inference dataset's column count. cx code review 2026-06-04 P0-d:
-    scheduler MUST NOT silently fall back to the cached predictions on
-    this error — that's how the 2026-06-03 22:00 0-recommendation
-    incident reached the user. Hard-fail instead so the cron wrapper
-    marks the job failed (red) and the on-call gets a real alert."""
+# Re-export so existing callers keep working.
+# Canonical definition lives in models.feature_contract because
+# cx round 2 P1-3 makes the artifact a real gate (not just a report).
+from models.feature_contract import (
+    FeatureContractViolation,
+    load_contract,
+    verify_inference_dataset,
+)
 
 
 class ShortTermModel:
@@ -391,6 +392,30 @@ class ShortTermModel:
                 f"incident). Retrain or wire supplementary "
                 f"injection."
             )
+
+        # cx round 2 P1-3 / P1-4: real-name gate against the
+        # production contract artifact. Catches loader-reorder /
+        # silent column swap drift that the count gate above misses.
+        # If the artifact is absent (fresh deploy, never trained), we
+        # log a warning and skip; once train_lgb runs once with the
+        # contract-write step the gate is fully active.
+        from pathlib import Path as _P
+        _data_dir = _P(__file__).resolve().parents[1] / "data" / "storage"
+        contract = load_contract(_data_dir)
+        if contract is None:
+            print("[short_term] no production feature contract artifact "
+                  "(expected at data/storage/production_feature_contract.json). "
+                  "Run scripts/train_lgb.py or scripts/export_feature_contract.py "
+                  "to populate. Inference proceeds with COUNT-only gate.")
+        else:
+            actual_names = [
+                col[1] if isinstance(col, tuple) else str(col)
+                for col in _xtest.columns.tolist()
+            ]
+            verify_inference_dataset(contract, actual_names)
+            print(f"[short_term] feature contract verified "
+                  f"({len(actual_names)} cols, schema v"
+                  f"{contract.get('schema_version', 1)})")
 
         return instance
 
