@@ -961,14 +961,40 @@ class DailyPipeline:
                 "cache coverage and LGB prediction freshness."
             )
 
+        # cx round 7 P0-1: stamp a defensive_only flag onto the
+        # snapshot whenever ALL items have non-positive model_score OR
+        # the LGB distribution_health is non-GREEN. Morning recommendation
+        # reads this flag and refuses to re-promote the snapshot's
+        # stocks as buyable candidates — pre-fix, the 22:00 "仅观察"
+        # warning was text-only and the 9:20 reader happily fed every
+        # snapshot stock back into SignalScorer as positive candidates.
+        _lgb_status_snap = getattr(self, "_lgb_status", {}) or {}
+        _dist_health = str(_lgb_status_snap.get("distribution_health", "GREEN")).upper()
+        defensive_only = bool(
+            items and all(
+                _finite_float(it.get("model_score", 0)) <= 0 for it in items
+            )
+        ) or _dist_health in ("YELLOW", "RED")
         payload = {
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "source_date": datetime.now().strftime("%Y-%m-%d"),
             "target_date": target_date,
-            "lgb_status": getattr(self, "_lgb_status", {}),
+            "lgb_status": _lgb_status_snap,
+            "lgb_distribution_health": _dist_health,
+            "defensive_only": defensive_only,
             "groups": forecast_groups,
             "items": items,
         }
+        if defensive_only:
+            logger.warning(
+                "Overnight snapshot marked defensive_only=True "
+                "(dist_health=%s, all_nonpos=%s). Morning recommendation "
+                "must NOT promote snapshot stocks as buyable candidates.",
+                _dist_health,
+                items and all(
+                    _finite_float(it.get("model_score", 0)) <= 0 for it in items
+                ),
+            )
         try:
             path = OVERNIGHT_STOCK_SNAPSHOT_PATH
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -1175,7 +1201,26 @@ class DailyPipeline:
         *,
         stock_macro: float,
     ) -> list[dict]:
-        """Convert a persisted 22:00 stock snapshot into morning candidates."""
+        """Convert a persisted 22:00 stock snapshot into morning candidates.
+
+        2026-06-04 cx round 7 P0-1: respect the snapshot's
+        ``defensive_only`` flag. When True (set by the writer when the
+        previous evening had all-negative model scores OR a non-GREEN
+        LGB distribution), the snapshot's items are observation-only
+        and MUST NOT enter the morning candidate pool. Pre-fix the
+        morning reader unconditionally promoted every snapshot stock
+        through SignalScorer, so the "仅观察" text was visible to the
+        user at night and then quietly re-emerged as buy-able the
+        next morning.
+        """
+        if snapshot.get("defensive_only"):
+            logger.warning(
+                "Overnight snapshot is defensive_only — skipping snapshot "
+                "candidate promotion. Morning recommendation will rely on "
+                "live signals only (lgb_distribution_health=%s).",
+                snapshot.get("lgb_distribution_health", "unknown"),
+            )
+            return []
         candidates = []
         sanitizer = self._make_sanitizer(require_quote=False)
         for item in snapshot.get("items", []):
@@ -2217,10 +2262,17 @@ class DailyPipeline:
         # by the time we get here, status is either GREEN or YELLOW.
         lgb_pool = [c for c in candidates if c.get("has_lgb")]
         n = len(lgb_pool)
-        # config.settings.HIGH_THRESHOLD is 0.7 in production; pick a
-        # cap just under so 强烈看多 cannot fire on YELLOW days.
-        from config.settings import HIGH_THRESHOLD as _HIGH_THR
-        _YELLOW_RANK_CAP = round(_HIGH_THR - 0.05, 4)
+        # cx round 7 P1-3 correction: YELLOW must cap below
+        # MID_THRESHOLD (0.3) too, otherwise the top decile still
+        # registers as "看多". A YELLOW distribution day means we
+        # don't trust the prediction signal enough to flag ANY stock
+        # as bullish — they all collapse to 观望 with a small ranking
+        # spread for downstream tie-breakers.
+        from config.settings import (
+            HIGH_THRESHOLD as _HIGH_THR,
+            MID_THRESHOLD as _MID_THR,
+        )
+        _YELLOW_RANK_CAP = round(_MID_THR - 0.05, 4)
         lgb_distribution_status = (
             getattr(self, "_lgb_status", {}).get("distribution_health", "GREEN")
         )

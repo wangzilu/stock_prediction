@@ -594,19 +594,36 @@ class PaperOMS:
         predictions = self.load_predictions()
         if not predictions:
             return None
+        # 2026-06-04 cx round 7 P1-6: previously this caught any
+        # sanitizer error and returned the UNFILTERED predictions —
+        # paper would then trade ST / new / suspended / 一字板 /
+        # high-crash-risk stocks that the production recommendation
+        # path explicitly excludes. The opposite of what "safety
+        # filter" means. Fail-closed instead: sanitizer error → no
+        # trade this cycle.
         try:
             from factors.candidate_sanitizer import CandidateSanitizer
             sanitizer = CandidateSanitizer(today=date, require_quote=False)
-            filtered = {}
+        except Exception as e:
+            logger.error(
+                "Paper OMS CandidateSanitizer import/init failed: %s — "
+                "refusing to trade unfiltered.", e,
+            )
+            return None
+        filtered = {}
+        try:
             for code, score in predictions.items():
                 ok, _reason = sanitizer.check(code, None)
                 if ok:
                     filtered[code] = score
             sanitizer.log_summary(label=f"paper_oms[{date}]")
-            return filtered or None
         except Exception as e:
-            logger.warning(f"  Candidate sanitizer failed (continuing unfiltered): {e}")
-            return predictions or None
+            logger.error(
+                "Paper OMS sanitizer.check raised: %s — refusing to "
+                "trade unfiltered predictions.", e,
+            )
+            return None
+        return filtered or None
 
     def _load_crash_predictions(self, date: str) -> dict | None:
         """Try to load crash predictions from crash_predictions_latest.json.
