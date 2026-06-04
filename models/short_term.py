@@ -336,41 +336,61 @@ class ShortTermModel:
         # booster's predict() walks default-direction branches on
         # the missing 84 cols → predictions cluster around a single
         # leaf and on bearish days every stock ends up negative.
-        try:
-            from models.feature_merger import FeatureMerger
-            handler = instance._dataset.handler
-            merger = FeatureMerger()
-            n_supp = merger.inject_supplementary_into_handler(
-                handler, preprocess=False,
+        #
+        # 2026-06-04 cx round 2 P0-2 follow-up: previously this block
+        # was wrapped in try/except Exception with a "non-fatal" print,
+        # i.e. inference would proceed with whatever partial supp was
+        # injected (or none) and the next dim check would catch — or
+        # not catch — the resulting skew. The "non-fatal" framing was
+        # also factually wrong: missing supp on a 242-trained model is
+        # the precise mechanism of the 22:00 0-rec incident. Failure
+        # MUST propagate so the outer scheduler hard-fails.
+        from models.feature_merger import FeatureMerger
+        from config.production_features import (
+            PRODUCTION_SUPPLEMENTARY_GROUPS,
+        )
+        handler = instance._dataset.handler
+        merger = FeatureMerger()
+        n_supp = merger.inject_supplementary_into_handler(
+            handler, preprocess=False,
+            groups=PRODUCTION_SUPPLEMENTARY_GROUPS,
+        )
+        print(f"[short_term] injected {n_supp} supplementary cols at inference")
+        if n_supp == 0:
+            raise FeatureContractViolation(
+                "[short_term] inject_supplementary_into_handler returned 0 "
+                "columns at inference. The 242-dim production champion "
+                "would silently degrade to 158-dim default-leaf "
+                "predictions. Refusing to serve."
             )
-            print(f"[short_term] injected {n_supp} supplementary cols at inference")
-        except Exception as e:  # noqa: BLE001
-            print(f"[short_term] supplementary injection failed (non-fatal): {e}")
 
         # Sanity gate: booster feature count must match the prepared
         # feature matrix width, or predictions are silent garbage.
-        try:
-            from qlib.data.dataset.handler import DataHandlerLP as _DK
-            _xtest = instance._dataset.prepare(
-                "test", col_set="feature", data_key=_DK.DK_I,
+        # The outer try is now ONLY around qlib's dataset.prepare —
+        # if that itself blows up we want a clear contract violation,
+        # not a silent skip.
+        from qlib.data.dataset.handler import DataHandlerLP as _DK
+        _xtest = instance._dataset.prepare(
+            "test", col_set="feature", data_key=_DK.DK_I,
+        )
+        _booster = getattr(instance._model, "model", None)
+        if _booster is None or not hasattr(_booster, "num_features"):
+            raise FeatureContractViolation(
+                "[short_term] loaded model has no inspectable booster "
+                "(num_features missing). Cannot verify the 242-dim "
+                "contract; refusing to serve."
             )
-            _booster = getattr(instance._model, "model", None)
-            if _booster is not None and hasattr(_booster, "num_features"):
-                booster_n = int(_booster.num_features())
-                dataset_n = int(_xtest.shape[1])
-                if booster_n != dataset_n:
-                    raise FeatureContractViolation(
-                        f"[short_term] FATAL: trained model expects "
-                        f"{booster_n} features but inference dataset has "
-                        f"{dataset_n}. Predictions would be silent "
-                        f"default-leaf garbage (cx review 2026-06-03 "
-                        f"incident). Retrain or wire supplementary "
-                        f"injection."
-                    )
-        except FeatureContractViolation:
-            raise
-        except Exception as _e:  # noqa: BLE001
-            print(f"[short_term] dim sanity gate skipped: {_e}")
+        booster_n = int(_booster.num_features())
+        dataset_n = int(_xtest.shape[1])
+        if booster_n != dataset_n:
+            raise FeatureContractViolation(
+                f"[short_term] FATAL: trained model expects "
+                f"{booster_n} features but inference dataset has "
+                f"{dataset_n}. Predictions would be silent "
+                f"default-leaf garbage (cx review 2026-06-03 "
+                f"incident). Retrain or wire supplementary "
+                f"injection."
+            )
 
         return instance
 

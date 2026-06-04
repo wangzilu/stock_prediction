@@ -168,7 +168,7 @@ class DailyPipeline:
 
     def _write_lgb_distribution_health(self, preds: dict, *,
                                           latest_date: str = "",
-                                          stale_count: int = 0) -> None:
+                                          stale_count: int = 0) -> str:
         """Per-day LGB prediction-distribution health JSON.
 
         Path: data/storage/lgb_distribution_health/{YYYY-MM-DD}.json
@@ -187,20 +187,21 @@ class DailyPipeline:
             stale_prediction_count > 10% of total
           - GREEN: positive_ratio >= 10% AND fresh
 
-        cx P1 follow-up: the morning_recommendation + sell_check
-        consumers should refuse to operate when status==RED and emit
-        an explicit alert instead of silently producing 0 candidates.
+        2026-06-04 cx round 2 P1-5: now returns the computed status
+        string so the caller can refuse to publish on RED. Empty
+        ``preds`` returns "RED" — there is nothing to publish AND
+        the absence itself is the alarm.
         """
         import json as _json
         from datetime import datetime as _dt
 
         if not preds:
-            return
+            return "RED"
         values = [float(v) for v in preds.values()
                   if v is not None and v == v]  # NaN filter
         n = len(values)
         if n == 0:
-            return
+            return "RED"
         n_pos = sum(1 for v in values if v > 0)
         n_neg = sum(1 for v in values if v < 0)
         n_zero = sum(1 for v in values if v == 0)
@@ -251,6 +252,7 @@ class DailyPipeline:
                 "LGB distribution health GREEN: pos=%d/%d (%.1f%%)",
                 n_pos, n, pos_ratio * 100,
             )
+        return status
 
     def _load_lgb_predictions(self):
         """Load LGB model and get latest predictions for all stocks."""
@@ -308,39 +310,58 @@ class DailyPipeline:
                     len(finite_preds),
                 )
 
+            # 2026-06-04 cx round 2 P1-5: write distribution health FIRST
+            # and refuse to publish (cache/in-memory) if status==RED.
+            # Pre-fix, the chain was:
+            #     write_prediction_cache(...)       # cache pollutes downstream
+            #     _write_lgb_distribution_health(...) # RED only logged
+            # which let an all-negative / all-zero day still feed
+            # morning_recommendation + sell_check via cache.
+            latest_date = getattr(model, "latest_prediction_date", "")
+            stale_count = int(
+                model._dataset.handler._infer.attrs.get(
+                    "stale_prediction_count", 0,
+                )
+            ) if hasattr(model, "_dataset") else 0
+            health_status = self._write_lgb_distribution_health(
+                finite_preds,
+                latest_date=latest_date,
+                stale_count=stale_count,
+            )
+            if health_status == "RED":
+                # Do NOT populate cache, do NOT set _lgb_predictions to
+                # the bad values. Surface the failure so the cron
+                # wrapper marks the job RED and the user gets a real
+                # alert instead of silent garbage.
+                raise FeatureContractViolation(
+                    f"LGB distribution health RED on {latest_date}: "
+                    f"refusing to publish {len(finite_preds)} predictions "
+                    f"(all-negative or all-zero pattern matches "
+                    f"the 2026-06-03 incident signature). "
+                    f"Re-run training / investigate before retry."
+                )
+
             self._lgb_predictions = finite_preds
             self._lgb_status = {
                 "status": "ok",
                 "count": len(self._lgb_predictions),
                 "min_required": LGB_MIN_PREDICTIONS,
                 "source": "live",
-                "latest_date": getattr(model, "latest_prediction_date", ""),
+                "latest_date": latest_date,
                 "error": "",
+                "distribution_health": health_status,
             }
             try:
                 write_prediction_cache(
                     self._lgb_predictions,
-                    latest_date=getattr(model, "latest_prediction_date", ""),
+                    latest_date=latest_date,
                     model_path=str(LGB_MODEL_PATH),
                     source="scheduler_live",
                 )
             except Exception as cache_exc:
                 logger.warning("Failed to update LGB prediction cache: %s", cache_exc)
-            logger.info(f"Loaded LGB predictions for {len(self._lgb_predictions)} stocks")
-            # cx P1: write per-day distribution health so an
-            # all-negative / all-zero / stale-heavy day shows up as
-            # RED in the dashboard rather than being silently consumed.
-            try:
-                self._write_lgb_distribution_health(
-                    self._lgb_predictions,
-                    latest_date=getattr(model, "latest_prediction_date", ""),
-                    stale_count=int(model._dataset.handler._infer.attrs.get(
-                        "stale_prediction_count", 0,
-                    )) if hasattr(model, "_dataset") else 0,
-                )
-            except Exception as health_exc:  # noqa: BLE001
-                logger.warning("LGB distribution-health write failed: %s",
-                                health_exc)
+            logger.info(f"Loaded LGB predictions for {len(self._lgb_predictions)} stocks "
+                        f"(distribution_health={health_status})")
         except FeatureContractViolation:
             # 2026-06-04 cx P0 round 2: explicit re-raise. Previously
             # the inner ``except FeatureContractViolation: raise`` was

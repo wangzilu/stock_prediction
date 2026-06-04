@@ -132,3 +132,114 @@ def test_train_lgb_raises_when_supp_cols_zero():
         "P0-2 gate phrase missing — when inject returns 0 cols, "
         "train_lgb must raise RuntimeError before model.fit()."
     )
+
+
+# -----------------------------------------------------------------------------
+# P1-5: distribution_health RED must block cache write, not just log
+# -----------------------------------------------------------------------------
+
+def test_distribution_health_returns_red_on_all_negative():
+    """All-negative predictions match the 22:00 incident signature.
+    The health writer must return 'RED' so the caller can refuse to
+    publish."""
+    from scheduler.jobs import DailyPipeline
+    pipeline = DailyPipeline()
+    all_negative = {f"SH{i:06d}": -0.001 * (i + 1) for i in range(50)}
+    status = pipeline._write_lgb_distribution_health(
+        all_negative, latest_date="2026-06-04",
+    )
+    assert status == "RED", (
+        f"all-negative predictions must classify RED, got {status}"
+    )
+
+
+def test_distribution_health_returns_red_on_empty():
+    """No predictions at all is the strongest signal something is
+    wrong — must classify RED, not silently no-op."""
+    from scheduler.jobs import DailyPipeline
+    pipeline = DailyPipeline()
+    status = pipeline._write_lgb_distribution_health(
+        {}, latest_date="2026-06-04",
+    )
+    assert status == "RED"
+
+
+def test_distribution_health_returns_green_on_balanced():
+    """Mixed positive/negative with healthy positive_ratio is GREEN."""
+    from scheduler.jobs import DailyPipeline
+    pipeline = DailyPipeline()
+    balanced = {
+        f"SH{i:06d}": (1 if i % 2 == 0 else -1) * 0.01 * (i + 1)
+        for i in range(100)
+    }
+    status = pipeline._write_lgb_distribution_health(
+        balanced, latest_date="2026-06-04",
+    )
+    assert status == "GREEN"
+
+
+def test_load_lgb_predictions_blocks_cache_on_red_distribution():
+    """End-to-end pin for P1-5: when the freshly-computed predictions
+    are all-negative (RED), _load_lgb_predictions must raise BEFORE
+    write_prediction_cache is invoked. Pre-fix, the cache was written
+    first and only THEN distribution_health logged RED — leaving the
+    downstream chain to consume the bad cache."""
+    from scheduler.jobs import DailyPipeline
+    from models.short_term import FeatureContractViolation
+
+    pipeline = DailyPipeline()
+    if hasattr(pipeline, "_lgb_predictions"):
+        delattr(pipeline, "_lgb_predictions")
+
+    fake_model = type("FakeModel", (), {
+        "predict_batch": lambda self_: {
+            f"SH{i:06d}": -0.001 * (i + 1) for i in range(5000)
+        },
+        "latest_prediction_date": "2026-06-04",
+    })()
+
+    cache_write_called = []
+
+    def _spy_write_cache(*args, **kwargs):
+        cache_write_called.append(True)
+
+    with patch(
+        "models.short_term.ShortTermModel.load_from_pickle",
+        return_value=fake_model,
+    ), patch(
+        "models.lgb_cache.write_prediction_cache",
+        side_effect=_spy_write_cache,
+    ):
+        with pytest.raises(FeatureContractViolation,
+                           match="distribution health RED"):
+            pipeline._load_lgb_predictions()
+
+    assert cache_write_called == [], (
+        "write_prediction_cache must NOT be called when distribution "
+        "is RED. P1-5 reorder regressed: cache is being polluted before "
+        "the health gate fires."
+    )
+
+
+# -----------------------------------------------------------------------------
+# Inference-side fail-closed (short_term.load_from_pickle)
+# -----------------------------------------------------------------------------
+
+SHORT_TERM = (PROJECT_ROOT / "models" / "short_term.py").read_text()
+
+
+def test_short_term_inference_inject_not_in_try_except():
+    """Inference-side twin of the train_lgb P0-2 fix. Pre-fix the
+    inject call was in try/except Exception with a print and a
+    "(non-fatal)" framing, which let the booster predict() walk on
+    158-only inputs against a 242-dim model — the precise 6-3 22:00
+    mechanism. Pin: that exact phrasing is gone, replaced by an
+    explicit raise."""
+    assert "supplementary injection failed (non-fatal)" not in SHORT_TERM, (
+        "models/short_term.py still has the 'non-fatal' silent-fallback "
+        "print. Inference will silently degrade to 158-dim default-leaf."
+    )
+    assert "Refusing to serve" in SHORT_TERM, (
+        "models/short_term.py missing the explicit refuse-to-serve "
+        "phrase that signals an inject failure raises."
+    )
