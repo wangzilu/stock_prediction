@@ -169,8 +169,14 @@ def main():
     # orders against an old signal. For live paper trading, that's the same
     # silent-degradation pattern as the ST-leak / frozen-state bugs — looks
     # successful while quietly bad. Hard-abort unless the user passes --force-stale.
+    # cx round 9 P0-2: require the prediction's recorded latest_date
+    # to be at least the expected most-recent trading date, not just
+    # that the smoke job exited green. Pre-fix, a same-day re-run of
+    # smoke against yesterday's qlib data would write success=True
+    # latest_date=yesterday and is_fresh() would say yes — paper would
+    # then trade on yesterday's signals against today's market.
     from scheduler.data_health import is_fresh
-    pred_fresh = is_fresh("lgb_after_close_smoke")
+    pred_fresh = is_fresh("lgb_after_close_smoke", require_latest_date=True)
     if not pred_fresh:
         if not getattr(args, "force_stale", False):
             logger.error(

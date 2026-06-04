@@ -83,23 +83,75 @@ def read_health(source: str, date: str = None) -> dict:
         return json.load(f)
 
 
-def is_fresh(source: str, date: str = None) -> bool:
+def _expected_latest_trading_date(date: str | None = None) -> str:
+    """Return the expected most-recent trading date for ``date`` (or now).
+
+    Uses pandas business-day approximation. cx round 9 P1-5 notes this
+    does not cover CN holidays / 调休 correctly — a follow-up should
+    consult the Qlib calendar / exchange holiday source. For now this
+    matches the existing ``--check-today`` semantics in
+    ``scripts/update_qlib_data.py``, so the freshness gate behaves
+    consistently with the freshness check that produced the artifact.
+    """
+    import pandas as _pd
+    today = date or datetime.now().strftime("%Y-%m-%d")
+    recent_bdays = _pd.bdate_range(end=today, periods=3)
+    return str(recent_bdays[-1].date())
+
+
+def is_fresh(
+    source: str,
+    date: str | None = None,
+    *,
+    require_latest_date: str | bool | None = None,
+) -> bool:
     """Check if a data source has fresh data for today.
 
     Returns True if:
     - Health file exists for today
     - success == True
     - partial == False
+    - if require_latest_date is provided, the recorded
+      ``latest_date`` is >= that target (string ``YYYY-MM-DD``).
+      Passing ``True`` substitutes the expected most-recent trading
+      date (today or last business day per
+      ``_expected_latest_trading_date``).
+
+    2026-06-04 cx round 9 P0-1: pre-fix this only checked
+    success/partial. A source could publish ``success=True,
+    latest_date=2026-06-03`` on 2026-06-04 and downstream gates would
+    treat it as today's data. ``lgb_after_close_smoke`` health and
+    paper trading's freshness gate were both affected — that is how
+    "all-green status board but stale signals" reached the user.
     """
     h = read_health(source, date)
     if not h:
         return False
-    return h.get("success", False) and not h.get("partial", False)
+    if not (h.get("success", False) and not h.get("partial", False)):
+        return False
+    if require_latest_date is None:
+        return True
+    expected = (
+        _expected_latest_trading_date(date)
+        if require_latest_date is True
+        else str(require_latest_date)
+    )
+    recorded = str(h.get("latest_date") or "")
+    if not recorded:
+        logger.warning(
+            "is_fresh(%s): success=True but latest_date is empty — "
+            "treating as stale (expected >= %s)",
+            source, expected,
+        )
+        return False
+    return recorded >= expected
 
 
 def check_freshness(
     required_sources: list[str],
     date: str = None,
+    *,
+    require_latest_date: str | bool | None = None,
 ) -> dict:
     """Check freshness of multiple sources.
 
@@ -110,8 +162,17 @@ def check_freshness(
             "stale": ["source2", ...],
             "missing": ["source3", ...],
         }
+
+    ``require_latest_date`` is forwarded to ``is_fresh`` for every
+    source — pass ``True`` to demand each source's recorded
+    ``latest_date`` matches the expected most-recent trading date.
     """
     date = date or datetime.now().strftime("%Y-%m-%d")
+    expected_for_log = (
+        _expected_latest_trading_date(date)
+        if require_latest_date is True
+        else require_latest_date
+    )
     fresh = []
     stale = []
     missing = []
@@ -120,10 +181,21 @@ def check_freshness(
         h = read_health(source, date)
         if not h:
             missing.append(source)
-        elif h.get("success") and not h.get("partial"):
-            fresh.append(source)
-        else:
+            continue
+        if not (h.get("success") and not h.get("partial")):
             stale.append(source)
+            continue
+        if require_latest_date is not None:
+            expected = (
+                _expected_latest_trading_date(date)
+                if require_latest_date is True
+                else str(require_latest_date)
+            )
+            recorded = str(h.get("latest_date") or "")
+            if not recorded or recorded < expected:
+                stale.append(source)
+                continue
+        fresh.append(source)
 
     return {
         "all_fresh": len(stale) == 0 and len(missing) == 0,
@@ -131,6 +203,7 @@ def check_freshness(
         "stale": stale,
         "missing": missing,
         "date": date,
+        "expected_latest_date": expected_for_log,
     }
 
 
@@ -193,16 +266,25 @@ def check_training_gate(date: str = None) -> dict:
     """Check if it's safe to train/predict today.
 
     Returns {"gate": "pass"|"fail"|"degrade", "details": ...}
+
+    cx round 9 P0-1: critical sources are now checked against the
+    expected latest-trading-date too, not just success=True. A
+    "qlib_data_update success=True latest_date=yesterday" record is
+    no longer treated as fresh enough to train on.
     """
-    result = check_freshness(CRITICAL_SOURCES, date)
+    result = check_freshness(CRITICAL_SOURCES, date, require_latest_date=True)
     if not result["all_fresh"]:
         return {
             "gate": "fail",
-            "reason": f"Critical sources stale/missing: {result['stale'] + result['missing']}",
+            "reason": (
+                f"Critical sources stale/missing: "
+                f"{result['stale'] + result['missing']} "
+                f"(expected latest_date >= {result.get('expected_latest_date')})"
+            ),
             "details": result,
         }
 
-    overlay_result = check_freshness(OVERLAY_SOURCES, date)
+    overlay_result = check_freshness(OVERLAY_SOURCES, date, require_latest_date=True)
     if not overlay_result["all_fresh"]:
         return {
             "gate": "degrade",

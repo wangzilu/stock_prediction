@@ -582,7 +582,25 @@ class DailyPipeline:
         recommendations: list,
         per_bucket: int = HORIZON_BUCKET_SIZE,
     ) -> dict[str, list]:
-        """Build disjoint short/mid/long stock recommendation buckets."""
+        """Build disjoint short/mid/long stock recommendation buckets.
+
+        2026-06-04 cx round 7 P1-4: each bucket now enforces a
+        bucket-specific positivity gate. Pre-fix, a stock that earned
+        ``signal="看多"`` via the SHORT-term signal alone got dumped
+        into the 中线 and 长线 buckets too even when its
+        mid_term_score / long-score formula was 0 (no actual
+        mid/long signal). The result: 中线 / 长线 buckets were
+        padded with short-term-only stocks, misrepresenting the
+        horizon classification.
+        Guards:
+          - 短线: short_term_score > 0
+          - 中线: mid_term_score > 0 (i.e. a real mid signal exists)
+          - 长线: long_score (0.7*final + 0.3*macro) > 0
+        These are independent of and STRICTER than the upstream
+        signal-contains-多 filter (signal=看多 only requires final
+        score > MID_THRESHOLD = 0.3, not the horizon-specific
+        sub-score positivity).
+        """
         bullish = self._stock_recommendations_only(recommendations)
         selected: set[str] = set()
         groups: dict[str, list] = {"短线": [], "中线": [], "长线": []}
@@ -601,12 +619,17 @@ class DailyPipeline:
                 break
             if rec.code in selected:
                 continue
+            short_score = _finite_float(getattr(rec, "short_term_score", 0))
+            if short_score <= 0:
+                # Bullish signal but short_term_score not positive — skip
+                # so 短线 only contains stocks with a real short-term lift.
+                continue
             next_day = getattr(rec, "next_day_change_pct", None)
             groups["短线"].append(
                 replace(
                     rec,
                     horizon="短线",
-                    horizon_score=_finite_float(getattr(rec, "short_term_score", 0)),
+                    horizon_score=short_score,
                     next_day_change_pct=next_day,
                 )
             )
@@ -625,35 +648,35 @@ class DailyPipeline:
                 break
             if rec.code in selected:
                 continue
-            score = _finite_float(getattr(rec, "mid_term_score", 0))
-            if score <= 0:
-                score = _finite_float(getattr(rec, "final_score", 0))
-            groups["中线"].append(replace(rec, horizon="中线", horizon_score=score))
+            mid_score = _finite_float(getattr(rec, "mid_term_score", 0))
+            if mid_score <= 0:
+                # No real mid-term signal — refuse to pad the 中线
+                # bucket with stocks that only earned 看多 via short-term.
+                continue
+            groups["中线"].append(replace(rec, horizon="中线", horizon_score=mid_score))
             selected.add(rec.code)
 
         # Sentiment weight zeroed: SnowNLP has no backtest evidence.
         # Redistributed to final_score (model signal).
         # Will re-enable with validated contrarian overlay after 60d accumulation.
-        long_ranked = sorted(
-            bullish,
-            key=lambda rec: (
+        def _long_score(rec) -> float:
+            return (
                 _finite_float(getattr(rec, "final_score", 0)) * 0.70
                 + _finite_float(getattr(rec, "macro_score", 0)) * 0.30
                 + _finite_float(getattr(rec, "sentiment_score", 0)) * 0.00
-            ),
-            reverse=True,
-        )
+            )
+
+        long_ranked = sorted(bullish, key=_long_score, reverse=True)
         for rec in long_ranked:
             if len(groups["长线"]) >= per_bucket:
                 break
             if rec.code in selected:
                 continue
-            score = (
-                _finite_float(getattr(rec, "final_score", 0)) * 0.70
-                + _finite_float(getattr(rec, "macro_score", 0)) * 0.30
-                + _finite_float(getattr(rec, "sentiment_score", 0)) * 0.00
-            )
-            groups["长线"].append(replace(rec, horizon="长线", horizon_score=round(score, 2)))
+            long_score = _long_score(rec)
+            if long_score <= 0:
+                # Long score formula non-positive — refuse to pad.
+                continue
+            groups["长线"].append(replace(rec, horizon="长线", horizon_score=round(long_score, 2)))
             selected.add(rec.code)
 
         return groups
@@ -1037,6 +1060,44 @@ class DailyPipeline:
 
         if datetime.now() - created_at > timedelta(days=4):
             logger.info("Ignoring stale overnight stock snapshot created_at=%s", created_at)
+            return None
+
+        # cx round 9 P1-6: verify the snapshot's internal LGB
+        # latest_date is consistent with the target_date. Pre-fix the
+        # snapshot's outer target_date could be 2026-06-05 while
+        # lgb_status.latest_date = 2026-06-03 (an old smoke result the
+        # 22:00 job picked up) and the 9:20 reader would happily
+        # accept it. The snapshot is only valid when the underlying
+        # signal date is within ONE trading day of the target.
+        lgb_status_inner = payload.get("lgb_status") or {}
+        lgb_latest_date = str(lgb_status_inner.get("latest_date") or "")
+        if not lgb_latest_date:
+            logger.warning(
+                "Ignoring overnight snapshot target_date=%s: lgb_status.latest_date "
+                "missing — cannot verify signal freshness.",
+                target_date,
+            )
+            return None
+        try:
+            target_dt = datetime.strptime(target_date[:10], "%Y-%m-%d")
+            lgb_dt = datetime.strptime(lgb_latest_date[:10], "%Y-%m-%d")
+        except ValueError:
+            logger.warning(
+                "Ignoring overnight snapshot: unparseable dates "
+                "target=%s lgb_latest=%s",
+                target_date, lgb_latest_date,
+            )
+            return None
+        # Allow up to 5 calendar days slack — covers weekends + the
+        # 1-day-behind nature of after-close inference. Anything older
+        # is treated as a stale-signal snapshot.
+        signal_age_days = (target_dt - lgb_dt).days
+        if signal_age_days < 0 or signal_age_days > 5:
+            logger.warning(
+                "Ignoring overnight snapshot target_date=%s with "
+                "lgb_status.latest_date=%s (%d-day gap outside [0,5])",
+                target_date, lgb_latest_date, signal_age_days,
+            )
             return None
 
         items = payload.get("items")
@@ -2353,10 +2414,40 @@ class DailyPipeline:
         top_recs = self._flatten_horizon_recommendations(horizon_groups)
 
         if not top_recs and recommendations:
-            # Fallback: if horizon classification filtered everything,
-            # use top 5 by final_score directly
-            logger.warning(f"Horizon classification produced 0 recs from {len(recommendations)} candidates — using top 5 by score")
-            top_recs = sorted(recommendations, key=lambda r: r.final_score, reverse=True)[:5]
+            # 2026-06-04 cx round 7 P1-5: pre-fix fallback was
+            # ``top 5 by final_score`` with NO signal / threshold guard,
+            # so even 观望 or weakly-negative recommendations could be
+            # surfaced as the "top 5" on a day where horizon
+            # classification correctly produced nothing. Now respect
+            # the same signal-contains-多 filter as bullish (i.e. only
+            # surface stocks the scorer actually labelled 看多 /
+            # 强烈看多), AND require final_score > MID_THRESHOLD so the
+            # fallback cannot fire on a wholly-bearish day. If the
+            # filtered fallback also yields zero, leave top_recs empty
+            # and let the report state "暂无满足条件" rather than
+            # fabricate recommendations.
+            from config.settings import MID_THRESHOLD as _MID_THR
+            qualified = [
+                r for r in recommendations
+                if "多" in str(getattr(r, "signal", ""))
+                and _finite_float(getattr(r, "final_score", 0)) > _MID_THR
+            ]
+            qualified.sort(key=lambda r: _finite_float(getattr(r, "final_score", 0)),
+                            reverse=True)
+            if qualified:
+                top_recs = qualified[:5]
+                logger.warning(
+                    "Horizon classification produced 0 recs from %d candidates — "
+                    "fallback yielded %d qualified (signal=多 + final_score>%.2f)",
+                    len(recommendations), len(qualified), _MID_THR,
+                )
+            else:
+                logger.warning(
+                    "Horizon classification produced 0 recs from %d candidates — "
+                    "fallback signal/threshold gate also empty. Leaving recommendation "
+                    "list empty rather than fabricating 5 picks.",
+                    len(recommendations),
+                )
 
         # Fetch global market data for report. Crypto path quarantined
         # behind LEGACY_MARKET_CONTEXT_ENABLED — when off (default), the
