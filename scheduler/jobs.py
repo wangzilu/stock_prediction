@@ -1710,14 +1710,52 @@ class DailyPipeline:
             )
         return "\n".join(lines)
 
+    def _fallback_rec_price(self, code: str, rec: dict) -> float:
+        """Best-effort recommendation-day close for the sell-check
+        fallback (cx round 5 P2-9). Tries Qlib daily $close on the
+        recommendation date; returns 0 on any failure."""
+        rec_date = str(rec.get("date") or "")[:10]
+        if not rec_date:
+            return 0.0
+        try:
+            from qlib.data import D
+            df = D.features([code.lower()], ["$close"],
+                            start_time=rec_date, end_time=rec_date)
+            if df is None or df.empty:
+                return 0.0
+            return float(df.iloc[-1, 0])
+        except Exception:
+            return 0.0
+
     def _build_sell_items(self, recent_recs: list[dict], lgb_preds: dict) -> list[dict]:
-        """Build mandatory sell items from recent recommendation records."""
+        """Build mandatory sell items from recent recommendation records.
+
+        2026-06-04 cx round 5 P2-9: pre-fix a missing/zero
+        ``price_at_rec`` silently caused the record to skip the
+        TP/SL check forever — that's a hidden silent-no-sell bug.
+        Now: when price_at_rec is missing, try the recommendation
+        day's close from Qlib as a fallback (mirrors what
+        tracker/verifier does). If neither is available, emit a
+        loud warning and STILL skip — but the warning means the
+        record is visible to the on-call.
+        """
         sell_items = []
         for rec in recent_recs:
             code = rec["code"]
             rec_price = rec.get("price_at_rec")
             if not rec_price or rec_price <= 0:
-                continue
+                # Fallback: look up the recommendation-day close via
+                # qlib. The verifier uses this exact path.
+                fallback_price = self._fallback_rec_price(code, rec)
+                if not fallback_price or fallback_price <= 0:
+                    logger.warning(
+                        "sell-check skipping %s: price_at_rec missing AND "
+                        "fallback close lookup failed (rec=%s). On-call: "
+                        "check recommendation pipeline.",
+                        code, rec.get("date", "?"),
+                    )
+                    continue
+                rec_price = fallback_price
 
             try:
                 market = next((m for c, n, m in WATCHLIST if c == code), MARKET_STOCK)
@@ -1770,17 +1808,26 @@ class DailyPipeline:
         return sorted(sell_items, key=lambda item: abs(item["gain_pct"]), reverse=True)
 
     def _format_intraday_sell_items(self, sell_items: list[dict]) -> str:
-        """Format mandatory sell list for the 14:30 report."""
-        lines = ["三、历史推荐必卖清单"]
+        """Format the 14:30 sell-alert list for prior recommendations.
+
+        2026-06-04 cx round 5 P2-8: title was "历史推荐必卖清单" but
+        the underlying source is only ``verifier.get_recent_recommendations``
+        — it does NOT cover paper holdings or any holdings the user
+        bought outside the recommendation list. "必卖" is too strong
+        a verb for a partial coverage source. Rename + adjust copy
+        to "历史推荐止盈/止损提醒" so users understand the scope is
+        the recommendation history, not all positions.
+        """
+        lines = ["三、历史推荐止盈/止损提醒（仅覆盖推荐记录，不含其他持仓）"]
         if not sell_items:
-            lines.append("暂无必须卖出的历史推荐，已有持仓继续按止盈/止损线观察。")
+            lines.append("暂无满足止盈/止损触发的历史推荐。已有持仓请继续按止盈/止损线观察。")
             return "\n".join(lines)
 
         for i, item in enumerate(sell_items, 1):
             gain = item["gain_pct"]
             sign = "+" if gain >= 0 else ""
             lines.append(
-                f"{i}. 必须卖出：{item['name']}({item['code'][-6:]})，"
+                f"{i}. 建议卖出：{item['name']}({item['code'][-6:]})，"
                 f"推荐日{item['rec_date']}，当前收益{sign}{gain:.1f}%，"
                 f"现价{item['current_price']:.2f}"
             )

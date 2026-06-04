@@ -76,6 +76,18 @@ class TurnoverConstrainedOptimizer:
         # Clean scores
         scores = alpha_scores.dropna().sort_values(ascending=False)
 
+        # 2026-06-04 cx round 5 P1-2: drop ``cannot_buy`` BEFORE
+        # picking top-K. Pre-fix the optimizer ignored the blacklist
+        # and a downstream paper filter (paper/oms.py:724) caught
+        # most cases, but the optimizer contract was broken — any
+        # other caller (backtest, research) would still buy the
+        # blacklisted names. Fix at the source.
+        if constraints and constraints.cannot_buy:
+            scores = scores.drop(
+                index=[s for s in constraints.cannot_buy if s in scores.index],
+                errors="ignore",
+            )
+
         # Step 1: Select candidate universe (top-K by score)
         candidates = scores.head(self.top_k)
 

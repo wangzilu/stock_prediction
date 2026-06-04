@@ -88,13 +88,18 @@ def main():
     parser.add_argument("--capital", type=float, default=1_000_000)
     parser.add_argument("--force-stale", action="store_true",
                         help="Run even if prediction freshness check fails (default: abort)")
-    # cx round 3 P2 #84 follow-up: sqrt_adv activation knobs
+    # cx round 5 P1-4 (2026-06-04): default flipped from "fixed" to
+    # "sqrt_adv". The fixed-rate path was pre-fix behaviour preserved
+    # for compatibility, but production cron should use the
+    # Almgren-Chriss path so reported PnL reflects real-world
+    # market-impact costs. Set --impact-model=fixed explicitly for
+    # diagnostic comparison or when the vol/ADV snapshot is missing.
     parser.add_argument(
-        "--impact-model", choices=["fixed", "sqrt_adv"], default="fixed",
-        help="Cost-model impact branch. 'fixed' (default) preserves pre-fix "
-             "bare slippage_rate behaviour. 'sqrt_adv' activates the "
-             "Almgren-Chriss path; requires qlib historical data for the "
-             "per-stock vol/ADV snapshot."
+        "--impact-model", choices=["fixed", "sqrt_adv"], default="sqrt_adv",
+        help="Cost-model impact branch. 'sqrt_adv' (default) activates "
+             "the Almgren-Chriss path with per-stock vol/ADV. 'fixed' "
+             "is the diagnostic / fallback path that uses bare "
+             "slippage_rate."
     )
     parser.add_argument(
         "--impact-coefficient", type=float, default=0.1,

@@ -288,10 +288,22 @@ class PaperOMS:
         prev_weights = self.state.get("prev_weights", {})
         holding_days = {code: pos.get("holding_days", 0)
                         for code, pos in self.state.get("positions", {}).items()}
-        reduce_weight = dict((risk_info or {}).get("reduce_weight", {}))
+        risk_info = risk_info or {}
+        reduce_weight = dict(risk_info.get("reduce_weight", {}))
+        # 2026-06-04 cx round 5 P1-3: forward RiskGuard cannot_sell /
+        # cannot_buy into the optimizer's PortfolioConstraints. Pre-fix
+        # the optimizer received only min_hold_days + reduce_weight, so
+        # stocks RiskGuard had flagged as "cannot trade today" (e.g.
+        # limit-down with no liquidity) still entered target weights
+        # — the subsequent fill loop then handled them ad-hoc, and the
+        # target vs actual weights diverged.
+        cannot_sell = set(risk_info.get("cannot_sell") or [])
+        cannot_buy = set(risk_info.get("cannot_buy") or [])
         constraints = PortfolioConstraints(
             min_hold_days=self.min_hold_days,
             reduce_weight=reduce_weight,
+            cannot_sell=cannot_sell,
+            cannot_buy=cannot_buy,
         )
 
         target_weights = optimizer.optimize(
@@ -741,6 +753,16 @@ class PaperOMS:
             if risk.cannot_buy:
                 predictions = {k: v for k, v in predictions.items()
                                if k not in risk.cannot_buy and k.lower() not in risk.cannot_buy}
+                # cx round 5 P1-3: ALSO expose to the optimizer so the
+                # constraint contract holds at every layer, not just
+                # this filter.
+                risk_info["cannot_buy"] = set(risk.cannot_buy)
+
+            # cx round 5 P1-3: forward cannot_sell to the optimizer too,
+            # so target weights respect the no-trade-today set instead
+            # of silently diverging from actual fills.
+            if risk.cannot_sell:
+                risk_info["cannot_sell"] = set(risk.cannot_sell)
 
             # Surface reduce_weight for the optimizer downstream
             if risk.reduce_weight:
@@ -878,8 +900,12 @@ class PaperOMS:
             return {"signal_date": date, "status": "no_pending_orders"}
 
         pending = json.loads(pending_path.read_text())
-        if pending.get("status") == "filled":
-            logger.info(f"  Orders for {date} already filled")
+        # cx round 5 P1-6: accept legacy "filled" plus the new
+        # "filled_clean" / "filled_partial" sentinels.
+        if str(pending.get("status", "")).startswith("filled"):
+            logger.info(
+                f"  Orders for {date} already {pending.get('status')!r}"
+            )
             return pending
 
         orders = pending.get("orders", [])
@@ -993,9 +1019,42 @@ class PaperOMS:
 
         self.state["cash"] = round(cash, 2)
 
-        # Commit pending target weights as actual prev_weights after successful fills
-        if "pending_target_weights" in self.state:
-            self.state["prev_weights"] = self.state.pop("pending_target_weights")
+        # 2026-06-04 cx round 5 P1-7: commit ACTUAL filled weights as
+        # prev_weights, not the theoretical pending_target_weights.
+        # Pre-fix any unfilled buy left prev_weights overstating the
+        # position by the missing fill — next day's optimizer would
+        # then compute turnover against a portfolio the OMS did not
+        # actually have, producing wrong target deltas.
+        # Compute actual weights from realised positions + cash, using
+        # the per-stock fill price (or current quote for non-fills).
+        actual_weights: dict[str, float] = {}
+        total_value = float(self.state.get("cash", 0.0))
+        positions = self.state.get("positions", {})
+        for code, pos in positions.items():
+            shares = float(pos.get("shares", 0))
+            # Use the last fill price for newly-bought positions, the
+            # latest known close otherwise.
+            last_price = float(pos.get("avg_price", 0))
+            for f in fills:
+                if f.get("code") == code:
+                    last_price = float(f.get("fill_price", last_price))
+                    break
+            position_value = shares * last_price
+            actual_weights[code] = position_value
+            total_value += position_value
+        # Normalise to fractions of gross. If total_value is zero
+        # (degenerate state), fall back to pending target so we don't
+        # zero out the portfolio model.
+        if total_value > 0:
+            actual_weights = {c: v / total_value for c, v in actual_weights.items()}
+        else:
+            actual_weights = dict(
+                self.state.get("pending_target_weights") or {}
+            )
+        self.state["prev_weights"] = actual_weights
+        # Pop pending after commit (still want to clear regardless of
+        # which weights we used) — this matches the pre-fix lifecycle.
+        self.state.pop("pending_target_weights", None)
 
         # Update holding days & PnL
         self.update_holding_days()
@@ -1021,12 +1080,23 @@ class PaperOMS:
                 {u["code"]: u["reason"] for u in unfilled_buys},
             )
 
-        # Build filled order file. status="filled" historically applied even
-        # when many intended buys couldn't transact (no price = likely halted,
-        # cash exhausted, etc.). Now we surface unfilled_buys so consumers can
-        # tell a partial reconcile from a clean one. status="filled" still
-        # means "no more work to do for this signal_date", not "all buys went
-        # through".
+        # 2026-06-04 cx round 5 P1-6: differentiate clean fill vs
+        # partial fill. Pre-fix status="filled" applied even when
+        # several intended buys could not transact (no price =
+        # likely halted, cash exhausted, etc.). Downstream consumers
+        # (paper status board, portfolio reconciler, sell-check) could
+        # not distinguish "all good" from "we owe the portfolio more
+        # buys". Now status reflects reality:
+        #   - "filled_clean"   : zero unfilled_buys
+        #   - "filled_partial" : ≥1 unfilled buy(s); on-call should
+        #                        inspect ``unfilled_buys`` for cause
+        # Keep the legacy "filled" sentinel as an alias on the pending
+        # record only (so old readers keep working) — the canonical
+        # status on the filled record is the new vocabulary.
+        if unfilled_buys:
+            fill_status = "filled_partial"
+        else:
+            fill_status = "filled_clean"
         filled = {
             "signal_date": date,
             "fill_date": use_date,
@@ -1035,7 +1105,8 @@ class PaperOMS:
             "unfilled_buys": unfilled_buys,
             "price_type": "next_open",
             "daily_pnl": pnl.get("daily_return", 0.0),
-            "status": "filled",
+            "status": fill_status,
+            "actual_weights": actual_weights,
         }
 
         # Archive filled orders
@@ -1044,8 +1115,10 @@ class PaperOMS:
         tmp.write_text(json.dumps(filled, indent=2, ensure_ascii=False))
         os.replace(tmp, filled_path)
 
-        # Mark pending as filled
-        pending["status"] = "filled"
+        # Mark pending as the resolved status. Legacy readers that
+        # only check for ==`"filled"` keep working because both
+        # filled_clean and filled_partial contain "filled".
+        pending["status"] = fill_status
         pending_path.write_text(json.dumps(pending, indent=2, ensure_ascii=False))
 
         return filled
@@ -1074,14 +1147,15 @@ class PaperOMS:
                 data = json.loads(path.read_text())
             except Exception:
                 continue
-            if data.get("status") == "filled":
+            # cx round 5 P1-6: accept any "filled*" sentinel
+            if str(data.get("status", "")).startswith("filled"):
                 continue
             result = self.reconcile(signal_date)
-            status = result.get("status")
+            status = result.get("status", "")
             if status == "pending":
                 deferred += 1
                 break
-            elif status == "filled":
+            elif str(status).startswith("filled"):
                 replayed += 1
             else:
                 skipped += 1

@@ -152,20 +152,51 @@ def _default_qlib_loader(start_date, end_date, universe):
         logger.warning("qlib not importable; vol/adv snapshot will be empty")
         return None
 
-    # Use the qlib expression language for daily close + amount.
+    # 2026-06-04 cx round 5 P1-5: amount unit disambiguation.
+    # qlib's cn_data bin documents $amount as YUAN-volume directly
+    # (元成交额, see the per-bin field comment block in the qlib
+    # source). $volume is documented as 股 — already shares, NOT
+    # 手. So the fallback ``$volume * $close`` should also be yuan
+    # without an extra factor.
+    # Pre-fix this comment block hedged ambiguously between "手 vs
+    # 股" semantics; the fallback could therefore be off by 100x if
+    # the wrong assumption was applied downstream. The assertion
+    # below verifies the unit empirically (amount > 1e4 for at
+    # least 90% of rows of liquid stocks — equity exchanges always
+    # see >10000 yuan/day of turnover for non-suspended names).
     instruments = universe if universe is not None else "all"
-    fields = ["$close", "$volume * $close"]  # amount = volume * close as fallback
     try:
-        # Prefer raw amount when available
+        # Prefer raw amount when available (cn_data canonical).
         df = D.features(D.instruments(instruments), ["$close", "$amount"],
                           start_time=str(start_date), end_time=str(end_date),
                           freq="day")
         df.columns = ["close", "amount"]
     except Exception:
-        df = D.features(D.instruments(instruments), fields,
+        # Fallback: $volume IS shares (per cn_data convention), so
+        # amount = volume × close gives yuan with no 100x correction.
+        # If a future qlib config switches $volume to 手, this
+        # fallback would silently understate adv by 100x; the unit
+        # check below catches the regression.
+        df = D.features(D.instruments(instruments),
+                          ["$close", "$volume * $close"],
                           start_time=str(start_date), end_time=str(end_date),
                           freq="day")
         df.columns = ["close", "amount"]
+
+    # Unit sanity: liquid stocks always have daily yuan-turnover well
+    # above 10,000. If at least half of rows are below that, the unit
+    # is almost certainly wrong (would be the 手-vs-股 100x slip).
+    if not df.empty:
+        plausibly_yuan_rate = float((df["amount"] >= 1e4).mean())
+        if plausibly_yuan_rate < 0.50:
+            logger.error(
+                "vol/adv snapshot: only %.1f%% of rows have amount >= 1e4. "
+                "This strongly suggests $amount/$volume is NOT in yuan — "
+                "downstream sqrt-impact would be off by ~100x. Aborting "
+                "snapshot build; investigate qlib bin unit.",
+                plausibly_yuan_rate * 100,
+            )
+            return None
     # Qlib index is (instrument, datetime); we want (datetime, instrument).
     df = df.reorder_levels(["datetime", "instrument"]).sort_index()
     df.index = df.index.set_names(["date", "code"])
