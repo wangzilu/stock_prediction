@@ -1,17 +1,30 @@
-"""PIT-safety pinning: macro features must NOT enter training data.
+"""PIT-safety pinning: macro features are zero-baseline (no leakage).
 
-Per cx code review round 3 (2026-06-03) P1: the previous
-`_load_macro` implementation loaded macro_features.parquet, took
-df.iloc[-1] (latest snapshot), and broadcast that snapshot to every
-historical (date, stock) row in the training index. Every training row
-therefore saw the LATEST macro values, not the macro values that were
-known at that row's prediction time — classic look-ahead bias.
+History:
+- Round 3 cx review (2026-06-03 morning) caught look-ahead in the old
+  `_load_macro` (iloc[-1] broadcast of LATEST macro values to every
+  historical row). First fix: return None to drop the columns entirely
+  from training.
+- Then commit d0b4240 (2026-06-03 night, during the 22:00 0-rec
+  incident response) found that dropping the columns broke train/serve
+  dim alignment: the trained champion expects 242 features and was
+  getting 158 (Alpha158 only) at inference. The new contract is:
+  `_load_macro` returns a frame of the same shape as before but with
+  ALL ZEROS, preserving the column-count contract while keeping the
+  look-ahead leak closed.
 
-The fix drops macro from training entirely until daily as-of macro
-data is available. These tests pin the contract so a future PR that
-silently re-enables it will fail CI loudly.
+What these tests now pin:
+  1. _load_macro returns a frame with the 3 contracted macro_* cols
+     (macro_cpi / macro_ppi / macro_m2_yoy).
+  2. EVERY value in those cols is exactly 0.0 — never the real
+     CPI/PPI/M2 from the parquet, even when the parquet looks valid.
+  3. `_load_supplementary` still yields zero macro_* columns when
+     queried via the production contract groups (because the contract
+     itself lists `macro_zero_baseline`, the zero-cols are kept; the
+     no-leak property is row-level).
 
-Re-enable contract (must satisfy ALL before flipping these tests):
+Re-enable contract (must satisfy ALL before flipping these tests to
+expect REAL macro values):
   1. macro_features.parquet has multiple rows with an explicit
      `available_date` column (T+1 publication conservatism).
   2. _load_macro joins via asof on available_date <= trade_date.
@@ -52,36 +65,67 @@ def merger_with_macro_parquet(tmp_path):
 
 
 # -----------------------------------------------------------------------------
-# Core contract — _load_macro returns None unconditionally
+# Core contract — _load_macro returns a ZERO-BASELINE frame (no leakage)
 # -----------------------------------------------------------------------------
 
-def test_load_macro_returns_none_even_with_valid_parquet(merger_with_macro_parquet):
-    """Even when macro_features.parquet exists with multi-row data, the
-    method must return None until the asof-merge re-enable contract is
-    satisfied. The single-row broadcast that this guards against would
-    re-appear if the function silently switched to iloc[-1] again."""
+EXPECTED_MACRO_COLS = ("macro_cpi", "macro_ppi", "macro_m2_yoy")
+
+
+def test_load_macro_returns_zero_baseline_even_with_valid_parquet(
+    merger_with_macro_parquet,
+):
+    """Even when macro_features.parquet exists with multi-row REAL data
+    (CPI 102.x, PPI 99.x, M2 8.x), `_load_macro` must return a frame
+    whose values are ALL ZERO. This preserves the trained champion's
+    242-dim contract while keeping the look-ahead leak closed. The
+    single-row broadcast this guards against would reappear if the
+    function silently switched back to iloc[-1] over the parquet."""
     index = pd.MultiIndex.from_product(
         [pd.date_range("2026-05-01", "2026-06-03"), ["SH600519", "SZ000001"]],
         names=["datetime", "instrument"],
     )
     result = merger_with_macro_parquet._load_macro(index)
-    assert result is None, (
-        "_load_macro returned a non-None frame — macro features have been "
-        "silently re-enabled without the daily as-of upgrade. Either revert "
-        "this re-enable or update the re-enable contract tests."
+    assert result is not None, (
+        "_load_macro returned None — the dim-preserving zero-baseline "
+        "contract regressed. Champion model expects 242 features at "
+        "inference (158 Alpha158 + 84 supplementary); dropping the 3 "
+        "macro_* cols puts inference back at 158→242 default-leaf land "
+        "(see 2026-06-03 22:00 incident)."
+    )
+    assert list(result.columns) == list(EXPECTED_MACRO_COLS), (
+        f"_load_macro column names drifted: {list(result.columns)} "
+        f"!= {list(EXPECTED_MACRO_COLS)}. The trained model named these "
+        f"three columns; renaming them silently is a train/serve skew."
+    )
+    assert (result.values == 0.0).all(), (
+        "_load_macro returned non-zero values — look-ahead leak has "
+        "re-opened. Every cell must be 0.0 until the daily as-of "
+        "macro contract lands (see module docstring)."
+    )
+    assert len(result) == len(index), (
+        f"_load_macro returned {len(result)} rows for an index of "
+        f"{len(index)} — broadcast contract violated."
     )
 
 
 def test_load_macro_returns_none_with_missing_parquet(tmp_path):
-    """Sanity: when the parquet doesn't exist, return None (was already
-    the case pre-fix). Pins that the early-return short-circuit didn't
-    accidentally introduce a different failure mode."""
+    """Degraded-path sanity: without the parquet, _load_macro cannot
+    synthesize the column-name template, so it returns None. The live
+    production cron always has the parquet (see fetch_macro_features.py
+    job), so this branch only fires for fresh environments / tests.
+
+    NOTE: when this branch fires in production, the downstream dim
+    check in `inject_supplementary_into_handler` + the contract-fail
+    gate in `short_term.py` will catch the resulting 232 vs 242
+    mismatch and refuse to ship predictions. That's the defense-in-
+    depth pin the 22:00 incident bought us."""
     m = FeatureMerger.__new__(FeatureMerger)
     m.data_dir = tmp_path
     if hasattr(FeatureMerger, "_macro_drop_warned"):
         delattr(FeatureMerger, "_macro_drop_warned")
     index = pd.MultiIndex.from_tuples(
-        [(pd.Timestamp("2026-06-01"), "SH600519")],
+        [(pd.Timestamp("2026-06-01"), "SH600519"),
+         (pd.Timestamp("2026-06-02"), "SH600519")],
         names=["datetime", "instrument"],
     )
     assert m._load_macro(index) is None
@@ -102,8 +146,15 @@ def test_warn_once_per_session(merger_with_macro_parquet, caplog):
     merger_with_macro_parquet._load_macro(index)
     merger_with_macro_parquet._load_macro(index)
 
-    macro_warns = [r for r in caplog.records
-                   if "macro features DROPPED" in r.getMessage()]
+    # Implementation logs "macro features DIMENSION-PRESERVED as zero
+    # baseline" (see d0b4240). Accept either the historical "DROPPED"
+    # phrasing or the current "DIMENSION-PRESERVED" phrasing so this
+    # test pins the warn-once invariant, not the exact wording.
+    macro_warns = [
+        r for r in caplog.records
+        if "macro features DROPPED" in r.getMessage()
+        or "macro features DIMENSION-PRESERVED" in r.getMessage()
+    ]
     assert len(macro_warns) == 1, (
         f"warn-once contract broken: emitted {len(macro_warns)} warnings "
         "across 3 calls (should be 1)"
@@ -111,13 +162,17 @@ def test_warn_once_per_session(merger_with_macro_parquet, caplog):
 
 
 # -----------------------------------------------------------------------------
-# Integration — _load_supplementary returns no macro_* columns
+# Integration — _load_supplementary preserves macro_* columns as ZEROS
 # -----------------------------------------------------------------------------
 
-def test_load_supplementary_has_no_macro_columns(merger_with_macro_parquet):
-    """The training-facing aggregator MUST NOT yield any macro_* columns.
-    This is the column-level contract a downstream model would otherwise
-    see (and learn from)."""
+def test_load_supplementary_emits_macro_columns_as_zero(merger_with_macro_parquet):
+    """The training-facing aggregator MUST yield the contracted macro_*
+    columns (dim-preserving) BUT every value must be 0.0 (PIT-safe).
+
+    Was: "must NOT yield macro_*". Flipped 2026-06-03 night when the
+    pure drop broke 158→242 dim alignment and produced 0 stock recs
+    at 22:00. The new contract is: keep the column shape, zero out
+    the values."""
     # Mock all the OTHER loaders so we isolate the macro behaviour.
     # We use real method names so if any of these get renamed, the test
     # fails loudly and a developer revisits the macro contract too.
@@ -137,15 +192,31 @@ def test_load_supplementary_has_no_macro_columns(merger_with_macro_parquet):
         [pd.date_range("2026-06-01", "2026-06-03"), ["SH600519"]],
         names=["datetime", "instrument"],
     )
-    supp = merger_with_macro_parquet._load_supplementary(index)
+    # P0-e (2026-06-04): _load_supplementary no longer accepts groups=None.
+    # Use the explicit "research / all-loaders" sentinel so this test
+    # still exercises the full loader fan-out the way it did before the
+    # production-contract gate landed.
+    from config.production_features import RESEARCH_ALL_LOADERS
+    supp = merger_with_macro_parquet._load_supplementary(
+        index, groups=RESEARCH_ALL_LOADERS,
+    )
 
-    if supp is not None:
-        macro_cols = [c for c in supp.columns if str(c).startswith("macro_")]
-        assert macro_cols == [], (
-            f"_load_supplementary returned macro_ columns: {macro_cols}. "
-            "Macro features are supposed to be dropped from training until "
-            "daily as-of data is available."
-        )
+    assert supp is not None, (
+        "_load_supplementary returned None when only macro should be live "
+        "— other loaders may have stopped being mocked."
+    )
+    macro_cols = [c for c in supp.columns if str(c).startswith("macro_")]
+    assert macro_cols, (
+        "_load_supplementary returned NO macro_ columns. The dim-preserving "
+        "zero-baseline contract requires the columns to be present "
+        "(see _load_macro doc) even if values are zero."
+    )
+    macro_block = supp[macro_cols]
+    assert (macro_block.values == 0.0).all(), (
+        "macro_ columns contain non-zero values — look-ahead leak has "
+        "reopened. Until the daily as-of macro contract lands, every "
+        "macro_ value must be 0.0."
+    )
 
 
 # -----------------------------------------------------------------------------

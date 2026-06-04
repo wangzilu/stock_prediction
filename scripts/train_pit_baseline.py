@@ -106,7 +106,11 @@ def prepare_features(dataset, segment, dim_mode, preprocess="raw"):
 
     elif dim_mode == "202":
         merger = FeatureMerger(DATA_DIR)
-        supp = merger._load_supplementary(X.index)
+        # research/ablation script — explicit opt-in to "load every loader"
+        # (P0-e: production must use PRODUCTION_SUPPLEMENTARY_GROUPS instead)
+        from config.production_features import RESEARCH_ALL_LOADERS
+        supp = merger._load_supplementary(X.index,
+                                          groups=RESEARCH_ALL_LOADERS)
         if supp is not None and not supp.empty:
             X = X.join(supp, how="left")
         instruments = list(set(str(c) for c in X.index.get_level_values(1)))

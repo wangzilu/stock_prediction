@@ -14,6 +14,11 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+from config.production_features import (
+    PRODUCTION_SUPPLEMENTARY_GROUPS,
+    RESEARCH_ALL_LOADERS,
+)
+
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "storage"
@@ -28,6 +33,7 @@ class FeatureMerger:
         self,
         handler,
         preprocess: bool = False,
+        groups: tuple[str, ...] | str = PRODUCTION_SUPPLEMENTARY_GROUPS,
     ) -> int:
         """Inject supplementary features into a Qlib handler's internal
         _data / _learn / _infer frames.
@@ -49,6 +55,9 @@ class FeatureMerger:
                 distribution. When the train_lgb branch
                 (`fix/train-lgb-use-feature-merger`) lands, both will
                 switch to True simultaneously.
+            groups: Explicit supplementary feature groups to inject. The
+                default is the production contract; pass None only from
+                research/shadow code that intentionally wants all loaders.
 
         Returns:
             Number of supplementary columns injected.
@@ -66,7 +75,7 @@ class FeatureMerger:
             )
             return 0
 
-        supp = self._load_supplementary(base_index)
+        supp = self._load_supplementary(base_index, groups=groups)
         if supp is None or supp.empty:
             logger.warning(
                 "inject_supplementary_into_handler: supplementary frame "
@@ -99,8 +108,8 @@ class FeatureMerger:
 
         logger.info(
             "inject_supplementary_into_handler: %d supp cols injected "
-            "into handler (preprocess=%s)",
-            n_supp, preprocess,
+            "into handler (preprocess=%s, groups=%s)",
+            n_supp, preprocess, groups,
         )
         return n_supp
 
@@ -128,8 +137,11 @@ class FeatureMerger:
 
         logger.info(f"Alpha158: {X_alpha.shape}")
 
-        # 2. Load supplementary features
-        supp = self._load_supplementary(X_alpha.index)
+        # 2. Load supplementary features. ``merge_for_training`` is the
+        # historical research API; preserve the "load everything" behavior
+        # behind an EXPLICIT sentinel so production code stays gated.
+        supp = self._load_supplementary(X_alpha.index,
+                                        groups=RESEARCH_ALL_LOADERS)
         if supp is not None and not supp.empty:
             n_raw = supp.shape[1]
 
@@ -457,64 +469,123 @@ class FeatureMerger:
         logger.info("  MCap data unavailable, skipping neutralization")
         return None
 
-    def _load_supplementary(self, index: pd.MultiIndex) -> pd.DataFrame:
-        """Load and align all supplementary features to the Qlib index."""
+    def _load_supplementary(
+        self,
+        index: pd.MultiIndex,
+        groups: tuple[str, ...] | str = PRODUCTION_SUPPLEMENTARY_GROUPS,
+    ) -> pd.DataFrame:
+        """Load and align supplementary features to the Qlib index.
+
+        2026-06-04 P0-e: ``groups`` MUST be explicit. The historical
+        ``groups=None → load every loader`` default was the暗道 that let
+        every new FeatureMerger loader silently enter the production
+        champion at the next retrain (see commit 95cd256, 2026-05-12,
+        and the 6-3 22:00 incident). This default now points at the
+        production contract; research code that legitimately wants the
+        full loader fan-out must pass
+        ``groups=config.production_features.RESEARCH_ALL_LOADERS``
+        as an explicit opt-in.
+
+        Args:
+            index: Qlib MultiIndex.
+            groups: Either a tuple of group names (e.g.
+                ``PRODUCTION_SUPPLEMENTARY_GROUPS`` for the live
+                champion, ``SHADOW_SUPPLEMENTARY_GROUPS`` for
+                pre-promotion experiments) or the sentinel
+                ``RESEARCH_ALL_LOADERS`` to bypass the contract.
+                Passing ``None`` is rejected so silent fan-out cannot
+                regress in.
+
+        Raises:
+            ValueError: when ``groups`` is None or an unknown type.
+        """
+        if groups is None:
+            raise ValueError(
+                "_load_supplementary: groups=None is rejected. "
+                "Production code must pass "
+                "config.production_features.PRODUCTION_SUPPLEMENTARY_GROUPS; "
+                "research/shadow code must pass either "
+                "SHADOW_SUPPLEMENTARY_GROUPS or the explicit "
+                "RESEARCH_ALL_LOADERS sentinel. (P0-e contract gate.)"
+            )
+        if groups == RESEARCH_ALL_LOADERS:
+            allowed = None  # legacy "load every loader" semantics
+        elif isinstance(groups, (tuple, list, set)):
+            allowed = set(groups)
+        else:
+            raise ValueError(
+                f"_load_supplementary: groups must be a tuple of group "
+                f"names or RESEARCH_ALL_LOADERS sentinel, got "
+                f"{type(groups).__name__}={groups!r}"
+            )
         frames = []
 
         # Fundamental features
-        fund = self._load_fundamental(index)
-        if fund is not None:
-            frames.append(fund)
+        if allowed is None or "fundamental" in allowed:
+            fund = self._load_fundamental(index)
+            if fund is not None:
+                frames.append(fund)
 
         # Capital flow features
-        flow = self._load_capital_flow(index)
-        if flow is not None:
-            frames.append(flow)
+        if allowed is None or "capital_flow" in allowed:
+            flow = self._load_capital_flow(index)
+            if flow is not None:
+                frames.append(flow)
 
-        # Macro features (broadcast)
-        macro = self._load_macro(index)
-        if macro is not None:
-            frames.append(macro)
+        # Macro features. Production uses the current zero-baseline contract;
+        # real macro values require a separate PIT-safe re-enable.
+        if allowed is None or "macro_zero_baseline" in allowed:
+            macro = self._load_macro(index)
+            if macro is not None:
+                frames.append(macro)
 
         # Shareholder features
-        holder = self._load_shareholder(index)
-        if holder is not None:
-            frames.append(holder)
+        if allowed is None or "shareholder" in allowed:
+            holder = self._load_shareholder(index)
+            if holder is not None:
+                frames.append(holder)
 
         # Valuation features (PE/PB/PS)
-        val = self._load_valuation(index)
-        if val is not None:
-            frames.append(val)
+        if allowed is None or "valuation" in allowed:
+            val = self._load_valuation(index)
+            if val is not None:
+                frames.append(val)
 
         # Northbound holding features
-        nb = self._load_northbound(index)
-        if nb is not None:
-            frames.append(nb)
+        if allowed is None or "northbound" in allowed:
+            nb = self._load_northbound(index)
+            if nb is not None:
+                frames.append(nb)
 
         # Quality features (ROE/margins/growth)
-        quality = self._load_quality(index)
-        if quality is not None:
-            frames.append(quality)
+        if allowed is None or "quality" in allowed:
+            quality = self._load_quality(index)
+            if quality is not None:
+                frames.append(quality)
 
         # ST_CLIENT daily_basic (PE/PB/PS/turnover/mv - PIT-safe daily)
-        st_basic = self._load_st_daily_basic(index)
-        if st_basic is not None:
-            frames.append(st_basic)
+        if allowed is None or "st_daily_basic" in allowed:
+            st_basic = self._load_st_daily_basic(index)
+            if st_basic is not None:
+                frames.append(st_basic)
 
         # ST_CLIENT moneyflow (资金流 - PIT-safe daily)
-        st_mf = self._load_st_moneyflow(index)
-        if st_mf is not None:
-            frames.append(st_mf)
+        if allowed is None or "st_moneyflow" in allowed:
+            st_mf = self._load_st_moneyflow(index)
+            if st_mf is not None:
+                frames.append(st_mf)
 
         # ST_CLIENT holder number (股东户数 - PIT-safe quarterly)
-        st_holder = self._load_st_holder_number(index)
-        if st_holder is not None:
-            frames.append(st_holder)
+        if allowed is None or "st_holder_number" in allowed:
+            st_holder = self._load_st_holder_number(index)
+            if st_holder is not None:
+                frames.append(st_holder)
 
         # Cross-market regime signals (恒生/纳指 - broadcast to all stocks per date)
-        cross_mkt = self._load_cross_market_regime(index)
-        if cross_mkt is not None:
-            frames.append(cross_mkt)
+        if allowed is None or "cross_market_regime" in allowed:
+            cross_mkt = self._load_cross_market_regime(index)
+            if cross_mkt is not None:
+                frames.append(cross_mkt)
 
         if not frames:
             return None

@@ -193,11 +193,15 @@ def main():
 
     logger.info(f"Factor groups: {', '.join(f'{k}({len(v)})' for k,v in groups.items())}")
 
-    # Load all supplementary at once for column reference
+    # Load all supplementary at once for column reference.
+    # Factor ablation BY DEFINITION wants every loader — explicit opt-in
+    # to the research sentinel (P0-e gate; production must use
+    # PRODUCTION_SUPPLEMENTARY_GROUPS instead).
+    from config.production_features import RESEARCH_ALL_LOADERS
     all_supp = {}
     for seg in ["train", "valid", "test"]:
         idx = segs_base[seg][0].index
-        supp = merger._load_supplementary(idx)
+        supp = merger._load_supplementary(idx, groups=RESEARCH_ALL_LOADERS)
         all_supp[seg] = supp
 
     # Also load Qlib custom factors

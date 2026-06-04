@@ -123,7 +123,11 @@ def main():
         logger.info(f"  Alpha158 {seg}: {X.shape}")
 
         # 2a. FeatureMerger: add parquet-based supplementary factors
-        supp = merger._load_supplementary(X.index)
+        # research/enhanced-xgb script — explicit opt-in to "load every
+        # loader" (P0-e: production gate via PRODUCTION_SUPPLEMENTARY_GROUPS)
+        from config.production_features import RESEARCH_ALL_LOADERS
+        supp = merger._load_supplementary(X.index,
+                                          groups=RESEARCH_ALL_LOADERS)
         if supp is not None and not supp.empty:
             logger.info(f"  FeatureMerger: +{supp.shape[1]} supplementary columns")
             X = X.join(supp, how="left")

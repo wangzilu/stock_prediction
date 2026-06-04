@@ -203,48 +203,41 @@ def main():
     print("Dataset ready.")
 
     # Merge supplementary features (capital flow, valuation, etc.)
-    # DataHandlerLP stores learn (_learn) and infer (_infer) data separately.
-    # We must inject into both so fit() (DK_L) and predict() (DK_I) see the same columns.
+    # 2026-06-04 cx P0-c: route through inject_supplementary_into_handler
+    # so the production contract (PRODUCTION_SUPPLEMENTARY_GROUPS in
+    # config/production_features.py) is the SINGLE GATE for which supp
+    # cols enter the trained model. Previously this site called
+    # FeatureMerger._load_supplementary() with no allowlist — every new
+    # loader added to FeatureMerger silently joined the production
+    # champion at the next weekly retrain (no shadow gate).
     supp_cols = 0
     try:
         from models.feature_merger import FeatureMerger
+        from config.production_features import PRODUCTION_SUPPLEMENTARY_GROUPS
         merger = FeatureMerger()
         handler = dataset.handler
 
-        # Compute supplementary features using raw _data index
-        raw_data = getattr(handler, '_data', None)
-        if raw_data is not None:
-            supp = merger._load_supplementary(raw_data.index)
-            if supp is not None and not supp.empty:
-                # Replace inf with NaN — XGBoost handles NaN but crashes on inf
-                supp = supp.replace([np.inf, -np.inf], np.nan)
-                supp_cols = supp.shape[1]
-                common = supp.index.intersection(raw_data.index)
+        supp_cols = merger.inject_supplementary_into_handler(
+            handler,
+            preprocess=False,
+            groups=PRODUCTION_SUPPLEMENTARY_GROUPS,
+        )
 
-                # Inject into all three internal DataFrames: _data, _learn, _infer
-                for attr in ('_data', '_learn', '_infer'):
-                    df = getattr(handler, attr, None)
-                    if df is None:
-                        continue
-                    attr_common = common.intersection(df.index)
-                    for col in supp.columns:
-                        df[("feature", col)] = np.nan
-                        df.loc[attr_common, ("feature", col)] = supp.loc[attr_common, col].values
-
-                # Verify injection worked for learn data
-                from qlib.data.dataset.handler import DataHandlerLP
-                verify = dataset.prepare("train", col_set="feature",
-                                         data_key=DataHandlerLP.DK_L)
-                print(f"Merged {supp_cols} supplementary features "
-                      f"(learn features: {verify.shape[1]})")
-                # Per code-review P2 2026-05-31: extract real feature
-                # name list for artifact contract (was always [] because
-                # `feature_cols` was never defined). verify.columns is a
-                # MultiIndex [("feature", name), ...].
-                feature_cols = [
-                    col[1] if isinstance(col, tuple) else col
-                    for col in verify.columns.tolist()
-                ]
+        if supp_cols:
+            # Verify injection worked for learn data
+            from qlib.data.dataset.handler import DataHandlerLP
+            verify = dataset.prepare("train", col_set="feature",
+                                     data_key=DataHandlerLP.DK_L)
+            print(f"Merged {supp_cols} supplementary features "
+                  f"(learn features: {verify.shape[1]})")
+            # Per code-review P2 2026-05-31: extract real feature
+            # name list for artifact contract (was always [] because
+            # `feature_cols` was never defined). verify.columns is a
+            # MultiIndex [("feature", name), ...].
+            feature_cols = [
+                col[1] if isinstance(col, tuple) else col
+                for col in verify.columns.tolist()
+            ]
     except Exception as e:
         print(f"Supplementary feature merge skipped: {e}")
         # If merge failed, feature_cols may not be defined — fall back to
