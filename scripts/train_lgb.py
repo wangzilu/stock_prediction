@@ -490,9 +490,18 @@ def main():
                   f"atomic copy. Reads from lgb_model.pkl will lag retrains "
                   f"until this is fixed.")
 
+    # cx round 25 P1-1: flip the legacy aliases ONLY AFTER the model
+    # is on disk. write_contract no longer touches the legacy
+    # contract alias; we do both flips here as a pair so concurrent
+    # inference sees either (old model + old contract) or
+    # (new model + new contract) — never a mismatched pair.
     _atomic_symlink(os.path.basename(MODEL_PATH), LEGACY_MODEL_PATH)
     print(f"Legacy model alias updated atomically: "
           f"{LEGACY_MODEL_PATH} → {os.path.basename(MODEL_PATH)}")
+
+    from models.feature_contract import update_legacy_contract_alias
+    update_legacy_contract_alias(Path(DATA_DIR), PRODUCTION_MODEL_PROFILE)
+    print(f"Legacy contract alias updated atomically (profile={PRODUCTION_MODEL_PROFILE})")
 
     # Save feature contract to experiment artifact
     # 2026-06-04 cx round 23 P1-2: model_name + feature_set now come

@@ -124,6 +124,13 @@ def write_contract(
             "group": group,
         })
 
+    # cx round 25 P1-3: resolve profile ONCE so both the path AND the
+    # JSON profile field reflect the same value. Pre-fix passing
+    # profile=None used PRODUCTION_MODEL_PROFILE for the path but
+    # wrote "" into the JSON.
+    from config.production_features import PRODUCTION_MODEL_PROFILE
+    resolved_profile = (profile or PRODUCTION_MODEL_PROFILE).strip().lower()
+
     contract = {
         "frozen_at": datetime.now().isoformat(timespec="seconds"),
         "model_pkl_path": str(model_pkl_path),
@@ -132,38 +139,60 @@ def write_contract(
         "supplementary_count": int(supplementary_count),
         "production_groups": list(production_groups),
         "features": features,
-        "profile": (profile or "").strip().lower(),  # cx round 22 P0-1
+        "profile": resolved_profile,  # cx round 22 P0-1 + round 25 P1-3
         # cx round 2: write a flag so ``verify_inference_dataset``
         # knows this artifact has real-name granularity in the supp
         # segment (older / placeholder-Alpha158 artifacts can still be
         # loaded but with reduced strictness on the alpha segment).
         "schema_version": 2,
     }
-    out = contract_path(data_dir, profile)
+    out = contract_path(data_dir, resolved_profile)
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(out.suffix + ".tmp")
     tmp.write_text(json.dumps(contract, ensure_ascii=False, indent=2))
     tmp.replace(out)
 
-    # cx round 22 P0-1: maintain the legacy symlink so consumers that
-    # still read ``production_feature_contract.json`` see the active
-    # profile's contract. Use atomic flip via .tmp + os.replace.
+    # cx round 25 P1-1: DO NOT update the legacy symlink here. Pre-fix
+    # this function flipped the legacy alias to the new contract BEFORE
+    # the new model.pkl was saved, creating a window where concurrent
+    # inference would see new contract + old model and refuse to serve.
+    # ``train_lgb`` now flips the legacy contract symlink AFTER the
+    # model.pkl atomic save succeeds, paired with the model symlink
+    # flip, so the legacy alias pair is always model-consistent.
+    logger.info("Wrote feature contract: %s (%d features, schema v2, profile=%s)",
+                out, expected, resolved_profile)
+    return out
+
+
+def update_legacy_contract_alias(data_dir: Path, profile: str | None = None) -> None:
+    """Atomically flip ``production_feature_contract.json`` to point
+    at the profile's contract. Called from train_lgb AFTER the model
+    artifact is saved so the legacy alias pair (model + contract) is
+    always consistent. cx round 25 P1-1 + P2-4.
+    """
     import os as _os
+    from config.production_features import PRODUCTION_MODEL_PROFILE
+    resolved = (profile or PRODUCTION_MODEL_PROFILE).strip().lower()
+    target = contract_path(data_dir, resolved)
     legacy = legacy_contract_path(data_dir)
     tmp_link = legacy.with_suffix(legacy.suffix + ".symlink.tmp")
     try:
         if tmp_link.exists() or tmp_link.is_symlink():
             tmp_link.unlink()
-        _os.symlink(out.name, tmp_link)
+        _os.symlink(target.name, tmp_link)
         _os.replace(tmp_link, legacy)
     except OSError as link_exc:
         import shutil
-        shutil.copy2(out, legacy)
-        logger.warning("Contract symlink unsupported (%s); copied instead", link_exc)
-
-    logger.info("Wrote feature contract: %s (%d features, schema v2, profile=%s)",
-                out, expected, contract["profile"] or "<unset>")
-    return out
+        # cx round 25 P2-4: copy via .tmp + atomic replace so the
+        # legacy path is never absent during the swap.
+        tmp_copy = legacy.with_suffix(legacy.suffix + ".copy.tmp")
+        shutil.copy2(target, tmp_copy)
+        _os.replace(tmp_copy, legacy)
+        logger.warning(
+            "Contract symlink unsupported (%s); used atomic copy. "
+            "Reads from legacy alias will lag retrains until fixed.",
+            link_exc,
+        )
 
 
 def load_contract(data_dir: Path, profile: str | None = None) -> dict | None:
@@ -172,22 +201,38 @@ def load_contract(data_dir: Path, profile: str | None = None) -> dict | None:
     continue" rather than as a fatal error, because there is a
     bootstrap window between the first deploy of this module and the
     first retrain that writes a contract."""
-    path = contract_path(data_dir, profile)
-    if not path.exists():
-        # Fall back to the legacy single-file location for back-compat
-        # during migration. After train_lgb runs once with the new
-        # writer, the profile-specific contract exists and this fallback
-        # is no longer hit.
-        legacy = legacy_contract_path(data_dir)
-        if legacy.exists():
-            logger.warning(
-                "load_contract: profile contract %s missing; using legacy %s. "
-                "Re-run scripts/train_lgb.py to populate the profile contract.",
-                path.name, legacy.name,
-            )
-            return json.loads(legacy.read_text())
+    from config.production_features import PRODUCTION_MODEL_PROFILE
+    resolved_profile = (profile or PRODUCTION_MODEL_PROFILE).strip().lower()
+    path = contract_path(data_dir, resolved_profile)
+    if path.exists():
+        return json.loads(path.read_text())
+
+    # Fall back to the legacy single-file location for back-compat
+    # during migration. cx round 25 P1-2: legacy may carry a DIFFERENT
+    # profile's contract (e.g. the symlink points at xgb_242 but the
+    # caller asked for xgb_174). Accept only when the contract's
+    # ``profile`` field matches OR is empty (pre-profile artifact —
+    # one-shot warning during migration).
+    legacy = legacy_contract_path(data_dir)
+    if not legacy.exists():
         return None
-    return json.loads(path.read_text())
+    legacy_data = json.loads(legacy.read_text())
+    legacy_profile = str(legacy_data.get("profile") or "").strip().lower()
+    if legacy_profile and legacy_profile != resolved_profile:
+        raise FeatureContractViolation(
+            f"load_contract: legacy alias {legacy.name} carries "
+            f"profile={legacy_profile!r} but caller requested "
+            f"{resolved_profile!r}. Refusing to serve a contract from "
+            f"the wrong profile. Run scripts/train_lgb.py under "
+            f"PRODUCTION_MODEL_PROFILE={resolved_profile} to produce "
+            f"the right contract."
+        )
+    logger.warning(
+        "load_contract: profile contract %s missing; using legacy %s "
+        "(legacy profile=%s). Re-run scripts/train_lgb.py.",
+        path.name, legacy.name, legacy_profile or "<unset>",
+    )
+    return legacy_data
 
 
 def verify_inference_dataset(

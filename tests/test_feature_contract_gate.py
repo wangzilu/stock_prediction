@@ -158,8 +158,14 @@ def test_verify_alpha158_segment_is_count_only(tmp_path):
 
 def test_train_lgb_writes_contract_after_save():
     src = (PROJECT_ROOT / "scripts" / "train_lgb.py").read_text()
-    assert "from models.feature_contract import write_contract" in src, (
-        "train_lgb.py no longer imports write_contract — P1-3 regressed."
+    # cx round 25: import was grouped into multi-line form. Match the
+    # symbol presence and the module path independently so future
+    # re-formats don't break this pin.
+    assert "from models.feature_contract import" in src, (
+        "train_lgb.py no longer imports from models.feature_contract — P1-3 regressed."
+    )
+    assert "write_contract" in src, (
+        "train_lgb.py no longer references write_contract — P1-3 regressed."
     )
     assert "write_contract(" in src, (
         "train_lgb.py no longer calls write_contract."
