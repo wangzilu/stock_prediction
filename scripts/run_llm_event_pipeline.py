@@ -390,9 +390,13 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
     # opt-in via env LLM_EVENT_FACTOR_SOURCE=eventstore only.
     logger.info("[Step 3/3] Building quantitative factors...")
     try:
-        from scripts.build_llm_event_factors import build_factors_range
-        import os as _os
-        factor_source = _os.environ.get("LLM_EVENT_FACTOR_SOURCE", "jsonl").strip().lower()
+        from scripts.build_llm_event_factors import (
+            build_factors_range,
+            resolve_llm_event_factor_source,
+        )
+        # cx round 20 P1-1: typo-safe + central. Pre-fix used a raw
+        # env read that silently fell back to JSONL on misspellings.
+        factor_source = resolve_llm_event_factor_source()
         df = build_factors_range(
             start_date=target_date,
             end_date=target_date,

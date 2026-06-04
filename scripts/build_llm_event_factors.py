@@ -328,6 +328,53 @@ def build_factors(signal_date: str = None, lookback_days: int = 30,
     return result
 
 
+_ALLOWED_FACTOR_SOURCES = ("jsonl", "eventstore")
+
+
+def resolve_llm_event_factor_source(
+    explicit: str | None = None,
+    *,
+    default: str = "jsonl",
+) -> str:
+    """Single resolver for the LLM event factor source.
+
+    2026-06-04 cx round 20 P1-1 + P1-2: pre-fix the pipeline read
+    ``os.environ.get("LLM_EVENT_FACTOR_SOURCE", "jsonl")`` and any
+    other call site (retry drain, ad-hoc backfills) used the bare
+    ``source="jsonl"`` keyword argument. Typos like ``event_store``
+    or ``eventsstore`` silently fell through to JSONL, AND the
+    retry drain could pick a DIFFERENT source than the main pipeline
+    on the same day — overwriting the morning's parquet with the
+    evening's other-source output.
+
+    Args:
+        explicit: optional caller-provided source. If None, consults
+            the env var ``LLM_EVENT_FACTOR_SOURCE``.
+        default: value when neither caller nor env supplies one.
+
+    Returns:
+        Normalised source name (``"jsonl"`` or ``"eventstore"``).
+
+    Raises:
+        RuntimeError: when the resolved value is not one of the
+            allowed options. Callers MUST treat invalid input as
+            a hard fail rather than silently substituting a default.
+    """
+    import os as _os
+    raw = (
+        explicit
+        if explicit is not None
+        else _os.environ.get("LLM_EVENT_FACTOR_SOURCE", default)
+    )
+    norm = str(raw or "").strip().lower()
+    if norm not in _ALLOWED_FACTOR_SOURCES:
+        raise RuntimeError(
+            f"Invalid LLM event factor source {raw!r}. "
+            f"Allowed: {list(_ALLOWED_FACTOR_SOURCES)}."
+        )
+    return norm
+
+
 def build_factors_range(
     start_date: str = None,
     end_date: str = None,

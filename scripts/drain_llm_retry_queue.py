@@ -106,13 +106,29 @@ def _sync_to_eventstore(events_path: Path, target_date: str) -> None:
 def _rebuild_factors(target_date: str) -> None:
     """Rebuild llm_event_factors.parquet for target_date (mirrors pipeline Step 3)."""
     try:
-        from scripts.build_llm_event_factors import build_factors_range
+        from scripts.build_llm_event_factors import (
+            build_factors_range,
+            resolve_llm_event_factor_source,
+        )
     except Exception as e:
         logger.warning("Factor builder unavailable (%s), skipping rebuild", e)
         return
-    df = build_factors_range(start_date=target_date, end_date=target_date, lookback_days=30)
+    # cx round 20 P1-2: share the resolver with run_llm_event_pipeline
+    # so retry drain cannot pick a different source than the morning
+    # pipeline on the same day. Pre-fix the drain used the bare
+    # default ``source="jsonl"``, so an admin who flipped the
+    # main pipeline to EventStore via env would still get a JSONL
+    # rebuild here that overwrote the parquet.
+    factor_source = resolve_llm_event_factor_source()
+    df = build_factors_range(
+        start_date=target_date, end_date=target_date,
+        lookback_days=30, source=factor_source,
+    )
     n_stocks = len(df) if df is not None and not df.empty else 0
-    logger.info("Factors rebuilt for %s: %d stocks", target_date, n_stocks)
+    logger.info(
+        "Factors rebuilt for %s: %d stocks (source=%s)",
+        target_date, n_stocks, factor_source,
+    )
 
 
 def drain(target_date: str) -> dict:
