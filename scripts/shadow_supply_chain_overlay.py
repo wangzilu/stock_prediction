@@ -63,12 +63,29 @@ def safe_zscore(s: pd.Series) -> pd.Series:
 
 
 def load_xgb_predictions() -> pd.Series:
-    """Load XGB predictions from lgb_latest_predictions.json."""
-    if not PREDICTIONS_PATH.exists():
+    """Load XGB predictions through the validated cache loader.
+
+    2026-06-04 cx round 3 P1-8: previously this read the JSON raw,
+    which means a RED / stale cache would produce nonsense shadow
+    stats that could mislead promotion decisions. Route through
+    ``load_prediction_cache`` so freshness + distribution gates
+    apply uniformly. Shadow analysis SKIPS when the cache is RED."""
+    from models.lgb_cache import load_prediction_cache
+    from models.prediction_health import PredictionDistributionRed
+    try:
+        preds, _payload = load_prediction_cache(PREDICTIONS_PATH)
+    except FileNotFoundError:
         logger.error("lgb_latest_predictions.json not found at %s", PREDICTIONS_PATH)
         return pd.Series(dtype=float)
-    payload = json.loads(PREDICTIONS_PATH.read_text())
-    preds = payload.get("predictions", {})
+    except PredictionDistributionRed as exc:
+        logger.error(
+            "shadow_supply_chain_overlay refusing RED cache: %s — "
+            "skipping shadow run this cycle.", exc,
+        )
+        return pd.Series(dtype=float)
+    except RuntimeError as exc:
+        logger.error("shadow_supply_chain_overlay cache load failed: %s", exc)
+        return pd.Series(dtype=float)
     s = pd.Series(preds, dtype=float)
     s.index.name = "instrument"
     logger.info("Loaded XGB predictions: %d stocks", len(s))

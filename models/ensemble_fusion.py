@@ -69,13 +69,28 @@ def _load_lgb_json() -> Optional[pd.Series]:
     """Load lgb_latest_predictions.json as a single-date prediction Series.
 
     Returns Series with (datetime, instrument) MultiIndex.
-    """
-    if not LGB_PREDICTIONS_PATH.exists():
-        return None
-    with open(LGB_PREDICTIONS_PATH) as f:
-        data = json.load(f)
 
-    preds = data.get("predictions", {})
+    2026-06-04 cx round 3 P1-8: routes through the validated loader
+    so freshness + RED-distribution gates apply. Pre-fix this read
+    the JSON raw, which means a poisoned cache (smoke RED, manual
+    debug) would feed the production ensembler and the ensembler's
+    output would silently inherit the rot.
+    """
+    from models.lgb_cache import load_prediction_cache
+    from models.prediction_health import PredictionDistributionRed
+    try:
+        preds, data = load_prediction_cache(LGB_PREDICTIONS_PATH)
+    except FileNotFoundError:
+        return None
+    except PredictionDistributionRed:
+        logger.error(
+            "ensemble_fusion refusing RED-distribution LGB cache — "
+            "excluding lgb_latest from the fusion this cycle."
+        )
+        return None
+    except RuntimeError as exc:
+        logger.error("ensemble_fusion LGB cache load failed: %s", exc)
+        return None
     if not preds:
         return None
 

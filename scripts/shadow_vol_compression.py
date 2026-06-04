@@ -90,12 +90,20 @@ def compute_vol_compression_factor(date: str) -> pd.Series:
 
 
 def load_xgb_predictions() -> pd.Series:
-    """Load XGB predictions from lgb_latest_predictions.json."""
-    if not PREDICTIONS_PATH.exists():
+    """Load XGB predictions through validated loader (cx round 3 P1-8)."""
+    from models.lgb_cache import load_prediction_cache
+    from models.prediction_health import PredictionDistributionRed
+    try:
+        preds, _payload = load_prediction_cache(PREDICTIONS_PATH)
+    except FileNotFoundError:
         logger.error("lgb_latest_predictions.json not found at %s", PREDICTIONS_PATH)
         return pd.Series(dtype=float)
-    payload = json.loads(PREDICTIONS_PATH.read_text())
-    preds = payload.get("predictions", {})
+    except PredictionDistributionRed as exc:
+        logger.error("shadow_vol_compression refusing RED cache: %s — skip.", exc)
+        return pd.Series(dtype=float)
+    except RuntimeError as exc:
+        logger.error("shadow_vol_compression cache load failed: %s", exc)
+        return pd.Series(dtype=float)
     s = pd.Series(preds, dtype=float)
     s.index.name = "instrument"
     logger.info("Loaded XGB predictions: %d stocks", len(s))

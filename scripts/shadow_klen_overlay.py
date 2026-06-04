@@ -177,15 +177,24 @@ def main():
     date = args.date or datetime.now().strftime("%Y-%m-%d")
     logger.info(f"=== KLEN Reversal Shadow (weight grid): {date} ===")
 
-    # Load XGB predictions
+    # 2026-06-04 cx round 3 P1-8: route through validated loader so a
+    # RED / stale cache cannot feed shadow_klen and contaminate
+    # promotion stats.
+    from models.lgb_cache import load_prediction_cache
+    from models.prediction_health import PredictionDistributionRed
     pred_path = DATA_DIR / "lgb_latest_predictions.json"
-    if not pred_path.exists():
+    try:
+        predictions, preds_raw = load_prediction_cache(pred_path)
+    except FileNotFoundError:
         logger.error("No predictions file")
         return
-
-    preds_raw = json.load(open(pred_path))
+    except PredictionDistributionRed as exc:
+        logger.error("shadow_klen refusing RED cache: %s — skipping run.", exc)
+        return
+    except RuntimeError as exc:
+        logger.error("shadow_klen cache load failed: %s", exc)
+        return
     pred_date = preds_raw.get("latest_date", "?")
-    predictions = preds_raw.get("predictions", {})
     logger.info(f"XGB predictions: {len(predictions)} stocks (date={pred_date})")
 
     xgb_preds = pd.Series(predictions, dtype=float)

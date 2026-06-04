@@ -38,12 +38,25 @@ from models.registry import ModelRegistry
 
 
 def load_latest_predictions():
-    """Load latest predictions from cache (written by smoke_lgb_predict.py)."""
+    """Load latest predictions through validated loader (cx round 3 P1-8).
+
+    Returns (predictions_dict, full_payload) or (None, {}) when the
+    cache is missing, RED, or stale. The shadow run skips when None
+    rather than fabricating stats off a poisoned cache."""
+    from models.lgb_cache import load_prediction_cache
+    from models.prediction_health import PredictionDistributionRed
     cache_path = DATA_DIR / "lgb_latest_predictions.json"
-    if not cache_path.exists():
+    try:
+        preds, payload = load_prediction_cache(cache_path)
+    except FileNotFoundError:
         return None, {}
-    payload = json.loads(cache_path.read_text())
-    return payload.get("predictions", {}), payload
+    except PredictionDistributionRed as exc:
+        logger.error("shadow_daily_inference refusing RED cache: %s — skip.", exc)
+        return None, {}
+    except RuntimeError as exc:
+        logger.error("shadow_daily_inference cache load failed: %s", exc)
+        return None, {}
+    return preds, payload
 
 
 def predict_with_xgb_model(model_path: str, feature_cache_path: str) -> dict:

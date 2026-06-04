@@ -96,13 +96,22 @@ def main():
 
     logger.info(f"=== ROC5_tsmin10 Shadow: {date} ===")
 
-    # Load XGB predictions
+    # Load XGB predictions through validated loader (cx round 3 P1-8)
+    from models.lgb_cache import load_prediction_cache
+    from models.prediction_health import PredictionDistributionRed
     pred_path = DATA_DIR / "lgb_latest_predictions.json"
-    if not pred_path.exists():
+    try:
+        preds_dict, _payload = load_prediction_cache(pred_path)
+    except FileNotFoundError:
         logger.error("No predictions")
         return
-    preds_raw = json.load(open(pred_path))
-    xgb = pd.Series(preds_raw["predictions"], dtype=float)
+    except PredictionDistributionRed as exc:
+        logger.error("shadow_roc5 refusing RED cache: %s — skip.", exc)
+        return
+    except RuntimeError as exc:
+        logger.error("shadow_roc5 cache load failed: %s", exc)
+        return
+    xgb = pd.Series(preds_dict, dtype=float)
     xgb.index = xgb.index.str.lower()
     logger.info(f"XGB: {len(xgb)} stocks")
 

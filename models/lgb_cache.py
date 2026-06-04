@@ -37,9 +37,40 @@ def write_prediction_cache(
     qlib_dir: str | None = None,
     min_predictions: int = LGB_MIN_PREDICTIONS,
     source: str = "lgb_smoke",
+    stale_count: int = 0,
+    allow_red: bool = False,
 ) -> dict:
-    """Write an atomic JSON cache for scheduler/RL fallback usage."""
+    """Write an atomic JSON cache for scheduler/RL fallback usage.
+
+    2026-06-04 cx round 3 P0-2: distribution health is now validated
+    HERE, at the single write-path bottleneck. Pre-fix the gate lived
+    only in ``scheduler.jobs.DailyPipeline``, so the 18:35
+    ``lgb_after_close_smoke`` cron could land an all-negative cache
+    that downstream paper / shadow / ensemble consumers then read as
+    truth. Sinking the gate into the writer means SMOKE, SCHEDULER,
+    or any future producer cannot poison the cache without an
+    explicit ``allow_red=True`` opt-out.
+
+    Args:
+        allow_red: only used by tests / debug. When True, RED writes
+            are allowed (the JSON records ``distribution_status="RED"``
+            so even loaders that ignore the exception can see it).
+    """
+    from models.prediction_health import (
+        classify_status,
+        PredictionDistributionRed,
+    )
+
     finite = finite_prediction_map(predictions)
+    status, dist_stats = classify_status(finite, stale_count=stale_count)
+    if status == "RED" and not allow_red:
+        raise PredictionDistributionRed(
+            f"refusing to write LGB cache from source={source!r}: "
+            f"distribution_status=RED (reason: {dist_stats.get('reason')}). "
+            f"This is the 2026-06-03 22:00 incident signature; "
+            f"investigate upstream feature contract / inject path."
+        )
+
     payload = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "latest_date": latest_date or "",
@@ -49,6 +80,8 @@ def write_prediction_cache(
         "prediction_count": len(predictions),
         "finite_prediction_count": len(finite),
         "min_predictions": min_predictions,
+        "distribution_status": status,
+        "distribution_stats": dist_stats,
         "predictions": finite,
     }
 
@@ -75,8 +108,27 @@ def load_prediction_cache(
     *,
     min_predictions: int = LGB_MIN_PREDICTIONS,
     max_age_days: int = LGB_CACHE_MAX_AGE_DAYS,
+    allow_red: bool = False,
 ) -> tuple[dict[str, float], dict]:
-    """Load and validate a cached LGB prediction map."""
+    """Load and validate a cached LGB prediction map.
+
+    2026-06-04 cx round 3 P0-3: the loader now ALSO checks distribution
+    health, so callers cannot silently consume a RED cache even if a
+    writer somehow produced one (older cache from before the writer
+    gate, manual debug, etc.). ``paper/oms.py`` and shadow scripts
+    that previously read the raw JSON must move to this function so
+    they get freshness + distribution gating for free.
+
+    Args:
+        allow_red: tests / debug only. When True the caller is
+            explicitly opting in to consume a RED cache (you will
+            usually NOT want this for live trading paths).
+    """
+    from models.prediction_health import (
+        classify_status,
+        PredictionDistributionRed,
+    )
+
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"LGB prediction cache not found: {path}")
@@ -107,6 +159,22 @@ def load_prediction_cache(
         raise RuntimeError(
             f"LGB prediction cache latest_date={latest_date} is {age_days} days old "
             f"(max={max_age_days})"
+        )
+
+    # Distribution health gate. Prefer the writer-recorded status
+    # (faster, no recomputation), fall back to classifying live for
+    # caches written before the writer gate landed.
+    recorded_status = str(payload.get("distribution_status", "")).upper()
+    if recorded_status in ("GREEN", "YELLOW", "RED"):
+        status = recorded_status
+    else:
+        status, _ = classify_status(finite)
+    if status == "RED" and not allow_red:
+        raise PredictionDistributionRed(
+            f"refusing to consume LGB cache at {path}: "
+            f"distribution_status=RED. Source={payload.get('source', '?')!r}, "
+            f"latest_date={latest_date!r}. The cache itself is the 6-3 "
+            f"incident signature; do not trade on it."
         )
 
     return finite, payload

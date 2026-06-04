@@ -33,6 +33,16 @@ from config.settings import (
     LGB_MODEL_PATH, RL_MODEL_PATH, MID_MODEL_PATH, PREDICTION_HORIZON_DAYS,
     LGB_MIN_PREDICTIONS, OVERNIGHT_STOCK_SNAPSHOT_PATH, DATA_DIR,
 )
+# 2026-06-04 cx round 3 P0-1: hoist these imports to module level.
+# Previously they lived INSIDE the outer try block of
+# _load_lgb_predictions, so any import failure (e.g. models/feature_contract
+# missing on a partial deploy) raised ImportError, was caught by
+# ``except Exception`` and silently routed to _use_cache. That meant
+# a deploy that forgot a file would publish yesterday's cache as if
+# everything were fine. Importing at module level means a missing dep
+# is a process-startup failure (cron returns non-zero, on-call gets paged).
+from models.short_term import ShortTermModel, FeatureContractViolation
+from models.lgb_cache import finite_prediction_map, write_prediction_cache
 import numpy as np
 import pandas as pd
 
@@ -295,9 +305,10 @@ class DailyPipeline:
                 return self._lgb_predictions
 
         try:
-            from models.short_term import ShortTermModel, FeatureContractViolation
-            from models.lgb_cache import finite_prediction_map, write_prediction_cache
-
+            # P0-1: ShortTermModel / FeatureContractViolation / lgb_cache
+            # helpers are imported at module level — a missing module
+            # is process-startup death, not a per-day silent cache
+            # fallback.
             model = ShortTermModel.load_from_pickle(
                 str(LGB_MODEL_PATH)
             )
@@ -2194,8 +2205,25 @@ class DailyPipeline:
         # the new "ranked_score" feeds signal_scorer; ranking-vs-magnitude
         # decoupling preserves the strength/expected calculations elsewhere
         # that depend on the raw scale.
+        #
+        # 2026-06-04 cx round 3 P1-4: cap rank normalization when the
+        # LGB distribution is YELLOW. Pre-fix, rank normalization would
+        # promote the top decile of a heavily-skewed-negative day to +1
+        # (= 强烈看多) even though the underlying prediction was a
+        # microscopic positive amid mostly negative peers. The cap pulls
+        # the top below HIGH_THRESHOLD (0.7) so YELLOW days surface as
+        # "看多" / "观望", not "强烈看多".
+        # RED is already blocked upstream in _load_lgb_predictions —
+        # by the time we get here, status is either GREEN or YELLOW.
         lgb_pool = [c for c in candidates if c.get("has_lgb")]
         n = len(lgb_pool)
+        # config.settings.HIGH_THRESHOLD is 0.7 in production; pick a
+        # cap just under so 强烈看多 cannot fire on YELLOW days.
+        from config.settings import HIGH_THRESHOLD as _HIGH_THR
+        _YELLOW_RANK_CAP = round(_HIGH_THR - 0.05, 4)
+        lgb_distribution_status = (
+            getattr(self, "_lgb_status", {}).get("distribution_health", "GREEN")
+        )
         if n > 0:
             scored = sorted(
                 lgb_pool,
@@ -2205,7 +2233,15 @@ class DailyPipeline:
             for rank, cand in enumerate(scored):
                 # rank 0 → +1, rank N-1 → -1, linear interpolation
                 normalized = 1.0 - 2.0 * (rank / max(n - 1, 1))
+                if lgb_distribution_status == "YELLOW" and normalized > _YELLOW_RANK_CAP:
+                    normalized = _YELLOW_RANK_CAP
                 cand["ranked_score"] = round(normalized, 4)
+        if lgb_distribution_status == "YELLOW":
+            logger.warning(
+                "LGB distribution YELLOW: rank normalization capped at "
+                "%.2f to suppress spurious 强烈看多 signals on a skewed day.",
+                _YELLOW_RANK_CAP,
+            )
         # Non-LGB candidates (crypto / gold) keep raw short_score as ranked
         for cand in candidates:
             cand.setdefault("ranked_score", _finite_float(cand.get("short_score")))

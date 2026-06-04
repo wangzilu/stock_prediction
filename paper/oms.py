@@ -212,13 +212,39 @@ class PaperOMS:
         return amount * self.slippage_rate
 
     def load_predictions(self) -> dict:
-        """Load latest model predictions."""
-        cache_path = DATA_DIR / "lgb_latest_predictions.json"
-        if not cache_path.exists():
+        """Load latest model predictions through the validated loader.
+
+        2026-06-04 cx round 3 P0-3: previously this method called
+        ``json.loads(cache_path.read_text())`` directly, bypassing
+        the freshness + distribution gates in
+        ``models.lgb_cache.load_prediction_cache``. That meant a
+        polluted cache (smoke RED, manual debug, anything) would
+        drive paper trades. The validated loader raises on:
+            - missing file
+            - undated / stale latest_date
+            - RED distribution (all-negative / all-zero / etc.)
+        and paper's loop logs the failure and skips this cycle
+        rather than trading on garbage."""
+        from models.lgb_cache import load_prediction_cache
+        from models.prediction_health import PredictionDistributionRed
+        try:
+            finite, _payload = load_prediction_cache()
+        except FileNotFoundError:
             logger.warning("No prediction cache found")
             return {}
-        payload = json.loads(cache_path.read_text())
-        return payload.get("predictions", {})
+        except PredictionDistributionRed as exc:
+            logger.error(
+                "Paper OMS refusing to trade on RED-distribution "
+                "prediction cache: %s", exc,
+            )
+            return {}
+        except RuntimeError as exc:
+            logger.error(
+                "Paper OMS refusing to trade on invalid prediction "
+                "cache: %s", exc,
+            )
+            return {}
+        return finite
 
     def get_current_positions(self) -> dict:
         """Get current positions as {code: Position}."""
