@@ -266,7 +266,22 @@ class PaperOMS:
         tier multipliers). Threaded through to the optimizer.
         """
         if not predictions:
-            return list(self.state.get("positions", {}).keys()), [], []
+            # 2026-06-04 cx round 14 P1-4: pre-fix returned the current
+            # holdings as the "target" with no buys/sells signal —
+            # downstream code treated this as a normal "no-change" day
+            # and the dashboard showed a clean PnL update, hiding the
+            # upstream prediction failure (broken model, stale cache,
+            # rejected health). Surface the failure as a paper-level
+            # status, write to oms_state, and skip the trade decision
+            # entirely so health monitors flag it.
+            logger.error(
+                "paper OMS: no predictions for this cycle — refusing to "
+                "treat as a normal trading decision. Holdings unchanged "
+                "but the decision is recorded as no_predictions/red."
+            )
+            self.state["last_decision_status"] = "no_predictions"
+            self._save_state()
+            return [], [], []
 
         if self.execution_mode == "optimizer_v2":
             return self._generate_target_optimizer(predictions, risk_info=risk_info)

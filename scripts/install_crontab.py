@@ -83,8 +83,15 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         # Monday's 9:20 morning_recommendation to read a Friday-22:00
         # outlook stale by 60+ hours (user-reported bug 2026-05-31).
         # Fix: 0-4 in cron = Sun-Thu.
+        # 2026-06-04 cx round 15 P1-2: enforce DAG deps so 22:00
+        # cannot ship "下一交易日策略" against a failed 17:00
+        # qlib_data_update or a failed 18:35 lgb_after_close_smoke.
+        # Pre-fix the dependency was declared in job_deps.py but the
+        # cron entry did not pass enforce_deps=True, so the DAG was
+        # decorative.
         CronJob("evening_outlook", "0 22 * * 0-4", [py, main_py, "--evening-outlook"], "cron_evening_outlook.log",
-                network="domestic", timeout_sec=900),
+                network="domestic", timeout_sec=900,
+                enforce_deps=True, dep_wait_seconds=900),
         # --- Post-close: LLM / event collection ---
     ]
     if (scripts / "collect_global_industry_news.py").exists():

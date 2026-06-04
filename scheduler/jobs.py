@@ -827,8 +827,15 @@ class DailyPipeline:
             # banner downstream). The rank order alone is the signal.
             price = _finite_float(quote.get("最新价")) if quote is not None else 0.0
             liquidity_score = min(volume / 1_000_000.0, 1.0)
+            # 2026-06-04 cx round 11 P1-4: pre-fix blended 80% model +
+            # 20% today's change_pct into short_expected and then SORTED
+            # 短线 by short_expected. That pushed today's intraday
+            # momentum into the model's ranking with NO backtest
+            # evidence the 20% blend earns alpha. Removed the change_pct
+            # mixin from short_expected; today's change_pct stays
+            # available as a separate field for display / tie-breaking.
             short_expected = round(
-                max(-10.0, min(10.0, model_score * 100.0 / max(PREDICTION_HORIZON_DAYS, 1) * 0.80 + change_pct * 0.20)),
+                max(-10.0, min(10.0, model_score * 100.0 / max(PREDICTION_HORIZON_DAYS, 1))),
                 2,
             )
             flow_score = self._capital_flow_score(code)
@@ -1174,19 +1181,29 @@ class DailyPipeline:
         )
 
     def _load_chain_alpha_for_sanitizer(self, today: str) -> dict | None:
-        """Read global_chain_factors.parquet for today's chain alpha."""
+        """Read global_chain_factors.parquet for today's chain alpha.
+
+        2026-06-04 cx round 14 P1-2: cache is keyed BY ``today``. Pre-fix
+        a single instance-level cache served the first ``today`` seen
+        forever, so a DailyPipeline running multiple target_dates
+        (backfill / replay / multi-day batch test) reused the first
+        day's chain block on every subsequent day.
+        """
         from config.settings import DATA_DIR
-        cached = getattr(self, "_chain_alpha_cache", None)
-        if cached is not None:
-            return cached
+        cache_map = getattr(self, "_chain_alpha_cache_by_date", None)
+        if cache_map is None:
+            cache_map = {}
+            self._chain_alpha_cache_by_date = cache_map
+        if today in cache_map:
+            return cache_map[today]
         path = DATA_DIR / "global_chain_factors.parquet"
         if not path.exists():
-            self._chain_alpha_cache = None
+            cache_map[today] = None
             return None
         try:
             df = pd.read_parquet(path)
             if df.empty or "global_chain_alpha" not in df.columns:
-                self._chain_alpha_cache = None
+                cache_map[today] = None
                 return None
             dt = pd.Timestamp(today)
             dates = df.index.get_level_values("datetime")
@@ -1200,26 +1217,32 @@ class DailyPipeline:
                         "Chain factors stale (%s, %d days) — skipping chain block in sanitizer",
                         latest.date(), age,
                     )
-                    self._chain_alpha_cache = None
+                    cache_map[today] = None
                     return None
                 snap = df.xs(latest, level="datetime")
             alpha = snap["global_chain_alpha"]
             alpha.index = alpha.index.str.upper()
             out = {c: float(v) for c, v in alpha.items() if pd.notna(v)}
-            self._chain_alpha_cache = out or None
-            return self._chain_alpha_cache
+            cache_map[today] = out or None
+            return cache_map[today]
         except Exception as e:
             logger.warning("Failed to load chain alpha for sanitizer: %s", e)
-            self._chain_alpha_cache = None
+            cache_map[today] = None
             return None
 
     def _load_cooldown_for_sanitizer(self, today: str) -> set | None:
         """Read RiskGuard state files (champion + shadow) and return union
-        of codes whose cooldown is still active on `today`."""
+        of codes whose cooldown is still active on ``today``.
+
+        2026-06-04 cx round 14 P1-2: keyed by ``today`` so backfill
+        and replay see the correct per-date cooldown set."""
         from config.settings import DATA_DIR
-        cached = getattr(self, "_cooldown_cache", None)
-        if cached is not None:
-            return cached
+        cache_map = getattr(self, "_cooldown_cache_by_date", None)
+        if cache_map is None:
+            cache_map = {}
+            self._cooldown_cache_by_date = cache_map
+        if today in cache_map:
+            return cache_map[today]
         codes: set[str] = set()
         for sub in ("paper", "paper_shadow"):
             state_path = DATA_DIR / sub / "risk_guard_state.json"
@@ -1232,8 +1255,8 @@ class DailyPipeline:
                         codes.add(code.upper())
             except Exception as e:
                 logger.warning("Failed to read %s for cooldown: %s", state_path, e)
-        self._cooldown_cache = codes or None
-        return self._cooldown_cache
+        cache_map[today] = codes or None
+        return cache_map[today]
 
     def _load_crash_probs_for_sanitizer(self) -> dict | None:
         """Read crash_predictions_latest.json and return {code_upper: prob}.
@@ -1245,12 +1268,18 @@ class DailyPipeline:
         wall-clock today only when no target_date is recorded.
         """
         from config.settings import DATA_DIR
-        cached = getattr(self, "_crash_probs_cache", None)
-        if cached is not None:
-            return cached
+        # 2026-06-04 cx round 14 P1-2: cache keyed by the pipeline's
+        # target_date so backfill/replay see the date-correct crash set.
+        ref = getattr(self, "_pipeline_target_date", None) or datetime.now().strftime("%Y-%m-%d")
+        cache_map = getattr(self, "_crash_probs_cache_by_date", None)
+        if cache_map is None:
+            cache_map = {}
+            self._crash_probs_cache_by_date = cache_map
+        if ref in cache_map:
+            return cache_map[ref]
         path = DATA_DIR / "crash_predictions_latest.json"
         if not path.exists():
-            self._crash_probs_cache = None
+            cache_map[ref] = None
             return None
         try:
             payload = json.loads(path.read_text())
@@ -1262,9 +1291,8 @@ class DailyPipeline:
                     "crash_predictions_latest.json has unparseable date=%r — skipping crash hard-block",
                     pred_date,
                 )
-                self._crash_probs_cache = None
+                cache_map[ref] = None
                 return None
-            ref = getattr(self, "_pipeline_target_date", None) or datetime.now().strftime("%Y-%m-%d")
             try:
                 ref_dt = datetime.strptime(str(ref)[:10], "%Y-%m-%d")
             except (ValueError, TypeError):
@@ -1281,14 +1309,14 @@ class DailyPipeline:
                     "crash_predictions_latest.json is %d trading days stale (file=%s vs signal=%s) — skipping crash hard-block",
                     age, pred_date, ref_dt.strftime("%Y-%m-%d"),
                 )
-                self._crash_probs_cache = None
+                cache_map[ref] = None
                 return None
             preds = payload.get("predictions", {}) or {}
-            self._crash_probs_cache = {str(k).upper(): float(v) for k, v in preds.items()}
-            return self._crash_probs_cache
+            cache_map[ref] = {str(k).upper(): float(v) for k, v in preds.items()}
+            return cache_map[ref]
         except Exception as e:
             logger.warning("Failed to load crash predictions: %s", e)
-            self._crash_probs_cache = None
+            cache_map[ref] = None
             return None
 
     def _candidates_from_stock_snapshot(
@@ -2121,8 +2149,27 @@ class DailyPipeline:
 
         monster_radar = self._build_monster_radar()
 
+        # cx round 15 P2-4: title now reflects the TARGET trading
+        # date, not the literal calendar day of the cron firing.
+        # Sun 22:00 → Mon market, Fri 22:00 cannot fire (no Sat
+        # market). Pre-fix the title showed the cron firing date
+        # (which is the day BEFORE the prediction's actual target),
+        # causing confusion around weekends and 调休 days.
+        # Best-effort: use the next CN trading date computed by the
+        # data_health calendar helper. Fall back to "next calendar
+        # day" if Qlib isn't initialised in this context.
+        try:
+            from scheduler.data_health import _expected_latest_trading_date as _eltd
+            import pandas as _pd
+            from qlib.data import D as _D
+            cal = _D.calendar(end_time=(datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d"))
+            today_iso = datetime.now().strftime("%Y-%m-%d")
+            future = [d for d in cal if str(_pd.Timestamp(d).date()) > today_iso]
+            target_date_str = str(_pd.Timestamp(future[0]).date()) if future else (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        except Exception:
+            target_date_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
         sections = [
-            f"【明日策略】{datetime.now().strftime('%Y-%m-%d')}",
+            f"【下一交易日策略】{target_date_str}",
             world_text,
             a_share_forecast_text,
             stock_forecast_text,
@@ -2295,11 +2342,13 @@ class DailyPipeline:
         logger.info("Starting daily recommendation pipeline...")
         today = target_date or datetime.now().strftime("%Y-%m-%d")
         self._pipeline_target_date = today
-        # Per-call caches that depend on date — clear them so a second run
-        # for a different date doesn't reuse the previous date's snapshot.
-        self._crash_probs_cache = None
-        self._chain_alpha_cache = None
-        self._cooldown_cache = None
+        # cx round 14 P1-2: these caches are now date-keyed maps so
+        # clearing them is no longer required for backfill correctness
+        # (each date gets its own entry). Keep the clear for memory
+        # hygiene in long-running processes.
+        self._crash_probs_cache_by_date = None
+        self._chain_alpha_cache_by_date = None
+        self._cooldown_cache_by_date = None
         self._geo_factors = None  # Reset cache
         self._headlines = None  # Reset cache
         self.market_collector.invalidate_cache()  # Fresh spot data

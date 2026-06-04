@@ -169,7 +169,18 @@ class CandidateSanitizer:
             self._first_dates = {}
 
     def _is_new_listing(self, code: str) -> bool | None:
-        """True if listed less than min_listing_days ago, None if data unknown."""
+        """True if listed less than min_listing_days TRADING-day-ago, None if data unknown.
+
+        2026-06-04 cx round 14 P1-1: pre-fix this used calendar days
+        ``(today - first).days < min_listing_days``. The TRAINING mask
+        (scripts/build_tradable_mask.py) uses TRADING days. The
+        discrepancy means a stock that was 50 trading days old but
+        65 calendar days old (because of weekends + 调休) would be
+        treated as "old enough" by the sanitizer but "too new" by
+        training — the inference path then recommends it but the
+        model was never trained on it. Fixed by counting trading days
+        via the CN calendar (Qlib if available, pandas bdate fallback).
+        """
         if self.min_listing_days <= 0:
             return False
         self._load_first_dates()
@@ -179,9 +190,27 @@ class CandidateSanitizer:
         try:
             first_dt = datetime.strptime(first[:10], "%Y-%m-%d")
             today_dt = datetime.strptime(self.today[:10], "%Y-%m-%d")
-            return (today_dt - first_dt).days < self.min_listing_days
         except (ValueError, TypeError):
             return None
+        if first_dt > today_dt:
+            return True  # future-dated listing → treat as new
+        try:
+            from qlib.data import D
+            cal = D.calendar(
+                start_time=str(first_dt.date()),
+                end_time=str(today_dt.date()),
+            )
+            if cal is not None and len(cal) > 0:
+                trading_days = max(int(len(cal) - 1), 0)
+                return trading_days < self.min_listing_days
+        except Exception:
+            pass
+        # Fallback: pandas bdate range (CN holidays not modelled).
+        import pandas as _pd
+        trading_days = max(
+            int(len(_pd.bdate_range(start=first_dt, end=today_dt)) - 1), 0,
+        )
+        return trading_days < self.min_listing_days
 
     # -- per-rule helpers -----------------------------------------------------
 
