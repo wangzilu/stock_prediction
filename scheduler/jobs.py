@@ -1260,10 +1260,16 @@ class DailyPipeline:
                 ref_dt = datetime.strptime(str(ref)[:10], "%Y-%m-%d")
             except (ValueError, TypeError):
                 ref_dt = datetime.now()
-            age = (ref_dt - pd_dt).days
+            # 2026-06-04 cx round 9 P2-7: count TRADING days, not
+            # calendar days. Monday after a 3-day weekend should not
+            # mark Friday's crash predictions as stale.
+            from scheduler.data_health import trading_day_age as _tda
+            age = _tda(str(pd_dt.date()), ref_dt.strftime("%Y-%m-%d"))
+            if age is None:
+                age = (ref_dt - pd_dt).days  # fallback
             if age > 3:
                 logger.warning(
-                    "crash_predictions_latest.json is %d days stale (file=%s vs signal=%s) — skipping crash hard-block",
+                    "crash_predictions_latest.json is %d trading days stale (file=%s vs signal=%s) — skipping crash hard-block",
                     age, pred_date, ref_dt.strftime("%Y-%m-%d"),
                 )
                 self._crash_probs_cache = None

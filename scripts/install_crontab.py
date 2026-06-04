@@ -130,6 +130,14 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         # --- Post-close: data update (domestic, critical) ---
         CronJob("qlib_data_update", "45 17 * * 1-5",
                 [py, str(scripts / "update_qlib_data.py"),
+                 # 2026-06-04 cx round 4 P1-7: ``--universe-source
+                 # baostock`` is hard-coded here even when price
+                 # provider auto-picks Tushare. Production used to
+                 # advertise "all Tushare" but the universe still
+                 # came from baostock. If your goal is full-Tushare,
+                 # change this to "tushare" — and make sure the
+                 # Tushare universe endpoint is whitelisted in your
+                 # TS token. Tracked in cx round 4 P1-7.
                  "--universe", "all", "--universe-source", "baostock",
                  "--refresh-universe",
                  "--min-health-instruments", "4500",

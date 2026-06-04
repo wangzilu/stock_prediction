@@ -649,14 +649,18 @@ class PaperOMS:
         try:
             payload = json.loads(crash_path.read_text())
             pred_date = payload.get("date", "")
-            # Accept if prediction date is today or yesterday (stale by 1 day is OK)
+            # 2026-06-04 cx round 9 P2-7: trading-day age (Mondays after
+            # 3-day weekends should not mark Friday's prediction stale).
             if pred_date and pred_date < date[:10]:
-                # More than a day stale — check how old
-                from datetime import datetime as _dt
-                age = (_dt.strptime(date[:10], "%Y-%m-%d") -
-                       _dt.strptime(pred_date, "%Y-%m-%d")).days
+                from scheduler.data_health import trading_day_age as _tda
+                age = _tda(pred_date, date[:10])
+                if age is None:
+                    # Fallback: calendar-day age
+                    from datetime import datetime as _dt
+                    age = (_dt.strptime(date[:10], "%Y-%m-%d") -
+                           _dt.strptime(pred_date, "%Y-%m-%d")).days
                 if age > 2:
-                    logger.info(f"  Crash predictions stale ({pred_date}, {age}d old), skipping")
+                    logger.info(f"  Crash predictions stale ({pred_date}, {age} trading days old), skipping")
                     return None
             crash_probs = payload.get("predictions", {})
             if crash_probs:

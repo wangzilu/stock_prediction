@@ -84,19 +84,68 @@ def read_health(source: str, date: str = None) -> dict:
 
 
 def _expected_latest_trading_date(date: str | None = None) -> str:
-    """Return the expected most-recent trading date for ``date`` (or now).
+    """Return the expected most-recent CN trading date for ``date`` (or now).
 
-    Uses pandas business-day approximation. cx round 9 P1-5 notes this
-    does not cover CN holidays / 调休 correctly — a follow-up should
-    consult the Qlib calendar / exchange holiday source. For now this
-    matches the existing ``--check-today`` semantics in
-    ``scripts/update_qlib_data.py``, so the freshness gate behaves
-    consistently with the freshness check that produced the artifact.
+    2026-06-04 cx round 9 P1-5: prefer Qlib's CN calendar over
+    pandas bdate_range so 调休 / 临时休市 / public holidays don't
+    produce false freshness errors. Falls back to pandas bdate_range
+    only when Qlib's calendar isn't available (research environment,
+    qlib_data not initialised yet).
     """
-    import pandas as _pd
     today = date or datetime.now().strftime("%Y-%m-%d")
+    # Try Qlib calendar first.
+    try:
+        from qlib.data import D
+        cal = D.calendar(end_time=today)
+        if cal is not None and len(cal) > 0:
+            last = cal[-1]
+            # cal can be a list/ndarray of Timestamps. Coerce.
+            import pandas as _pd
+            return str(_pd.Timestamp(last).date())
+    except Exception:
+        pass
+    # Fallback: pandas business-day approximation (still wrong on
+    # CN-specific holidays, but better than nothing).
+    import pandas as _pd
     recent_bdays = _pd.bdate_range(end=today, periods=3)
     return str(recent_bdays[-1].date())
+
+
+def trading_day_age(
+    older_date: str, reference_date: str | None = None,
+) -> int | None:
+    """Number of CN trading days between ``older_date`` and ``reference_date``.
+
+    2026-06-04 cx round 9 P2-7: risk-control freshness checks
+    (crash predictions, supply-chain factors) previously used
+    calendar-day age — Mondays after a 3-day weekend got the same
+    "stale" verdict as a true 3-trading-day gap. Use this helper to
+    count actual trading sessions instead.
+    Returns None if either date is unparseable.
+    """
+    import pandas as _pd
+    ref = reference_date or datetime.now().strftime("%Y-%m-%d")
+    try:
+        older_dt = _pd.Timestamp(older_date[:10])
+        ref_dt = _pd.Timestamp(ref[:10])
+    except Exception:
+        return None
+    if older_dt > ref_dt:
+        return 0
+    # Try Qlib calendar first.
+    try:
+        from qlib.data import D
+        cal = D.calendar(
+            start_time=str(older_dt.date()),
+            end_time=str(ref_dt.date()),
+        )
+        if cal is not None and len(cal) > 0:
+            # cal includes both endpoints when they are trading days.
+            return max(int(len(cal) - 1), 0)
+    except Exception:
+        pass
+    # Fallback: pandas bdate_range (CN holidays not modelled).
+    return int(len(_pd.bdate_range(start=older_dt, end=ref_dt)) - 1)
 
 
 def is_fresh(
@@ -243,22 +292,30 @@ def daily_summary(date: str = None) -> dict:
 
 # --- Predefined source groups for freshness gates ---
 
-# Critical for training/prediction — must be fresh
+# 2026-06-04 cx round 9 P1-4: critical now includes the supplementary
+# feature data sources the trained champion actually consumes. Pre-fix
+# fund_flow_update / valuation_update / regime_daily_update sat in
+# OVERLAY or OPTIONAL, so stale snapshots only produced a degrade
+# banner — but the trained model has ALREADY ingested those columns
+# and inference will use whatever stale value is on disk. The right
+# response to stale supplementary inputs is to block training and
+# degrade live prediction, not to print a warning.
 CRITICAL_SOURCES = [
     "qlib_data_update",
+    # cx round 9 P1-4: production supplementary data sources
+    "fund_flow_update",
+    "valuation_update",
+    "regime_daily_update",
 ]
 
 # Required for full pipeline — stale = degrade overlay
 OVERLAY_SOURCES = [
     "llm_event_pipeline",
-    "regime_daily_update",
 ]
 
 # Nice to have — missing = skip overlay
 OPTIONAL_SOURCES = [
     "guba_popularity",
-    "fund_flow_update",
-    "valuation_update",
 ]
 
 

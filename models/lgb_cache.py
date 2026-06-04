@@ -161,6 +161,27 @@ def load_prediction_cache(
             f"(max={max_age_days})"
         )
 
+    # 2026-06-04 cx round 9 P1-3: tighten by also requiring
+    # latest_date to be at least the most-recent CN trading date.
+    # The 7-calendar-day default is too permissive for daily-frequency
+    # A-share recommendations — it effectively let last week's
+    # predictions feed today's signal. Trading-date check refuses
+    # any cache that pre-dates the last trading session.
+    try:
+        from scheduler.data_health import _expected_latest_trading_date
+        expected = _expected_latest_trading_date()
+        if latest_date < expected:
+            raise RuntimeError(
+                f"LGB prediction cache latest_date={latest_date} is older "
+                f"than last trading date {expected} (CN trading-day gate)"
+            )
+    except RuntimeError:
+        raise
+    except Exception:
+        # Fallback to calendar-day check (still applied above) if the
+        # trading-day helper isn't available for any reason.
+        pass
+
     # Distribution health gate. Prefer the writer-recorded status
     # (faster, no recomputation), fall back to classifying live for
     # caches written before the writer gate landed.
