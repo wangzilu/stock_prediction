@@ -804,6 +804,17 @@ class DailyPipeline:
             universe = [(code, None) for code in lgb_preds]
 
         for code, quote in universe:
+            # 2026-06-04 22:00 incident fix: when spot cache is PARTIAL,
+            # codes without a quote ended up in the report with name="",
+            # change_pct=0%, and price=0 — the user sees a row that
+            # looks like an empty placeholder. Skip these candidates
+            # entirely so the partial-coverage report only shows
+            # stocks we actually have a quote for. The candidate
+            # SANITIZER would not catch this because we deliberately
+            # use require_quote=False at this site (evening forecast
+            # is observation-mode, not actionable).
+            if is_partial and quote is None:
+                continue
             name = str(quote.get("名称", "")) if quote is not None else ""
             ok, _reason = sanitizer.check(code, name, quote=quote)
             if not ok:
