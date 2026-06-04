@@ -139,9 +139,21 @@ class FundingArbResult:
     net_pnl_usd: float = 0.0
     fees_paid_usd: float = 0.0
     slippage_paid_usd: float = 0.0
-    after_cost_apr: float = 0.0
+    # 2026-06-04 cx round 28 P0-1 + P1-2: expose BOTH denominators so
+    # consumers can't accidentally read the rosier notional figure.
+    # ``after_cost_apr`` is an ALIAS of ``after_cost_apr_on_capital``
+    # (the honest one); ``after_cost_apr_on_notional`` is kept for
+    # comparing against the legacy reporting. ``passes_acceptance``
+    # uses the capital figure.
+    after_cost_apr_on_notional: float = 0.0
+    after_cost_apr_on_capital: float = 0.0
+    after_cost_apr: float = 0.0  # = after_cost_apr_on_capital
     after_cost_sharpe: float = 0.0
-    max_drawdown: float = 0.0
+    max_drawdown: float = 0.0  # legacy alias
+    max_drawdown_on_notional: float = 0.0
+    max_drawdown_on_capital: float = 0.0
+    capital_required_usd: float = 0.0
+    effective_notional_usd: float = 0.0
     timeline: pd.DataFrame = field(default_factory=pd.DataFrame)
     """Per-event timeline: timestamp, funding_rate, position, gross_pnl,
     net_pnl, cumulative_net_pnl, action."""
@@ -149,21 +161,32 @@ class FundingArbResult:
     def summary(self) -> str:
         return (
             f"FundingArbResult({self.n_events} events, "
-            f"net=${self.net_pnl_usd:,.2f}, APR={self.after_cost_apr*100:.2f}%, "
+            f"net=${self.net_pnl_usd:,.2f}, "
+            f"APR(cap)={self.after_cost_apr_on_capital*100:.2f}% / "
+            f"APR(not)={self.after_cost_apr_on_notional*100:.2f}%, "
             f"Sharpe={self.after_cost_sharpe:.2f}, "
-            f"max_dd={self.max_drawdown*100:.1f}%)"
+            f"max_dd(cap)={self.max_drawdown_on_capital*100:.1f}%)"
         )
 
     def passes_acceptance(self) -> tuple[bool, str]:
-        """Apply the Phase Crypto-C acceptance gate."""
+        """Apply the Phase Crypto-C acceptance gate.
+
+        cx round 28 P0-1: gate uses the CAPITAL-denominated APR, not
+        the rosier notional-denominated figure. A funding arb that
+        looks like ~10% APR on notional collapses to ~5% APR on
+        capital when capital_required ≈ 2× notional under 1× leverage.
+        """
         if self.after_cost_sharpe >= 1.5:
             return True, f"Sharpe {self.after_cost_sharpe:.2f} ≥ 1.5"
-        if self.after_cost_apr >= 0.05:
-            return True, f"APR {self.after_cost_apr*100:.1f}% ≥ 5%"
+        if self.after_cost_apr_on_capital >= 0.05:
+            return True, f"APR(capital) {self.after_cost_apr_on_capital*100:.1f}% ≥ 5%"
         return False, (
             f"Sharpe {self.after_cost_sharpe:.2f} < 1.5 AND "
-            f"APR {self.after_cost_apr*100:.2f}% < 5% — strategy "
-            "doesn't clear the acceptance bar at this size. "
+            f"APR(capital) {self.after_cost_apr_on_capital*100:.2f}% < 5% — "
+            "strategy doesn't clear the acceptance bar at this size. "
+            "(APR on notional would have been "
+            f"{self.after_cost_apr_on_notional*100:.2f}%, kept for "
+            "comparison; do not rely on the rosier number.) "
             "See Δ2 fail verdict path."
         )
 
@@ -239,11 +262,14 @@ def backtest_funding_arb(
         notional = requested_notional
     fee_per_leg = config.fee_rate_per_leg
     slip_per_leg = config.slippage_bps_per_leg / 1e4
-    cost_per_flip = notional * 2 * (fee_per_leg + slip_per_leg)
-    # *2 because each entry/exit involves both legs (perp + spot).
+    # cx round 28 P2-4: removed the unused ``cost_per_flip`` local
+    # (computed but never referenced). Costs are calculated inline at
+    # each open/close/flip site below.
 
     # State
-    position_sign = 0   # +1 long perp / short spot, -1 short perp / long spot
+    # cx round 28 P1-3: comment direction fix (was reversed). +1 means
+    # the SHORT-perp leg (we collect funding when funding_rate > 0).
+    position_sign = 0   # +1 short perp + long spot, -1 long perp + short spot
     n_open = 0
     n_close = 0
     n_flip = 0
@@ -339,15 +365,19 @@ def backtest_funding_arb(
         if n_events else 0.0
     )
 
-    # Drawdown
+    # Drawdown — cx round 28 P1-2: report on capital AND notional so
+    # downstream can pick the right denominator. capital is the
+    # honest one for paper-account viability.
     if n_events:
         eq = timeline["cum_net_pnl"].values
         peak = np.maximum.accumulate(eq)
-        # Express in fraction-of-notional terms
-        dd = (eq - peak) / max(notional, 1.0)
-        max_dd = float(abs(dd.min()))
+        dd_not = (eq - peak) / max(notional, 1.0)
+        dd_cap = (eq - peak) / max(capital_required, 1.0)
+        max_dd_notional = float(abs(dd_not.min()))
+        max_dd_capital = float(abs(dd_cap.min()))
     else:
-        max_dd = 0.0
+        max_dd_notional = 0.0
+        max_dd_capital = 0.0
 
     return FundingArbResult(
         n_events=n_events,
@@ -358,8 +388,14 @@ def backtest_funding_arb(
         net_pnl_usd=float(cum_net),
         fees_paid_usd=float(fees_total),
         slippage_paid_usd=float(slip_total),
-        after_cost_apr=float(apr),
+        after_cost_apr_on_notional=float(apr),
+        after_cost_apr_on_capital=float(apr_on_capital),
+        after_cost_apr=float(apr_on_capital),  # alias — see dataclass note
         after_cost_sharpe=float(sharpe),
-        max_drawdown=max_dd,
+        max_drawdown_on_notional=max_dd_notional,
+        max_drawdown_on_capital=max_dd_capital,
+        max_drawdown=max_dd_capital,  # alias
+        capital_required_usd=float(capital_required),
+        effective_notional_usd=float(notional),
         timeline=timeline,
     )
