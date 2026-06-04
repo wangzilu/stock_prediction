@@ -107,11 +107,32 @@ def main():
         pipeline.run_risk_check()
         return
 
-    # Default: start scheduler
+    # 2026-06-04 cx round 15 P1-1: the in-process APScheduler block is
+    # DISABLED by default. The production schedule lives in
+    # scripts/install_crontab.py — the single source of truth — and
+    # diverged from this block (e.g. evening_outlook here is Mon-Fri
+    # but cron is Sun-Thu to cover Sun→Mon markets, the old bug from
+    # 2026-05-31). Re-enabling this block would resurrect that bug.
+    # To intentionally run the in-process scheduler for offline /
+    # disconnected use, set MAIN_PY_INPROC_SCHEDULER=acknowledge_unsafe.
+    if os.environ.get("MAIN_PY_INPROC_SCHEDULER") != "acknowledge_unsafe":
+        logger.error(
+            "main.py default scheduler path is DISABLED — use the cron "
+            "installed by scripts/install_crontab.py. Set "
+            "MAIN_PY_INPROC_SCHEDULER=acknowledge_unsafe to override "
+            "(NOT recommended; the in-process schedule has diverged "
+            "from the production cron and brings back the Sun→Mon bug)."
+        )
+        sys.exit(2)
+
     from apscheduler.schedulers.blocking import BlockingScheduler
     from apscheduler.triggers.cron import CronTrigger
 
     scheduler = BlockingScheduler()
+
+    # NOTE: the schedule below DOES NOT match
+    # scripts/install_crontab.py. It is retained for diagnostic /
+    # disconnected use only; the production schedule comes from cron.
 
     # 9:20 Morning recommendation (pre-market)
     scheduler.add_job(
@@ -137,10 +158,10 @@ def main():
         name="Daily Summary",
     )
 
-    # 22:00 Evening outlook
+    # 22:00 Evening outlook — note: cron uses sun-thu, not mon-fri
     scheduler.add_job(
         _status_wrapped("evening_outlook", pipeline.run_evening_outlook),
-        CronTrigger(day_of_week="mon-fri", hour=22, minute=0),
+        CronTrigger(day_of_week="sun-thu", hour=22, minute=0),
         id="evening_outlook",
         name="Evening Outlook",
     )
@@ -161,12 +182,12 @@ def main():
         name="Hourly Risk Check",
     )
 
-    logger.info("Scheduler started. Jobs:")
+    logger.info("Scheduler started (MAIN_PY_INPROC_SCHEDULER override active). Jobs:")
     logger.info("  - Morning recommendation: Mon-Fri 09:20")
     logger.info("  - Intraday decision: Mon-Fri 14:30")
     logger.info("  - Daily summary: Mon-Fri 15:30")
     logger.info("  - Spot cache warmup: Mon-Fri 17:05")
-    logger.info("  - Evening outlook: Mon-Fri 22:00")
+    logger.info("  - Evening outlook: Sun-Thu 22:00 (matches cron Sun-Thu fix)")
     logger.info("  - Risk check: Mon-Fri 9:30-15:30 (hourly)")
     logger.info("Press Ctrl+C to exit.")
 

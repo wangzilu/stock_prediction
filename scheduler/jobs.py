@@ -1146,7 +1146,8 @@ class DailyPipeline:
 
     def _make_sanitizer(self, *, require_quote: bool = True,
                         max_prediction_age_days: int = 3,
-                        target_date: str | None = None) -> CandidateSanitizer:
+                        target_date: str | None = None,
+                        actionable_required: bool = False) -> CandidateSanitizer:
         """Build a CandidateSanitizer for the current pipeline call.
 
         target_date: the date the pipeline is generating signals FOR. For
@@ -1178,6 +1179,7 @@ class DailyPipeline:
             crash_probs=crash_probs,
             chain_alpha=chain_alpha,
             cooldown_set=cooldown_set,
+            actionable_required=actionable_required,
         )
 
     def _load_chain_alpha_for_sanitizer(self, today: str) -> dict | None:
@@ -1384,9 +1386,14 @@ class DailyPipeline:
         return candidates
 
     def _build_stock_candidates(self, lgb_preds: dict, stock_macro: float) -> list[dict]:
-        """Build A-share candidates with model-covered stocks preferred when available."""
+        """Build A-share candidates with model-covered stocks preferred when available.
+
+        2026-06-04 cx round 14 P1-3: actionable_required=True ensures
+        no-quote candidates can never enter the buy pipeline even if
+        someone later flips require_quote off here.
+        """
         candidates = []
-        sanitizer = self._make_sanitizer(require_quote=True)
+        sanitizer = self._make_sanitizer(require_quote=True, actionable_required=True)
         self.market_collector._load_spot_cache()
         spot = self.market_collector._spot_cache
         lgb_available = bool(lgb_preds) and getattr(self, "_lgb_status", {}).get("status") == "ok"
@@ -1640,16 +1647,26 @@ class DailyPipeline:
         """Build 14:30 strong-buy candidates from model scores plus live tape.
 
         cx code review 2026-06-04 P1 #4/#5: previously filtered
-        `expected <= 0` and labelled `强烈推荐` only when
-        `short_score >= 0.04`. On bearish all-negative days (and given
-        the standing 158-vs-242 inference mismatch — raw scores often
-        in [-0.03, 0.03]), every candidate was filtered out and even
-        relative-best ones never reached the 0.04 absolute threshold.
-        Switch to relative ranking: keep all candidates, label by
-        cross-sectional rank percentile.
+        ``expected <= 0`` and labelled ``强烈推荐`` only when
+        ``short_score >= 0.04``. On bearish days the model is a 5-day
+        cross-sectional ranking/return score; raw values cluster near
+        zero in [-0.03, 0.03] for most names, so an absolute threshold
+        rejected even relative-best candidates. Switch to relative
+        ranking: keep all candidates, label by cross-sectional rank
+        percentile. When the LGB distribution is YELLOW/RED, the
+        ranked_score upstream is capped below MID_THRESHOLD so signal
+        cannot reach 看多 — the resulting empty buy-list is the
+        correct outcome on a "defensive observation" day.
+
+        2026-06-04 cx round 11 P1-3: removed the old
+        "standing 158-vs-242 inference mismatch" rationale that used
+        to explain the [-0.03, 0.03] range. That mismatch was closed
+        by the contract gate; the score range explanation now reflects
+        the real semantics (5-day cross-sectional rank/return).
         """
         spot = self._spot_lookup()
-        sanitizer = self._make_sanitizer(require_quote=True)
+        # cx round 14 P1-3: actionable_required for intraday buy.
+        sanitizer = self._make_sanitizer(require_quote=True, actionable_required=True)
         rows = []
 
         # cx P0: partial spot must not serve as universe. When spot is

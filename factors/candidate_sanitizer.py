@@ -17,16 +17,27 @@ recommendation/paper trade right now". Every entry point that turns a model
 score into a user-visible candidate or a paper-trade order MUST go through it.
 
 Rules enforced:
-  1. ST / *ST / 退市整理 — by name pattern OR by st_stock_list.json membership
+  1. ST / *ST / 退市整理 — by name pattern OR by st_stock_list.json membership.
+     2026-06-04 cx round 14 P2-5: the live (current-day) path uses the
+     current ST list. The historical / replay path should pass the
+     ``asof_date`` so a historically-aware ST mask can be consulted;
+     #91 tracks adding the data/storage/st_historical_mask.parquet
+     producer.
   2. 北交所 (BJ / 4xx / 8xx / 9xx) — code prefix
   3. Invalid price (≤ 0 or NaN)
   4. Suspended trading today (volume == 0 / NaN / quote missing)
   5. 一字板 (high == low this session — can't actually transact at target price)
   6. Low liquidity (volume below configurable floor)
   7. Stale prediction (prediction date older than freshness window)
+  8. New IPO < min_listing_days TRADING days (cx round 14 P1-1) —
+     consults Qlib calendar so the count matches training-mask semantics.
 
-Rules NOT enforced (yet — listing-date data isn't in a single location):
-  - New IPO < 60 days (tracked in build_tradable_mask; expose via daily file in next iteration)
+Doc drift fix (cx round 14 P2-6, 2026-06-04): pre-fix this block
+listed "New IPO < 60 days" under "Rules NOT enforced (yet)" while the
+IPO check at line ~171 was actually live. The "Rules NOT enforced"
+block has been deleted because every original IPO rule IS now
+enforced; future deferred rules should be tracked in the issue
+tracker, not in this docstring.
 
 Fail-closed semantics: if st_stock_list.json fails to load AND the caller can't
 provide a name string, the sanitizer treats the candidate as REJECTED. This is
@@ -79,12 +90,23 @@ class CandidateSanitizer:
         chain_alpha: dict | None = None,
         min_chain_alpha: float = -2.0,
         cooldown_set: set | None = None,
+        actionable_required: bool = False,
     ):
         self.today = today or datetime.now().strftime("%Y-%m-%d")
         self.min_volume = float(min_volume)
         self.max_prediction_age_days = int(max_prediction_age_days)
         self.allow_bse = bool(allow_bse)
         self.require_quote = bool(require_quote)
+        # 2026-06-04 cx round 14 P1-3: actionable_required=True forces
+        # quote presence even if require_quote=False. Used by paths
+        # that will feed a candidate into the BUY pipeline (morning
+        # recommendation, sell-check, paper OMS). Observation-only
+        # paths (evening snapshot, index top lists, 14:30 monitor
+        # display) keep actionable_required=False so they can still
+        # surface stocks without a live quote — those candidates ARE
+        # tagged with not_actionable_reason="no_quote_unverified" via
+        # ``last_check_reason`` for downstream filtering.
+        self.actionable_required = bool(actionable_required)
         self.min_listing_days = int(min_listing_days)
         # Crash probability hard block (mini-RiskGuard for recommendation path).
         # crash_probs is {code_upper: prob}; codes with prob >= threshold are
@@ -312,9 +334,17 @@ class CandidateSanitizer:
 
         # 3-6. quote-dependent rules
         if quote is None:
-            if self.require_quote:
+            if self.require_quote or self.actionable_required:
+                # cx round 14 P1-3: actionable_required forces rejection
+                # even when require_quote=False — keeps the buy
+                # pipeline from accepting unverified-quote candidates.
                 self._stats["no_quote"] += 1
-                return False, "no_quote"
+                reason = (
+                    "no_quote_actionable"
+                    if self.actionable_required and not self.require_quote
+                    else "no_quote"
+                )
+                return False, reason
         else:
             price = self._finite(quote.get("最新价", quote.get("price")))
             high = self._finite(quote.get("最高", quote.get("high")))

@@ -161,6 +161,20 @@ class PromotionGate:
 
         # 3. Backtest checks
         bt = art.load_backtest()
+        # 2026-06-04 cx round 12 P1-4 + cx round 11 P2-6: the gate now
+        # requires three-of-three criteria when the backtest exposes
+        # them. The pre-fix gate could pass with only label-space
+        # RankIC positive — a champion that beats noise on standardised
+        # label but earns no real return could still be promoted.
+        #   (a) rank_ic_mean > min_rank_ic              (existing)
+        #   (b) top20_raw_return_spread > 0             (new, raw $)
+        #   (c) cost_adjusted_spread > min_cost_adjusted_spread (P1-4)
+        # If the backtest does not record raw return spread (legacy
+        # artifact), criterion (b) is recorded as a "raw_return_unknown"
+        # warning instead of a hard failure so older artifacts can still
+        # be evaluated — but the recommendation tag is downgraded.
+        raw_return_spread_seen = False
+        raw_return_spread_positive = False
         if bt:
             turnover = bt.get("avg_turnover")
             if turnover is not None:
@@ -179,6 +193,25 @@ class PromotionGate:
                         f"cost_to_return={ctr:.2f} > "
                         f"threshold={self.thresholds['max_cost_to_return']}"
                     )
+
+            # cx round 12 P1-4: raw forward-return spread check (NOT
+            # the label-space spread which may be CSZScoreNorm'd).
+            rrs = bt.get("top20_raw_return_spread")
+            if rrs is not None:
+                raw_return_spread_seen = True
+                checks["top20_raw_return_spread"] = rrs
+                if rrs <= 0:
+                    failures.append(
+                        f"top20_raw_return_spread={rrs:+.4f} ≤ 0 "
+                        f"(model has no raw $ alpha at top-K)"
+                    )
+                else:
+                    raw_return_spread_positive = True
+
+            # cx round 11 P2-6: gate aggregator metrics for the
+            # rolling-split case (computed below by the splits block;
+            # surface a warning here if a single artifact's RankIC
+            # alone is being relied on).
         else:
             failures.append("No backtest.json — portfolio-level validation required for shadow")
 
@@ -282,6 +315,44 @@ class PromotionGate:
             )
             checks["split_positive_ratio"] = split_pos_ratio
             checks["missing_splits"] = missing_splits
+
+            # cx round 11 P2-6: multi-metric aggregator. A mean-driven
+            # gate is gameable by a few outlier-Sharpe splits that pull
+            # the average up. Record median, worst-quartile mean, and
+            # max single-split contribution so the gate report exposes
+            # those tails. Hard-fail when worst-quartile mean is itself
+            # non-positive (= the bottom 25% of splits actively lose).
+            import statistics as _stats
+            valid_ics = [ic for ic in split_ics if ic is not None]
+            if valid_ics:
+                median_ic = float(_stats.median(valid_ics))
+                checks["median_rank_ic"] = round(median_ic, 6)
+                sorted_ics = sorted(valid_ics)
+                q1_size = max(int(len(sorted_ics) * 0.25), 1)
+                worst_quartile = sorted_ics[:q1_size]
+                worst_q_mean = (
+                    float(_stats.mean(worst_quartile)) if worst_quartile else 0.0
+                )
+                checks["worst_quartile_mean_rank_ic"] = round(worst_q_mean, 6)
+                total_abs = sum(abs(ic) for ic in valid_ics) or 1.0
+                max_single_contribution = max(
+                    abs(ic) for ic in valid_ics
+                ) / total_abs
+                checks["max_single_split_contribution"] = round(
+                    max_single_contribution, 4
+                )
+                if worst_q_mean <= 0:
+                    failures.append(
+                        f"worst_quartile_rank_ic_mean={worst_q_mean:+.4f} ≤ 0 "
+                        f"(bottom 25% of splits actively lose — mean is "
+                        f"propped by extremes)"
+                    )
+                if max_single_contribution > 0.40:
+                    failures.append(
+                        f"max_single_split_contribution={max_single_contribution:.2%} > 40% "
+                        f"(one split dominates the aggregate — distribution "
+                        f"too thin for promotion)"
+                    )
 
             # HARD FAIL: split positive ratio below threshold
             if split_pos_ratio < self.thresholds["min_rank_ic_pos_ratio"]:

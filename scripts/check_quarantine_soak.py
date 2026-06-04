@@ -141,14 +141,30 @@ def _check_required_jobs(jobs_today: dict, target: str) -> tuple[str, list[str]]
         if j in REQUIRED_DAILY_JOBS and info.get("status") != "success"
     ]
 
-    # Saturday/Sunday: A-share market closed, no morning/sell/summary expected.
-    weekday = datetime.strptime(target, "%Y-%m-%d").weekday()
-    is_weekend = weekday >= 5  # 5=Sat, 6=Sun
+    # 2026-06-04 cx round 15 P2-5: use the CN trading calendar instead
+    # of pandas weekday >= 5. Pre-fix春节 / 国庆 / 调休 produced false
+    # "missing daily job" alarms (it WAS a calendar weekday but a CN
+    # holiday) or false "weekend so OK" passes (调休 made a weekend
+    # day a working day).
+    is_non_trading_day = False
+    try:
+        from qlib.data import D
+        cal = D.calendar(end_time=target)
+        if cal is not None and len(cal) > 0:
+            import pandas as _pd
+            latest_trading = str(_pd.Timestamp(cal[-1]).date())
+            is_non_trading_day = (target > latest_trading) or (
+                target not in {str(_pd.Timestamp(d).date()) for d in cal}
+            )
+    except Exception:
+        # Fallback: weekday-based check
+        weekday = datetime.strptime(target, "%Y-%m-%d").weekday()
+        is_non_trading_day = weekday >= 5
 
-    if is_weekend:
-        notes.append(f"{target} is weekend — daily-cron requirements waived")
+    if is_non_trading_day:
+        notes.append(f"{target} is non-trading day (CN calendar) — daily-cron requirements waived")
         if failed:
-            return "YELLOW", notes + [f"unexpected failures on weekend: {failed}"]
+            return "YELLOW", notes + [f"unexpected failures on non-trading day: {failed}"]
         return "GREEN", notes
 
     if failed:

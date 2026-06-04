@@ -310,36 +310,60 @@ def check_freshness(
 
 
 def daily_summary(date: str = None) -> dict:
-    """Summarize all health statuses for a date."""
+    """Summarize all health statuses for a date.
+
+    2026-06-04 cx round 13 P1-4: also reports MISSING CRITICAL sources
+    explicitly. Pre-fix this only counted ``n_success`` / ``n_failed``
+    over files that existed, so a day where ``qlib_data_update`` never
+    ran AT ALL looked the same as a day where it succeeded — the
+    summary said "n_success=N n_failed=0" with no signal that a
+    critical source was simply absent. The new ``missing_critical``
+    and ``overall_status`` fields surface absence as RED.
+    """
     date = date or datetime.now().strftime("%Y-%m-%d")
     day_dir = HEALTH_DIR / date
-    if not day_dir.exists():
-        return {"date": date, "sources": {}, "n_success": 0, "n_failed": 0}
 
-    sources = {}
+    sources: dict = {}
     n_success = 0
     n_failed = 0
 
-    for f in sorted(day_dir.glob("*.json")):
-        with open(f) as fh:
-            h = json.load(fh)
-        source = h.get("source", f.stem)
-        sources[source] = {
-            "success": h.get("success", False),
-            "n_items": h.get("n_items", 0),
-            "latest_date": h.get("latest_date", ""),
-            "error_type": h.get("error_type", ""),
-        }
-        if h.get("success"):
-            n_success += 1
-        else:
-            n_failed += 1
+    if day_dir.exists():
+        for f in sorted(day_dir.glob("*.json")):
+            with open(f) as fh:
+                h = json.load(fh)
+            source = h.get("source", f.stem)
+            sources[source] = {
+                "success": h.get("success", False),
+                "n_items": h.get("n_items", 0),
+                "latest_date": h.get("latest_date", ""),
+                "error_type": h.get("error_type", ""),
+            }
+            if h.get("success"):
+                n_success += 1
+            else:
+                n_failed += 1
+
+    # Missing-critical detection (cx round 13 P1-4)
+    missing_critical = [s for s in CRITICAL_SOURCES if s not in sources]
+    failed_critical = [
+        s for s in CRITICAL_SOURCES
+        if s in sources and not sources[s].get("success")
+    ]
+    if missing_critical or failed_critical:
+        overall_status = "RED"
+    elif n_failed > 0:
+        overall_status = "YELLOW"
+    else:
+        overall_status = "GREEN"
 
     return {
         "date": date,
         "sources": sources,
         "n_success": n_success,
         "n_failed": n_failed,
+        "missing_critical": missing_critical,
+        "failed_critical": failed_critical,
+        "overall_status": overall_status,
     }
 
 
@@ -360,6 +384,37 @@ CRITICAL_SOURCES = [
     "valuation_update",
     "regime_daily_update",
 ]
+
+
+# 2026-06-04 cx round 13 P1-5: every group listed in
+# PRODUCTION_SUPPLEMENTARY_GROUPS must have a corresponding entry
+# here. Groups without a health source can produce stale supp
+# features without the gate noticing. ``validate_production_feature_coverage``
+# below cross-checks at startup.
+PRODUCTION_GROUP_TO_HEALTH_SOURCE: dict[str, str] = {
+    "fundamental": "qlib_data_update",       # piggybacks qlib daily update
+    "capital_flow": "fund_flow_update",
+    "macro_zero_baseline": "qlib_data_update",  # zero-baseline, no fresh source needed
+    "shareholder": "qlib_data_update",        # TODO #91: separate fetch_shareholder_data job
+    "valuation": "valuation_update",
+    "northbound": "qlib_data_update",         # TODO: separate hk_hold fetch
+    "quality": "valuation_update",             # quality lives in valuation parquet
+    "st_daily_basic": "qlib_data_update",
+    "st_moneyflow": "qlib_data_update",
+    "st_holder_number": "qlib_data_update",
+    "cross_market_regime": "regime_daily_update",
+}
+
+
+def validate_production_feature_coverage() -> tuple[bool, list[str]]:
+    """Check that every PRODUCTION_SUPPLEMENTARY_GROUPS entry maps to
+    a known health source. Returns (ok, missing_mappings)."""
+    from config.production_features import PRODUCTION_SUPPLEMENTARY_GROUPS
+    missing = [
+        g for g in PRODUCTION_SUPPLEMENTARY_GROUPS
+        if g not in PRODUCTION_GROUP_TO_HEALTH_SOURCE
+    ]
+    return (not missing), missing
 
 # Required for full pipeline — stale = degrade overlay
 OVERLAY_SOURCES = [

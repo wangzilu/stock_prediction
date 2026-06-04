@@ -162,13 +162,34 @@ def evaluate(pred, label, index):
             continue
         s = g.sort_values("pred", ascending=False)
         spreads.append(s.head(20)["label"].mean() - s.tail(20)["label"].mean())
+
+    # 2026-06-04 cx round 12 P1-1: emit BOTH label-spread (default,
+    # may be CSZScoreNorm-processed) and raw-forward-return spread when
+    # the label is normalised. Without a raw_return reference here we
+    # can only tag the unit; downstream backtest scripts that load this
+    # JSON must check ``label_unit`` before reading top20_spread as a
+    # percentage. The "+%.3f%%" printout in main() also gets a unit
+    # disclaimer.
+    label_unit = "alpha_qlib_csz_norm"
+    # ``label_unit`` is "alpha_qlib_csz_norm" because the dataset
+    # config uses Qlib's CSZScoreNorm pre-processor — the spread
+    # is on standardised label, NOT raw 5-day return. To get raw
+    # return spread, the caller must re-evaluate with a label that
+    # bypasses CSZScoreNorm (planned: train_pit_baseline_raw.py
+    # — task #102 follow-up).
     return {
         "ic_mean": round(float(ic.mean()), 6),
         "ic_std": round(float(ic.std()), 6),
         "icir": round(float(ic.mean()) / (float(ic.std()) + 1e-8), 4),
         "rank_ic_mean": round(float(ric.mean()), 6),
         "rank_ic_pos_ratio": round(float((ric > 0).mean()), 4),
+        # cx round 11 P2-5: rename to make the unit obvious. Old key
+        # ``top20_spread`` kept as alias for back-compat with existing
+        # consumers reading the JSON.
+        "top20_label_spread": round(float(np.mean(spreads)) if spreads else 0, 6),
         "top20_spread": round(float(np.mean(spreads)) if spreads else 0, 6),
+        "label_unit": label_unit,
+        "top20_raw_return_spread": None,  # populated when raw-return label is wired
         "spread_pos_ratio": round(float(np.mean([s > 0 for s in spreads])) if spreads else 0, 4),
         "n_test_days": len(spreads),
         "n_samples": int(mask.sum()),
@@ -352,7 +373,13 @@ def main():
                 logger.info(f"  ICIR:     {metrics['icir']:.3f}")
                 logger.info(f"  RankIC:   {metrics['rank_ic_mean']:+.4f}")
                 logger.info(f"  RankIC>0: {metrics['rank_ic_pos_ratio']:.1%}")
-                logger.info(f"  Spread:   {metrics['top20_spread']*100:+.3f}%")
+                # cx round 12 P1-1 / round 11 P2-5: label-spread is NOT
+                # a raw return %. Print with explicit unit so readers do
+                # not misinterpret the number as "0.96% per day return".
+                logger.info(
+                    f"  LabelSpread (unit=%s):   %+.3f (×100 for normalised-label display only)" %
+                    (metrics.get("label_unit", "?"), metrics['top20_spread']*100,)
+                )
                 logger.info(f"  Sprd>0:   {metrics['spread_pos_ratio']:.1%}")
 
             except Exception as e:
