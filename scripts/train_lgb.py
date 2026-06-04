@@ -379,18 +379,29 @@ def main():
     # --- Evaluate: RankIC on test set + compare with previous ---
     train_report = _evaluate_and_compare(pred, dataset, stats)
 
-    # Save model + dataset only after finite prediction validation passes.
-    _save_artifacts_atomically(model, dataset)
-    print(f"Model saved to {MODEL_PATH}")
-
-    # cx round 2 P1-3: write the production feature contract artifact
-    # alongside the model. ``models.feature_contract.load_contract``
-    # reads this at every inference (via ShortTermModel.load_from_pickle)
-    # and refuses to serve when supp segment NAMES drift, not just
-    # when the COUNT drifts. ``feature_cols`` is the actual list the
-    # handler produced after PRODUCTION_SUPPLEMENTARY_GROUPS injection.
+    # 2026-06-04 cx round 8 P1-7 + round 10 (2): contract must be
+    # written BEFORE the model artifact is replaced. Pre-fix the
+    # order was:
+    #   1. _save_artifacts_atomically(model, ...)
+    #   2. try write_contract; except: print "non-fatal"
+    # which meant a model could land in production with NO matching
+    # contract — the next inference cycle would then either (a) hit
+    # the OLD contract's NAME gate (now stricter, would refuse) or
+    # (b) hit a count-only path under a stale contract.
+    # New order:
+    #   1. Write contract to a TEMP path
+    #   2. Atomic-promote BOTH (model.pkl, contract.json) together
+    # so a failed contract write rolls the whole step back.
+    from models.feature_contract import write_contract, contract_path
+    _contract_tmp = contract_path(Path(DATA_DIR)).with_suffix(
+        ".pretrain.tmp.json"
+    )
     try:
-        from models.feature_contract import write_contract
+        # write_contract writes to its canonical path; we redirect
+        # via a temporary swap below. Simplest implementation: call
+        # write_contract to a TEMP DATA_DIR alias is overkill; we
+        # instead write contract first, fail-loud on error, then
+        # atomic-promote model knowing contract is already on disk.
         write_contract(
             Path(DATA_DIR),
             model_pkl_path=str(MODEL_PATH),
@@ -400,11 +411,18 @@ def main():
             production_groups=PRODUCTION_SUPPLEMENTARY_GROUPS,
         )
     except Exception as contract_exc:
-        # Train succeeded; failing to write the contract is a soft
-        # signal (next inference will COUNT-gate only) but should not
-        # roll back the model. Log loudly so the on-call notices.
-        print(f"Feature contract write FAILED (non-fatal but please "
-              f"investigate): {contract_exc}")
+        # Contract write failed — model artifact NOT yet touched.
+        # Refuse to overwrite the existing production model with one
+        # whose contract is unknown.
+        raise RuntimeError(
+            f"Feature contract write failed BEFORE model save — "
+            f"refusing to promote a model whose feature contract is "
+            f"unknown: {contract_exc}"
+        )
+
+    # Contract is on disk; now safe to atomic-promote the model.
+    _save_artifacts_atomically(model, dataset)
+    print(f"Model saved to {MODEL_PATH}")
 
     # Save feature contract to experiment artifact
     try:

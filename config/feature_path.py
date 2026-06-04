@@ -1,5 +1,34 @@
 """Champion feature path configuration and promotion pipeline.
 
+⚠️  REGISTRY SPLIT WARNING (cx round 10, 2026-06-04) ⚠️
+
+This module is the RESEARCH-LINE registry — it describes the
+``xgb_174`` champion profile (Alpha158 + 16 qlib_custom + a few
+one-off cols, 205 columns total). It is NOT the runtime production
+contract any more.
+
+What actually runs in production today:
+  - lgb_model.pkl is 242-dim (Alpha158 + 11 supplementary loader
+    groups). See ``config.production_features.PRODUCTION_MODEL_PROFILE``
+    and ``PRODUCTION_SUPPLEMENTARY_GROUPS``.
+  - The feature contract artifact at
+    ``data/storage/production_feature_contract.json`` is the
+    runtime source of truth.
+
+How the split happened:
+  - commit 95cd256 (2026-05-12) opened the ``_load_supplementary``
+    暗道 in ``scripts/train_lgb.py`` without an allowlist.
+  - The first weekly retrain after that (~2026-05-23) wrote a
+    242-dim model over the previous ``xgb_174`` champion binary,
+    but this CHAMPION_PATH dict still names ``xgb_174``.
+  - Task #112 tracks the formal resolution (retrain xgb_174 +
+    24-split + cost-adjusted backtest → choose default).
+
+Until #112 lands, treat this module as the SHADOW / RESEARCH
+description of what xgb_174 was. Do not use CHAMPION_PATH as the
+truth for inference / training without first cross-checking against
+``config.production_features``.
+
 Defines exactly what the champion model uses, what supplement data sources
 are available but not yet promoted, and the official pipeline for promoting
 new factors into the champion cache.

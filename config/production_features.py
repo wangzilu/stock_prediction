@@ -27,23 +27,91 @@ Promotion workflow:
 """
 
 
+import os
+
+# ---------------------------------------------------------------------------
+# Model profile machinery (cx round 10, 2026-06-04)
+# ---------------------------------------------------------------------------
+# History the user established this evening:
+#   - commit 95cd256 (2026-05-12) opened the暗道 in scripts/train_lgb.py
+#     that auto-injected EVERY FeatureMerger loader into training. No
+#     shadow→promote gate.
+#   - The first weekly retrain after that (~2026-05-23) wrote a 242-dim
+#     model.pkl over the previous 174 / xgb_174 champion binary.
+#   - A 16-day held-out comparison (data/storage/pit_baseline_comparison.json)
+#     shows 242 "less bad" than 158, but IC is still negative and the
+#     sample is too thin to confirm 242 ≻ 174.
+#   - Meanwhile xgb_174 evidence still exists: artifact metrics.json
+#     (RankIC 0.05117, ICIR 0.646), phase4 backtest (cost-adjusted
+#     Sharpe 1.79), and feature_cache_174_holder_regime_ma.parquet.
+#
+# Tonight's safest fix is to expose the profile choice EXPLICITLY so
+# the team can flip it the moment 174 is retrained — but keep the
+# runtime default at xgb_242 because the 174 model binary is gone and
+# changing the default would make Monday's cron refuse to serve.
+#
+# DO NOT treat ``xgb_242`` as validated. It is grandfathered pending
+# task #112 (retrain 174 + 24-split + cost-adjusted backtest →
+# challenge gate → maybe flip default).
+PRODUCTION_MODEL_PROFILE: str = os.environ.get(
+    "PRODUCTION_MODEL_PROFILE", "xgb_242",
+).strip().lower()
+
+
+# Supplementary loader groups per profile. Adding a NEW loader to
+# FeatureMerger does NOT automatically join any profile — the group
+# must be listed here, and that change is the explicit promotion act.
+SUPPLEMENTARY_GROUPS_BY_PROFILE: dict[str, tuple[str, ...]] = {
+    "xgb_242": (
+        "fundamental",
+        "capital_flow",
+        "macro_zero_baseline",
+        "shareholder",
+        "valuation",
+        "northbound",
+        "quality",
+        "st_daily_basic",
+        "st_moneyflow",
+        "st_holder_number",
+        "cross_market_regime",
+    ),
+    # xgb_174 placeholder. The historical xgb_174 path actually used
+    # Alpha158 + 16 qlib-custom factors + capital_flow + a few one-off
+    # cols (see config/feature_path.py for the 205-col enumeration).
+    # That cannot be expressed as PURE FeatureMerger groups — the qlib
+    # custom factors come from D.features expressions, not parquets.
+    # Restoring xgb_174 therefore requires both:
+    #   (1) listing the FeatureMerger-side groups here (capital_flow
+    #       is the only supplementary loader the 174 profile used);
+    #   (2) wiring the qlib-custom expressions into the inference
+    #       dataset construction (scripts/train_lgb.py + ShortTermModel
+    #       and the production_inference helper).
+    # Until (2) is done, selecting PRODUCTION_MODEL_PROFILE=xgb_174 is
+    # a stub that the contract gate will reject.
+    "xgb_174": (
+        "capital_flow",
+    ),
+}
+
+
+if PRODUCTION_MODEL_PROFILE not in SUPPLEMENTARY_GROUPS_BY_PROFILE:
+    raise RuntimeError(
+        f"Unknown PRODUCTION_MODEL_PROFILE={PRODUCTION_MODEL_PROFILE!r}. "
+        f"Allowed: {list(SUPPLEMENTARY_GROUPS_BY_PROFILE)}."
+    )
+
+
+# Resolved at import time. Downstream code should keep importing
+# PRODUCTION_SUPPLEMENTARY_GROUPS as before; the profile mechanism
+# selects which underlying tuple it points at.
 PRODUCTION_SUPPLEMENTARY_GROUPS: tuple[str, ...] = (
-    "fundamental",
-    "capital_flow",
-    "macro_zero_baseline",
-    "shareholder",
-    "valuation",
-    "northbound",
-    "quality",
-    "st_daily_basic",
-    "st_moneyflow",
-    "st_holder_number",
-    "cross_market_regime",
+    SUPPLEMENTARY_GROUPS_BY_PROFILE[PRODUCTION_MODEL_PROFILE]
 )
 # NOTE: every group above entered production via commit 95cd256 / its
-# follow-ups WITHOUT a documented shadow→promotion record. Task #102
-# tracks the 174-vs-242 hold-out backtest that must retroactively
-# justify this list. Until that lands, treat this contract as
+# follow-ups WITHOUT a documented shadow→promotion record. Task #112
+# tracks the 174-vs-242 24-split + cost-adjusted backtest that must
+# retroactively justify the xgb_242 profile (or restore xgb_174 as
+# default). Until then treat the current profile as
 # "frozen-and-grandfathered", not "validated".
 
 
