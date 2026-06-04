@@ -16,6 +16,15 @@ from config.settings import (
 from config.watchlist import WATCHLIST_STOCK
 
 
+class FeatureContractViolation(RuntimeError):
+    """Raised when the loaded XGBModel's feature count does NOT match
+    the inference dataset's column count. cx code review 2026-06-04 P0-d:
+    scheduler MUST NOT silently fall back to the cached predictions on
+    this error — that's how the 2026-06-03 22:00 0-recommendation
+    incident reached the user. Hard-fail instead so the cron wrapper
+    marks the job failed (red) and the on-call gets a real alert."""
+
+
 class ShortTermModel:
     """LightGBM-based short-term stock prediction model using Qlib.
 
@@ -350,7 +359,7 @@ class ShortTermModel:
                 booster_n = int(_booster.num_features())
                 dataset_n = int(_xtest.shape[1])
                 if booster_n != dataset_n:
-                    raise RuntimeError(
+                    raise FeatureContractViolation(
                         f"[short_term] FATAL: trained model expects "
                         f"{booster_n} features but inference dataset has "
                         f"{dataset_n}. Predictions would be silent "
@@ -358,7 +367,7 @@ class ShortTermModel:
                         f"incident). Retrain or wire supplementary "
                         f"injection."
                     )
-        except RuntimeError:
+        except FeatureContractViolation:
             raise
         except Exception as _e:  # noqa: BLE001
             print(f"[short_term] dim sanity gate skipped: {_e}")

@@ -57,11 +57,15 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
     jobs = [
         # --- Market hours: domestic ---
         # morning/sell/risk/evening need Qlib Alpha158 load (~300s) + predict + push
-        # Historical: morning took 840s on 5/22. Set 900s (15 min) to be safe.
+        # Historical: morning took 840s on 5/22. Bumped 900 → 1800 on
+        # 2026-06-04 after the inject_supplementary_into_handler fix
+        # added ~9 min to live LGB inference (asof_merge across 12
+        # parquet sources × 5195 stocks). 1800s = 30 min budget keeps
+        # an 18-min headroom over the observed 12-min cold-path total.
         CronJob("morning_recommendation", "20 9 * * 1-5", [py, main_py, "--morning"], "cron_morning.log",
-                network="domestic", timeout_sec=900),
+                network="domestic", timeout_sec=1800),
         CronJob("sell_check", "30 14 * * 1-5", [py, main_py, "--sell-check"], "cron_sell_check.log",
-                network="domestic", timeout_sec=900),
+                network="domestic", timeout_sec=1800),
         CronJob("daily_summary", "30 15 * * 1-5", [py, main_py, "--daily-summary"], "cron_daily_summary.log",
                 network="domestic", timeout_sec=600),
         CronJob("risk_check", "35 9-15 * * 1-5", [py, main_py, "--risk-check"], "cron_risk_check.log",
@@ -170,9 +174,12 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         #     to see cache_rebuild complete; 30 min default would give
         #     up at 19:05, 10 min short. 3600s = 60 min covers it.
         #   All later jobs inherit the same worst case → 3600s across.
+        # 2026-06-04 bumped 900 → 1800 — see morning_recommendation
+        # comment above. Same inject_supplementary_into_handler cost
+        # applies here.
         CronJob("lgb_after_close_smoke", "35 18 * * 1-5",
                 [py, str(scripts / "smoke_lgb_predict.py")], "lgb_after_close_smoke.log",
-                network="none", timeout_sec=900, critical=True,
+                network="none", timeout_sec=1800, critical=True,
                 enforce_deps=True, dep_wait_seconds=3600),
         CronJob("predict_crash_daily", "37 18 * * 1-5",
                 [py, str(scripts / "predict_crash_daily.py")], "crash_predict.log",

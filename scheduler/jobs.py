@@ -166,6 +166,92 @@ class DailyPipeline:
             MARKET_GOLD: "黄金",
         }.get(market, "")
 
+    def _write_lgb_distribution_health(self, preds: dict, *,
+                                          latest_date: str = "",
+                                          stale_count: int = 0) -> None:
+        """Per-day LGB prediction-distribution health JSON.
+
+        Path: data/storage/lgb_distribution_health/{YYYY-MM-DD}.json
+
+        Schema:
+          {
+            'date', 'latest_date', 'n_predictions', 'n_positive',
+            'n_negative', 'n_zero', 'mean', 'median', 'min', 'max',
+            'stale_prediction_count', 'status'  # 'GREEN'|'YELLOW'|'RED'
+          }
+
+        Status rules:
+          - RED: all-negative (e.g. 158→242 dim mismatch fallback to
+            default-leaf), or all-zero, or n_predictions == 0
+          - YELLOW: positive_ratio < 10% (suspicious skew), or
+            stale_prediction_count > 10% of total
+          - GREEN: positive_ratio >= 10% AND fresh
+
+        cx P1 follow-up: the morning_recommendation + sell_check
+        consumers should refuse to operate when status==RED and emit
+        an explicit alert instead of silently producing 0 candidates.
+        """
+        import json as _json
+        from datetime import datetime as _dt
+
+        if not preds:
+            return
+        values = [float(v) for v in preds.values()
+                  if v is not None and v == v]  # NaN filter
+        n = len(values)
+        if n == 0:
+            return
+        n_pos = sum(1 for v in values if v > 0)
+        n_neg = sum(1 for v in values if v < 0)
+        n_zero = sum(1 for v in values if v == 0)
+        values_sorted = sorted(values)
+        med = values_sorted[n // 2]
+        mean = sum(values) / n
+
+        pos_ratio = n_pos / n if n else 0.0
+        stale_ratio = stale_count / n if n else 0.0
+        if n == 0 or n_pos == 0 or n_neg == 0:
+            status = "RED"
+        elif pos_ratio < 0.10 or stale_ratio > 0.10:
+            status = "YELLOW"
+        else:
+            status = "GREEN"
+
+        report = {
+            "date": _dt.now().strftime("%Y-%m-%d"),
+            "ts": _dt.now().isoformat(timespec="seconds"),
+            "latest_date": latest_date,
+            "n_predictions": n,
+            "n_positive": n_pos,
+            "n_negative": n_neg,
+            "n_zero": n_zero,
+            "positive_ratio": round(pos_ratio, 4),
+            "mean": round(mean, 6),
+            "median": round(med, 6),
+            "min": round(min(values), 6),
+            "max": round(max(values), 6),
+            "stale_prediction_count": stale_count,
+            "status": status,
+        }
+        out_dir = DATA_DIR / "lgb_distribution_health"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{report['date']}.json"
+        out_path.write_text(
+            _json.dumps(report, ensure_ascii=False, indent=2),
+        )
+        if status != "GREEN":
+            logger.warning(
+                "LGB distribution health %s: pos=%d/%d (%.1f%%), neg=%d, "
+                "stale=%d → %s",
+                status, n_pos, n, pos_ratio * 100, n_neg, stale_count,
+                out_path,
+            )
+        else:
+            logger.info(
+                "LGB distribution health GREEN: pos=%d/%d (%.1f%%)",
+                n_pos, n, pos_ratio * 100,
+            )
+
     def _load_lgb_predictions(self):
         """Load LGB model and get latest predictions for all stocks."""
         cached = getattr(self, "_lgb_predictions", None)
@@ -207,12 +293,21 @@ class DailyPipeline:
                 return self._lgb_predictions
 
         try:
-            from models.short_term import ShortTermModel
+            from models.short_term import ShortTermModel, FeatureContractViolation
             from models.lgb_cache import finite_prediction_map, write_prediction_cache
 
-            model = ShortTermModel.load_from_pickle(
-                str(LGB_MODEL_PATH)
-            )
+            try:
+                model = ShortTermModel.load_from_pickle(
+                    str(LGB_MODEL_PATH)
+                )
+            except FeatureContractViolation:
+                # 2026-06-04 cx P0-d: feature-contract violation MUST NOT
+                # fall back to a stale cache silently. Yesterday's
+                # all-negative cache served exactly this fall-back and
+                # the user got 0 recommendations. Hard-fail instead so
+                # the cron wrapper marks the job RED and the user gets
+                # a proper alert.
+                raise
             preds = model.predict_batch()
             finite_preds = finite_prediction_map(preds)
             if len(finite_preds) < LGB_MIN_PREDICTIONS:
@@ -241,6 +336,20 @@ class DailyPipeline:
             except Exception as cache_exc:
                 logger.warning("Failed to update LGB prediction cache: %s", cache_exc)
             logger.info(f"Loaded LGB predictions for {len(self._lgb_predictions)} stocks")
+            # cx P1: write per-day distribution health so an
+            # all-negative / all-zero / stale-heavy day shows up as
+            # RED in the dashboard rather than being silently consumed.
+            try:
+                self._write_lgb_distribution_health(
+                    self._lgb_predictions,
+                    latest_date=getattr(model, "latest_prediction_date", ""),
+                    stale_count=int(model._dataset.handler._infer.attrs.get(
+                        "stale_prediction_count", 0,
+                    )) if hasattr(model, "_dataset") else 0,
+                )
+            except Exception as health_exc:  # noqa: BLE001
+                logger.warning("LGB distribution-health write failed: %s",
+                                health_exc)
         except Exception as e:
             return _use_cache(str(e))
         return self._lgb_predictions
@@ -703,9 +812,10 @@ class DailyPipeline:
             it.get("model_score", 0) <= 0 for it in all_items
         ):
             lines.append(
-                "  ⚠️ 全市场看空模式：模型对今日所有候选预测为负。以下为"
-                "相对最优 Top K，仅供参考，不代表绝对买入信号。建议优先"
-                "等待大盘情绪修复后再行动。"
+                "  ⚠️ 服务降级模式（防御候选 - 仅观察）：模型对今日所有候选"
+                "预测为负，可能由模型异常或全市场看空触发。以下为相对最优"
+                "Top K，**不构成买入建议**。建议查证 prediction_health 是否"
+                "RED，并等待修复后再视情况操作。"
             )
             logger.warning(
                 "Evening forecasts: ALL %d candidates have model_score<=0 — "
