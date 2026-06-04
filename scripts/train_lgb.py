@@ -210,47 +210,51 @@ def main():
     # FeatureMerger._load_supplementary() with no allowlist — every new
     # loader added to FeatureMerger silently joined the production
     # champion at the next weekly retrain (no shadow gate).
-    supp_cols = 0
-    try:
-        from models.feature_merger import FeatureMerger
-        from config.production_features import PRODUCTION_SUPPLEMENTARY_GROUPS
-        merger = FeatureMerger()
-        handler = dataset.handler
+    # 2026-06-04 cx P0 round 2: production training MUST NOT save a
+    # 158-dim model just because supplementary injection raised.
+    # Previously this block swallowed any exception with
+    # ``print("...skipped"); ...``, then training continued at the
+    # Alpha158-only dim and the artifact got overwritten — silently
+    # shipping next week's champion as 158-dim with the 242-dim name.
+    # Now: any failure here aborts training before model.fit() runs;
+    # nothing is saved.
+    from models.feature_merger import FeatureMerger
+    from config.production_features import PRODUCTION_SUPPLEMENTARY_GROUPS
+    merger = FeatureMerger()
+    handler = dataset.handler
 
-        supp_cols = merger.inject_supplementary_into_handler(
-            handler,
-            preprocess=False,
-            groups=PRODUCTION_SUPPLEMENTARY_GROUPS,
+    supp_cols = merger.inject_supplementary_into_handler(
+        handler,
+        preprocess=False,
+        groups=PRODUCTION_SUPPLEMENTARY_GROUPS,
+    )
+    if not supp_cols:
+        raise RuntimeError(
+            "production training requires "
+            "PRODUCTION_SUPPLEMENTARY_GROUPS to inject the supplementary "
+            "block; inject_supplementary_into_handler returned 0 columns. "
+            "Refusing to save a 158-dim model under the 242-dim contract."
         )
 
-        if supp_cols:
-            # Verify injection worked for learn data
-            from qlib.data.dataset.handler import DataHandlerLP
-            verify = dataset.prepare("train", col_set="feature",
-                                     data_key=DataHandlerLP.DK_L)
-            print(f"Merged {supp_cols} supplementary features "
-                  f"(learn features: {verify.shape[1]})")
-            # Per code-review P2 2026-05-31: extract real feature
-            # name list for artifact contract (was always [] because
-            # `feature_cols` was never defined). verify.columns is a
-            # MultiIndex [("feature", name), ...].
-            feature_cols = [
-                col[1] if isinstance(col, tuple) else col
-                for col in verify.columns.tolist()
-            ]
-    except Exception as e:
-        print(f"Supplementary feature merge skipped: {e}")
-        # If merge failed, feature_cols may not be defined — fall back to
-        # raw Alpha158 names if we can derive them
-        try:
-            from qlib.data.dataset.handler import DataHandlerLP as _DK
-            verify_fallback = dataset.prepare("train", col_set="feature", data_key=_DK.DK_L)
-            feature_cols = [
-                col[1] if isinstance(col, tuple) else col
-                for col in verify_fallback.columns.tolist()
-            ]
-        except Exception:
-            feature_cols = []
+    # Verify injection worked for learn data + capture the real feature
+    # name list for the artifact contract.
+    from qlib.data.dataset.handler import DataHandlerLP
+    verify = dataset.prepare("train", col_set="feature",
+                             data_key=DataHandlerLP.DK_L)
+    print(f"Merged {supp_cols} supplementary features "
+          f"(learn features: {verify.shape[1]})")
+    feature_cols = [
+        col[1] if isinstance(col, tuple) else col
+        for col in verify.columns.tolist()
+    ]
+    # 158 alpha158 cols + supp_cols supplementary cols
+    if verify.shape[1] != 158 + supp_cols:
+        raise RuntimeError(
+            f"production training dim sanity failed: handler reports "
+            f"{verify.shape[1]} features but expected "
+            f"{158 + supp_cols} (158 alpha158 + {supp_cols} supp). "
+            f"Refusing to save a model under a corrupt feature contract."
+        )
 
     # Model selection: XGB (better IC) or LGB (fallback)
     model_type = os.environ.get("TRAIN_MODEL_TYPE", "xgb").lower()

@@ -125,6 +125,23 @@ def prepare_features(dataset, segment, dim_mode, preprocess="raw"):
             if new_cols:
                 X = X.join(custom[new_cols], how="left")
 
+    elif dim_mode == "production_242":
+        # Mirrors the live champion EXACTLY: Alpha158 + the 11 groups in
+        # PRODUCTION_SUPPLEMENTARY_GROUPS, no qlib_custom extras. This is
+        # the contract train_lgb.py ships today (post-P0-c). Side-by-side
+        # vs dim=158 answers "is the 84-col supplementary block actually
+        # earning its keep on hold-out?" (task #102 / 174-vs-242 ask).
+        merger = FeatureMerger(DATA_DIR)
+        from config.production_features import (
+            PRODUCTION_SUPPLEMENTARY_GROUPS,
+        )
+        supp = merger._load_supplementary(
+            X.index, groups=PRODUCTION_SUPPLEMENTARY_GROUPS,
+        )
+        if supp is not None and not supp.empty:
+            supp = supp.replace([np.inf, -np.inf], np.nan)
+            X = X.join(supp, how="left")
+
     feature_names = list(X.columns)
     X_np = X.values.astype(np.float32)
     y_np = y.values.astype(np.float32)

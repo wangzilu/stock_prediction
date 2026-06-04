@@ -296,18 +296,9 @@ class DailyPipeline:
             from models.short_term import ShortTermModel, FeatureContractViolation
             from models.lgb_cache import finite_prediction_map, write_prediction_cache
 
-            try:
-                model = ShortTermModel.load_from_pickle(
-                    str(LGB_MODEL_PATH)
-                )
-            except FeatureContractViolation:
-                # 2026-06-04 cx P0-d: feature-contract violation MUST NOT
-                # fall back to a stale cache silently. Yesterday's
-                # all-negative cache served exactly this fall-back and
-                # the user got 0 recommendations. Hard-fail instead so
-                # the cron wrapper marks the job RED and the user gets
-                # a proper alert.
-                raise
+            model = ShortTermModel.load_from_pickle(
+                str(LGB_MODEL_PATH)
+            )
             preds = model.predict_batch()
             finite_preds = finite_prediction_map(preds)
             if len(finite_preds) < LGB_MIN_PREDICTIONS:
@@ -350,6 +341,14 @@ class DailyPipeline:
             except Exception as health_exc:  # noqa: BLE001
                 logger.warning("LGB distribution-health write failed: %s",
                                 health_exc)
+        except FeatureContractViolation:
+            # 2026-06-04 cx P0 round 2: explicit re-raise. Previously
+            # the inner ``except FeatureContractViolation: raise`` was
+            # swallowed by THIS outer ``except Exception`` and routed
+            # to _use_cache — i.e. the fail-closed gate was actually
+            # fail-open via the outer handler. Re-raise here so the
+            # cron wrapper marks the job RED and no stale cache ships.
+            raise
         except Exception as e:
             return _use_cache(str(e))
         return self._lgb_predictions
