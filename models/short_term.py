@@ -184,61 +184,46 @@ class ShortTermModel:
         init_qlib(QLIB_PROVIDER_URI)
         self._initialized = True
 
-    def train(
-        self,
-        train_start: str = "2020-01-01",
-        train_end: str = "2025-12-31",
-        valid_start: str = "2026-01-01",
-        valid_end: str = "2026-03-31",
-    ):
-        """Train the LightGBM model."""
-        self.initialize()
+    def train(self, *args, **kwargs):
+        """LEGACY — DO NOT USE (cx round 8 P1-4).
 
-        handler_config = {
-            "class": "Alpha158",
-            "module_path": "qlib.contrib.data.handler",
-            "kwargs": {
-                "start_time": train_start,
-                "end_time": valid_end,
-                "instruments": LGB_INFERENCE_UNIVERSE,
-                "label": [
-                    f"Ref($close, -{PREDICTION_HORIZON_DAYS}) / Ref($close, -1) - 1"
-                ],
-            },
-        }
+        The previous body trained an Alpha158-only (158-dim) LGBModel
+        with NO supplementary feature injection, NO PRODUCTION_
+        SUPPLEMENTARY_GROUPS gate, NO feature contract write, and NO
+        tradable mask. Any model saved by this path would be 158-dim
+        while inference expects 242 — the exact 6-3 22:00 incident
+        mechanism.
 
-        dataset_config = {
-            "class": "DatasetH",
-            "module_path": "qlib.data.dataset",
-            "kwargs": {
-                "handler": handler_config,
-                "segments": {
-                    "train": (train_start, train_end),
-                    "valid": (valid_start, valid_end),
-                },
-            },
-        }
+        The production training path is ``scripts/train_lgb.py``.
+        That script enforces the supplementary contract, writes the
+        feature contract artifact, gates on prediction health, and
+        atomic-saves the model only after the contract write succeeds.
 
-        self._dataset = init_instance_by_config(dataset_config)
-
-        model_config = {
-            "class": "LGBModel",
-            "module_path": "qlib.contrib.model.gbdt",
-            "kwargs": {
-                "loss": "mse",
-                "colsample_bytree": 0.8879,
-                "learning_rate": 0.05,
-                "subsample": 0.8789,
-                "lambda_l1": 205.6999,
-                "lambda_l2": 580.9768,
-                "max_depth": 8,
-                "num_leaves": 210,
-                "num_threads": 4,
-            },
-        }
-
-        self._model = init_instance_by_config(model_config)
-        self._model.fit(self._dataset)
+        Raises:
+            RuntimeError: always. To re-enable for an explicit research
+                purpose (NOT production), set environment variable
+                ``LEGACY_SHORT_TERM_TRAIN_OVERRIDE=acknowledge_158_dim``
+                — the resulting model still cannot be loaded by
+                ``load_from_pickle`` because the contract gate will
+                refuse a 158-dim artifact.
+        """
+        import os as _os
+        if _os.environ.get("LEGACY_SHORT_TERM_TRAIN_OVERRIDE") != "acknowledge_158_dim":
+            raise RuntimeError(
+                "ShortTermModel.train() is DISABLED (cx round 8 P1-4 — "
+                "2026-06-04). It would train an Alpha158-only 158-dim "
+                "model that immediately fails the production 242-dim "
+                "feature contract. Use scripts/train_lgb.py instead."
+            )
+        # If you really want the legacy Alpha158-only path (e.g. for a
+        # diagnostic 158-vs-242 comparison), the code lives in the git
+        # history of this file pre-2026-06-04. We do not reproduce it
+        # in the live tree because copy-paste recipients would forget
+        # to set the override.
+        raise RuntimeError(
+            "Legacy ShortTermModel.train body was removed; consult "
+            "git history if you really need a 158-only training path."
+        )
 
     def predict(self, date: str = None) -> pd.DataFrame:
         """Generate predictions for the watchlist stocks.
@@ -393,29 +378,39 @@ class ShortTermModel:
                 f"injection."
             )
 
-        # cx round 2 P1-3 / P1-4: real-name gate against the
-        # production contract artifact. Catches loader-reorder /
-        # silent column swap drift that the count gate above misses.
-        # If the artifact is absent (fresh deploy, never trained), we
-        # log a warning and skip; once train_lgb runs once with the
-        # contract-write step the gate is fully active.
+        # cx round 2 P1-3 / P1-4 + round 8 P1-1: real-name gate
+        # against the production contract artifact. The artifact is
+        # MANDATORY at inference time — there is no "bootstrap" window
+        # where a count-only gate is acceptable for production
+        # recommendations. (Pre-fix this section accepted missing
+        # contract with a warning, which is exactly the silent-fallback
+        # pattern we've been closing across the codebase.)
+        # If the artifact really is missing (fresh deploy), the operator
+        # must run train_lgb.py once to populate it — that's the only
+        # path that produces a contract aligned with the trained model.
+        # ``scripts/export_feature_contract.py`` is a diagnostic tool
+        # and does NOT count for this gate (cx round 8 P1-2).
         from pathlib import Path as _P
         _data_dir = _P(__file__).resolve().parents[1] / "data" / "storage"
         contract = load_contract(_data_dir)
         if contract is None:
-            print("[short_term] no production feature contract artifact "
-                  "(expected at data/storage/production_feature_contract.json). "
-                  "Run scripts/train_lgb.py or scripts/export_feature_contract.py "
-                  "to populate. Inference proceeds with COUNT-only gate.")
-        else:
-            actual_names = [
-                col[1] if isinstance(col, tuple) else str(col)
-                for col in _xtest.columns.tolist()
-            ]
-            verify_inference_dataset(contract, actual_names)
-            print(f"[short_term] feature contract verified "
-                  f"({len(actual_names)} cols, schema v"
-                  f"{contract.get('schema_version', 1)})")
+            raise FeatureContractViolation(
+                "[short_term] production feature contract artifact "
+                "MISSING at data/storage/production_feature_contract.json. "
+                "Inference refuses to serve without it — a count-only "
+                "gate cannot catch loader reorder / silent column swap "
+                "(the exact failure mode this artifact exists to pin). "
+                "Re-run scripts/train_lgb.py to produce a contract "
+                "aligned with the current lgb_model.pkl."
+            )
+        actual_names = [
+            col[1] if isinstance(col, tuple) else str(col)
+            for col in _xtest.columns.tolist()
+        ]
+        verify_inference_dataset(contract, actual_names)
+        print(f"[short_term] feature contract verified "
+              f"({len(actual_names)} cols, schema v"
+              f"{contract.get('schema_version', 1)})")
 
         return instance
 

@@ -180,41 +180,47 @@ def _log_event(action: str, reason: str):
 
 
 def main():
-    # cx round 6 P0-1: hard-block every code path by default. The
-    # legacy --check / --promote / --rollback subcommands are kept in
-    # this module's source for git-blame archaeology but cannot run
-    # unless an explicit override is set in the environment.
+    # cx round 6 P0-1 + round 8 P2-6: hard-block every code path by
+    # default. The legacy --check / --promote / --rollback subcommands
+    # are kept in this module's source for git-blame archaeology but
+    # cannot run unless an explicit override is set in the environment.
+    # And even with the override, ONLY --rollback is permitted —
+    # promote MUST go through the unified PromotionGate +
+    # scripts/train_lgb.py path so the contract + PIT + cost-adjusted
+    # gates run.
     if os.environ.get("LEGACY_PROMOTE_OVERRIDE") != "acknowledge_unsafe":
         return _abort_legacy_entry()
 
-    logger.warning(
-        "LEGACY_PROMOTE_OVERRIDE=acknowledge_unsafe detected — "
-        "running legacy promotion path. This bypasses contract / "
-        "PIT / cost-adjusted gates. ONLY for emergency rollback."
-    )
-    parser = argparse.ArgumentParser(description="Model promotion gate (LEGACY)")
-    parser.add_argument("--check", action="store_true", help="Check promotion status")
-    parser.add_argument("--promote", action="store_true", help="Force promote candidate")
-    parser.add_argument("--rollback", action="store_true", help="Force rollback")
+    parser = argparse.ArgumentParser(description="Model promotion gate (LEGACY rollback only)")
+    parser.add_argument("--check", action="store_true", help="(DISABLED) Check promotion status")
+    parser.add_argument("--promote", action="store_true", help="(DISABLED) Force promote candidate")
+    parser.add_argument("--rollback", action="store_true", help="Force rollback (the only path the override permits)")
     args = parser.parse_args()
 
-    if args.promote:
-        do_promote()
-    elif args.rollback:
-        do_rollback()
-    else:
-        result = check_promotion()
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+    if args.promote or args.check:
+        logger.error(
+            "LEGACY_PROMOTE_OVERRIDE permits --rollback ONLY (round 8 P2-6). "
+            "Forward promotion must use tracker.promotion_gate.PromotionGate "
+            "+ scripts/train_lgb.py so the contract / PIT / cost-adjusted "
+            "gates run. Refusing --promote / --check."
+        )
+        return 2
 
-        if result["action"] == "promote":
-            logger.info("Auto-promoting candidate model...")
-            do_promote()
-        elif result["action"] == "rollback":
-            logger.info("Auto-rolling back production model...")
-            do_rollback()
-        else:
-            logger.info(f"Action: {result['action']} — {result['reason']}")
-    return 0
+    if args.rollback:
+        logger.warning(
+            "LEGACY_PROMOTE_OVERRIDE=acknowledge_unsafe + --rollback: "
+            "executing emergency rollback. This bypasses the contract "
+            "artifact — the resulting lgb_model.pkl may NOT match the "
+            "current production_feature_contract.json, and inference "
+            "will refuse to serve until train_lgb.py is re-run to "
+            "regenerate the contract."
+        )
+        do_rollback()
+        return 0
+
+    logger.error("LEGACY_PROMOTE_OVERRIDE set but no action specified. "
+                 "Pass --rollback to use the rollback path.")
+    return 2
 
 
 if __name__ == "__main__":
