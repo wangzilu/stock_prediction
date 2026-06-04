@@ -46,7 +46,12 @@ TOP_K_STOCKS = 5
 LGB_MIN_PREDICTIONS = int(os.environ.get("LGB_MIN_PREDICTIONS", "4500"))
 LGB_INFERENCE_UNIVERSE = os.environ.get("LGB_INFERENCE_UNIVERSE", "all")
 LGB_MIN_DATA_INSTRUMENTS = int(os.environ.get("LGB_MIN_DATA_INSTRUMENTS", "4500"))
-LGB_CACHE_MAX_AGE_DAYS = int(os.environ.get("LGB_CACHE_MAX_AGE_DAYS", "7"))
+# 2026-06-04 cx round 13 P2-6: default tightened from 7 → 1 trading day.
+# 7 was research-grade leniency that effectively let last week's
+# predictions feed today's live recommendation. Set
+# LGB_CACHE_MAX_AGE_DAYS=7 explicitly via the env var for
+# research/diagnostic paths that need the old behavior.
+LGB_CACHE_MAX_AGE_DAYS = int(os.environ.get("LGB_CACHE_MAX_AGE_DAYS", "1"))
 
 # Model paths
 RL_MODEL_PATH = DATA_DIR / "rl_model.pt"

@@ -77,10 +77,15 @@ def test_generate_daily_report():
         scorer.score_stock("SZ300750", "宁德时代", 0.6, 0.3, 0.4),
     ]
     recs[0].horizon = "短线"
+    # cx round 11 P1-1: set via back-compat alias to confirm the
+    # alias still writes through to the canonical
+    # horizon_dailyized_return_pct field.
     recs[0].next_day_change_pct = 1.25
+    assert recs[0].horizon_dailyized_return_pct == 1.25
     report = scorer.generate_report(recs)
     assert "今日推荐" in report
     assert "贵州茅台" in report
     assert "评分" in report
     assert "短线" in report
-    assert "明日+1.25%" in report
+    # Label was "明日" pre-fix; now "5日均/日" with 5-day basis.
+    assert "5日均/日+1.25%" in report

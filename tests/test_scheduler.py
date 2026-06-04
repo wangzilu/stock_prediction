@@ -250,10 +250,12 @@ def test_horizon_recommendations_include_short_next_day_prediction():
     groups = pipeline._classify_recommendations_by_horizon(recs, per_bucket=1)
     text = pipeline._format_horizon_recommendations(groups)
 
-    assert "短线（明日）" in text
+    # cx round 11 P1-1: title was "短线（明日）" / "明日预测";
+    # relabelled to expose the 5-day horizon basis.
+    assert "短线（5日窗口）" in text
     assert "中线（1-4周）" in text
     assert "长线（1-3月）" in text
-    assert "明日预测+1.40%" in text
+    assert "5日均/日+1.40%" in text
 
 
 def test_evening_outlook_records_structured_market_prediction():

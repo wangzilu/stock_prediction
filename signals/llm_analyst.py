@@ -208,8 +208,12 @@ class LLMAnalyst:
             for i, rec in enumerate(recommendations, 1):
                 display_code = rec.code[2:] if rec.code[:2] in ("SH", "SZ", "BJ") else rec.code
                 next_day = ""
-                if getattr(rec, "horizon", "") == "短线" and getattr(rec, "next_day_change_pct", None) is not None:
-                    next_day = f" | 明日预测{rec.next_day_change_pct:+.2f}%"
+                # cx round 11 P1-1: relabel from "明日预测" to "5日均/日".
+                # Underlying value is 5-day model_score / 5, not a
+                # next-day forecast. ``next_day_change_pct`` is now a
+                # back-compat property aliasing ``horizon_dailyized_return_pct``.
+                if getattr(rec, "horizon", "") == "短线" and getattr(rec, "horizon_dailyized_return_pct", None) is not None:
+                    next_day = f" | 5日均/日{rec.horizon_dailyized_return_pct:+.2f}%"
                 horizon = f" | {rec.horizon}" if getattr(rec, "horizon", "") else ""
                 rec_text += (
                     f"{i}. {rec.name}({display_code}){horizon}{next_day} | "
@@ -295,7 +299,7 @@ class LLMAnalyst:
 
 5. 💡 **个股推荐与操作建议**（100-150字）
    必须按短线、中线、长线分别说明推荐逻辑（不是罗列指标）。
-   短线标的必须引用明日预测涨跌幅。
+   短线标的必须引用 5 日预测均/日 (即 5 日横截面模型分数的日均近似，不是真正的明日收益)。
    如无推荐则说明观望理由和应该关注的方向/板块。
 
 关键要求：

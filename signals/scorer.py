@@ -39,7 +39,22 @@ class Recommendation:
     rl_confidence: float = 0.0
     horizon: str = ""
     horizon_score: float = 0.0
-    next_day_change_pct: Optional[float] = None
+    # 2026-06-04 cx round 11 P1-1: renamed from ``next_day_change_pct``.
+    # The underlying value is ``5-day model_score * 100 / 5`` — a per-day
+    # linear approximation of a 5-day forward-return prediction, NOT a
+    # next-day forecast. The old name caused users to read this as a
+    # next-day expected return. ``next_day_change_pct`` survives as a
+    # back-compat property below.
+    horizon_dailyized_return_pct: Optional[float] = None
+
+    # Back-compat read/write alias. Remove after one full retrain cycle.
+    @property
+    def next_day_change_pct(self) -> Optional[float]:
+        return self.horizon_dailyized_return_pct
+
+    @next_day_change_pct.setter
+    def next_day_change_pct(self, value: Optional[float]) -> None:
+        self.horizon_dailyized_return_pct = value
 
 
 @dataclass
@@ -214,8 +229,10 @@ class SignalScorer:
             display_code = rec.code[2:] if rec.code[:2] in ("SH", "SZ") else rec.code
             horizon = f" | {rec.horizon}" if rec.horizon else ""
             next_day = ""
-            if rec.next_day_change_pct is not None:
-                next_day = f" | 明日{rec.next_day_change_pct:+.2f}%"
+            # cx round 11 P1-1: "明日" → "5日均/日". See dataclass field
+            # docstring for the unit (5-day model_score / 5).
+            if rec.horizon_dailyized_return_pct is not None:
+                next_day = f" | 5日均/日{rec.horizon_dailyized_return_pct:+.2f}%"
             lines.append(
                 f"{i}. {rec.name}({display_code}) | {rec.signal}{horizon}{next_day} | 评分 {score_display}"
             )

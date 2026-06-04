@@ -1499,16 +1499,12 @@ def _main_inner(args: argparse.Namespace) -> int:
     # morning_recommendation) read it as green and proceeded on stale
     # data.
     if getattr(args, "check_today", False):
-        today = datetime.now()
-        today_str = today.strftime("%Y-%m-%d")
-
-        # Determine expected latest trading date (skip weekends and known holidays)
-        # Use pandas bdate_range as approximation; doesn't cover CN holidays perfectly
-        # but cron only runs Mon-Fri so weekends are already excluded
-        import pandas as _pd
-        recent_bdays = _pd.bdate_range(end=today_str, periods=3)
-        # Expected: today if it's a business day, otherwise last business day
-        expected_date = str(recent_bdays[-1].date())
+        # cx round 13 P1-3: use the centralised CN-calendar helper
+        # instead of pandas bdate_range. The helper consults Qlib's
+        # calendar first (covers 节假日 / 调休 / 临时休市) and falls
+        # back to bdate only when Qlib isn't initialised.
+        from scheduler.data_health import _expected_latest_trading_date
+        expected_date = _expected_latest_trading_date()
 
         # Check a few representative stocks for latest date
         qlib_dir = args.qlib_dir

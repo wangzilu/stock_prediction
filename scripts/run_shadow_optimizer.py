@@ -113,7 +113,12 @@ def main():
             )
             sys.exit(2)
     else:
-        if not is_fresh("lgb_after_close_smoke") and not getattr(args, "force_stale", False):
+        # cx round 13 P1-2: strict latest_date gate. Pre-fix shadow
+        # could run against yesterday's smoke result and produce
+        # promotion stats vs a champion that REFUSED the same stale
+        # cache (paper trading uses require_latest_date=True since
+        # round 9 P0-2).
+        if not is_fresh("lgb_after_close_smoke", require_latest_date=True) and not getattr(args, "force_stale", False):
             logger.error(
                 "Refusing to run shadow optimizer: no fresh prediction health for today "
                 "(lgb_after_close_smoke). Pass --force-stale to override."

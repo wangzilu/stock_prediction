@@ -696,8 +696,11 @@ class DailyPipeline:
     def _format_horizon_recommendations(self, groups: dict[str, list]) -> str:
         """Format grouped stock recommendations for deterministic push content."""
         lines = ["【长中短线分类推荐】"]
+        # cx round 11 P1-1: "短线（明日）" / "明日预测" → 5-day basis.
+        # The score is a 5-day cross-sectional model output linearly
+        # divided by 5; it is NOT a true next-day prediction.
         specs = [
-            ("短线", "短线（明日）", "明日预测"),
+            ("短线", "短线（5日窗口）", "5日均/日"),
             ("中线", "中线（1-4周）", "中线评分"),
             ("长线", "长线（1-3月）", "长线评分"),
         ]
@@ -709,8 +712,8 @@ class DailyPipeline:
                 continue
             for i, rec in enumerate(items, 1):
                 display_code = rec.code[2:] if rec.code[:2] in ("SH", "SZ", "BJ") else rec.code
-                if key == "短线" and rec.next_day_change_pct is not None:
-                    metric = f"{metric_label}{rec.next_day_change_pct:+.2f}%"
+                if key == "短线" and rec.horizon_dailyized_return_pct is not None:
+                    metric = f"{metric_label}{rec.horizon_dailyized_return_pct:+.2f}%"
                 else:
                     metric = f"{metric_label}{_finite_float(getattr(rec, 'horizon_score', 0)):+.2f}"
                 score_display = round((rec.final_score + 1) * 5, 1)
@@ -722,14 +725,20 @@ class DailyPipeline:
         return "\n".join(lines)
 
     def _format_lgb_short_candidates(self, predictions: list[tuple[str, float]], limit: int = 5) -> str:
-        """Format 22:00 short-term candidates with next-day return estimates."""
-        lines = ["五、个股预测（明日短线候选）"]
+        """Format 22:00 short-term candidates with 5-day horizon return estimates.
+
+        2026-06-04 cx round 11 P1-1: title and metric label re-framed
+        from "明日" to "5日". The underlying score is a 5-day forward
+        return prediction; dividing by 5 gives a per-day average, not
+        a next-day forecast.
+        """
+        lines = ["五、个股预测（5日横截面短线候选）"]
         positive_predictions = [
             (code, score) for code, score in predictions
             if _finite_float(score) > 0
         ]
         if not positive_predictions:
-            lines.append("暂无有效短线模型候选，明日个股层面先控制仓位，等待盘中确认。")
+            lines.append("暂无有效短线模型候选，下一个交易日个股层面先控制仓位，等待盘中确认。")
             return "\n".join(lines)
 
         for i, (code, score) in enumerate(positive_predictions[:limit], 1):
@@ -739,7 +748,7 @@ class DailyPipeline:
             )
             display_code = code[2:] if code[:2] in ("SH", "SZ", "BJ") else code
             lines.append(
-                f"{i}. {display_code}：模型分{score:+.4f}，明日预测{expected:+.2f}%"
+                f"{i}. {display_code}：模型分{score:+.4f}，5日均/日{expected:+.2f}%"
             )
         return "\n".join(lines)
 

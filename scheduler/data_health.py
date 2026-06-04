@@ -42,6 +42,48 @@ class HealthStatus:
     partial: bool = False          # True if only partial data collected
 
 
+def _normalize_iso_date(value) -> str:
+    """Coerce a date-like input to canonical ``YYYY-MM-DD`` string.
+
+    2026-06-04 cx round 13 P0-1: collectors have been writing latest_date
+    in inconsistent formats — fund_flow_update writes "20260604",
+    regime_daily_update writes "2026-06-04", and a few write "".
+    Naive string comparison ``"20260603" < "2026-06-04"`` evaluates True
+    because the literal characters compare position-by-position and
+    ``'0'`` is greater than ``'-'`` at position 4, which would let the
+    freshness gate ACCEPT a 3-day-old YYYYMMDD record as newer than
+    today's YYYY-MM-DD. Normalize on the way in (write_health) and
+    on the way out (is_fresh/check_freshness) so the gate never sees
+    a mixed-format pair.
+    Returns "" when input cannot be parsed — callers should treat
+    "" as "no date recorded".
+    """
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    # Already ISO?
+    if len(text) == 10 and text[4] == "-" and text[7] == "-":
+        try:
+            datetime.strptime(text, "%Y-%m-%d")
+            return text
+        except ValueError:
+            pass
+    # YYYYMMDD?
+    if len(text) == 8 and text.isdigit():
+        try:
+            return datetime.strptime(text, "%Y%m%d").strftime("%Y-%m-%d")
+        except ValueError:
+            return ""
+    # Anything pandas can parse (covers YYYY/MM/DD, datetime ISO with time, etc.)
+    try:
+        import pandas as _pd
+        return str(_pd.Timestamp(text).date())
+    except Exception:
+        return ""
+
+
 def write_health(
     source: str,
     status: HealthStatus,
@@ -58,11 +100,19 @@ def write_health(
     day_dir = HEALTH_DIR / date
     day_dir.mkdir(parents=True, exist_ok=True)
 
+    # 2026-06-04 cx round 13 P0-1: normalize at the write boundary so
+    # the on-disk record always uses YYYY-MM-DD regardless of what
+    # the collector handed us (some pass "20260604", some pass
+    # "2026-06-04"; the freshness gate later string-compares these).
+    normalized_latest = _normalize_iso_date(status.latest_date)
+    status_record = asdict(status)
+    status_record["latest_date"] = normalized_latest
+
     record = {
         "source": source,
         "date": date,
         "finished_at": datetime.now().isoformat(timespec="seconds"),
-        **asdict(status),
+        **status_record,
     }
 
     path = day_dir / f"{source}.json"
@@ -180,15 +230,18 @@ def is_fresh(
         return False
     if require_latest_date is None:
         return True
-    expected = (
+    expected_raw = (
         _expected_latest_trading_date(date)
         if require_latest_date is True
         else str(require_latest_date)
     )
-    recorded = str(h.get("latest_date") or "")
+    # cx round 13 P0-1: normalize both sides before comparison so
+    # mixed "20260604" vs "2026-06-04" formats cannot fool the gate.
+    expected = _normalize_iso_date(expected_raw)
+    recorded = _normalize_iso_date(h.get("latest_date"))
     if not recorded:
         logger.warning(
-            "is_fresh(%s): success=True but latest_date is empty — "
+            "is_fresh(%s): success=True but latest_date is empty/unparseable — "
             "treating as stale (expected >= %s)",
             source, expected,
         )
@@ -235,12 +288,12 @@ def check_freshness(
             stale.append(source)
             continue
         if require_latest_date is not None:
-            expected = (
+            expected = _normalize_iso_date(
                 _expected_latest_trading_date(date)
                 if require_latest_date is True
-                else str(require_latest_date)
+                else require_latest_date
             )
-            recorded = str(h.get("latest_date") or "")
+            recorded = _normalize_iso_date(h.get("latest_date"))
             if not recorded or recorded < expected:
                 stale.append(source)
                 continue
