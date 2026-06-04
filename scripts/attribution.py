@@ -63,40 +63,22 @@ def get_industry_map() -> dict:
 
 def simple_attribution(topk: int = 20, test_days: int = 30) -> dict:
     """Run simplified Brinson attribution."""
-    from qlib.utils import init_instance_by_config
-
-    init_qlib(QLIB_DATA)
+    # 2026-06-04 cx round 8 P1-3: production-safe loader (242-dim).
+    from models.production_inference import load_production_model
 
     today = datetime.now()
     test_start = (today - timedelta(days=test_days)).strftime("%Y-%m-%d")
     test_end = today.strftime("%Y-%m-%d")
 
-    handler_config = {
-        "class": "Alpha158",
-        "module_path": "qlib.contrib.data.handler",
-        "kwargs": {
-            "start_time": test_start,
-            "end_time": test_end,
-            "instruments": "all",
-            "label": [f"Ref($close, -{PREDICTION_HORIZON_DAYS}) / Ref($close, -1) - 1"],
-        },
-    }
-    dataset_config = {
-        "class": "DatasetH",
-        "module_path": "qlib.data.dataset",
-        "kwargs": {
-            "handler": handler_config,
-            "segments": {"test": (test_start, test_end)},
-        },
-    }
-
-    dataset = init_instance_by_config(dataset_config)
-
     if not os.path.exists(MODEL_PATH):
         return {"error": "Model not found"}
 
-    with open(MODEL_PATH, "rb") as f:
-        model = pickle.load(f)
+    model, dataset = load_production_model(
+        test_start, test_end,
+        model_path=MODEL_PATH,
+        instruments="all",
+        label_expr=f"Ref($close, -{PREDICTION_HORIZON_DAYS}) / Ref($close, -1) - 1",
+    )
 
     pred = model.predict(dataset=dataset)
     if isinstance(pred, pd.Series):

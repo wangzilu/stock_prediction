@@ -37,43 +37,32 @@ def run_attribution():
         QLIB_PROVIDER_URI,
     )
     from models.portfolio_policy import sector_from_code
-    from qlib.utils import init_instance_by_config
 
-    init_qlib(QLIB_PROVIDER_URI)
+    # 2026-06-04 cx round 8 P1-3: use the production-safe loader so
+    # Brinson attribution sees the SAME 242-dim feature shape as
+    # the live champion. Pre-fix the script unpickled the 242-dim
+    # model against a 158-dim Alpha158 dataset → silent default-leaf
+    # predictions → garbage sector/timing attribution numbers.
+    from models.production_inference import load_production_model
+
     label_expr = f"Ref($close, -{PREDICTION_HORIZON_DAYS}) / Ref($close, -1) - 1"
 
     model_path = DATA_DIR / "lgb_model.pkl"
     if not model_path.exists():
         logger.error("Model not found")
         return None
-    with open(model_path, "rb") as f:
-        model = pickle.load(f)
 
     today = datetime.now()
     test_start = (today - timedelta(days=29)).strftime("%Y-%m-%d")
     test_end = today.strftime("%Y-%m-%d")
 
-    handler_config = {
-        "class": "Alpha158",
-        "module_path": "qlib.contrib.data.handler",
-        "kwargs": {
-            "start_time": test_start,
-            "end_time": test_end,
-            "instruments": LGB_INFERENCE_UNIVERSE,
-            "label": [label_expr],
-        },
-    }
-    dataset_config = {
-        "class": "DatasetH",
-        "module_path": "qlib.data.dataset",
-        "kwargs": {
-            "handler": handler_config,
-            "segments": {"test": (test_start, test_end)},
-        },
-    }
-
     logger.info(f"Loading dataset for {test_start} ~ {test_end}...")
-    dataset = init_instance_by_config(dataset_config)
+    model, dataset = load_production_model(
+        test_start, test_end,
+        model_path=str(model_path),
+        instruments=LGB_INFERENCE_UNIVERSE,
+        label_expr=label_expr,
+    )
 
     pred = model.predict(dataset=dataset)
     if isinstance(pred, pd.Series):

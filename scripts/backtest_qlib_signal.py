@@ -52,10 +52,7 @@ def backtest(
 
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-    from qlib.utils import init_instance_by_config
     from qlib.contrib.evaluate import risk_analysis
-
-    init_qlib(qlib_data)
 
     today = datetime.now()
     test_start = (today - timedelta(days=test_days)).strftime("%Y-%m-%d")
@@ -65,30 +62,16 @@ def backtest(
 
     # Use 5-day forward return label (matches training), rebalance every 5 days
     rebalance_period = PREDICTION_HORIZON_DAYS
-    handler_config = {
-        "class": "Alpha158",
-        "module_path": "qlib.contrib.data.handler",
-        "kwargs": {
-            "start_time": test_start,
-            "end_time": test_end,
-            "instruments": universe,
-            "label": [f"Ref($close, -{PREDICTION_HORIZON_DAYS}) / Ref($close, -1) - 1"],
-        },
-    }
-    dataset_config = {
-        "class": "DatasetH",
-        "module_path": "qlib.data.dataset",
-        "kwargs": {
-            "handler": handler_config,
-            "segments": {"test": (test_start, test_end)},
-        },
-    }
 
-    logger.info("Loading dataset...")
-    dataset = init_instance_by_config(dataset_config)
-
-    with open(model_path, "rb") as f:
-        model = pickle.load(f)
+    # 2026-06-04 cx round 8 P1-3: production-safe loader.
+    from models.production_inference import load_production_model
+    logger.info("Loading dataset (242-dim production aligned)...")
+    model, dataset = load_production_model(
+        test_start, test_end,
+        model_path=model_path,
+        instruments=universe,
+        label_expr=f"Ref($close, -{PREDICTION_HORIZON_DAYS}) / Ref($close, -1) - 1",
+    )
 
     pred = model.predict(dataset=dataset)
     if isinstance(pred, pd.Series):

@@ -49,13 +49,10 @@ def evaluate(
 ) -> dict:
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-    from qlib.utils import init_instance_by_config
     from qlib.contrib.eva.alpha import calc_ic, calc_long_short_return
 
     if not os.path.exists(model_path):
         return {"ok": False, "error": f"Model file not found: {model_path}"}
-
-    init_qlib(qlib_data)
 
     today = datetime.now()
     test_start = (today - timedelta(days=test_days)).strftime("%Y-%m-%d")
@@ -64,30 +61,20 @@ def evaluate(
     logger.info(f"Test period: {test_start} ~ {test_end}")
     logger.info(f"Label: {LABEL_EXPR}")
 
-    handler_config = {
-        "class": "Alpha158",
-        "module_path": "qlib.contrib.data.handler",
-        "kwargs": {
-            "start_time": test_start,
-            "end_time": test_end,
-            "instruments": universe,
-            "label": [LABEL_EXPR],
-        },
-    }
-    dataset_config = {
-        "class": "DatasetH",
-        "module_path": "qlib.data.dataset",
-        "kwargs": {
-            "handler": handler_config,
-            "segments": {"test": (test_start, test_end)},
-        },
-    }
-
-    logger.info("Loading dataset with labels...")
-    dataset = init_instance_by_config(dataset_config)
-
-    with open(model_path, "rb") as f:
-        model = pickle.load(f)
+    # 2026-06-04 cx round 8 P1-3: use the production-safe loader so
+    # the model evaluation sees the SAME 242-dim feature shape the
+    # live champion sees. Pre-fix this script built a bare Alpha158
+    # (158-dim) dataset and called pickle.load on the 242-dim model
+    # — XGB walked default-direction branches on the missing 84 cols
+    # and produced silent-garbage IC/spread that misled "is 242 ok?"
+    # decisions.
+    from models.production_inference import load_production_model
+    model, dataset = load_production_model(
+        test_start, test_end,
+        model_path=model_path,
+        instruments=universe,
+        label_expr=LABEL_EXPR,
+    )
 
     logger.info("Running predictions...")
     pred = model.predict(dataset=dataset)
