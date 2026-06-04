@@ -1,24 +1,33 @@
-"""Export the 242-dim production feature contract.
+"""[DIAGNOSTIC ONLY — NOT A RECOVERY TOOL] Export feature contract.
 
-Reads the currently-deployed lgb_model.pkl + the train-time feature
-shape and writes
-  data/storage/production_feature_contract.json
+⚠️  cx round 8 P1-2 (2026-06-04): this script is NOT a substitute
+for the contract written by ``scripts/train_lgb.py``.
 
-with:
-  - frozen_at: timestamp
-  - model_pkl_path
-  - booster_num_features
-  - features: [
-      {index, name, group, pit_status, approved}
-    ]
+What this script does:
+  - Probes the CURRENT FeatureMerger loader state with a synthetic
+    3-day single-stock index.
+  - Writes ``data/storage/production_feature_contract.json``
+    populated from those probe results.
 
-The contract artifact is the SINGLE SOURCE OF TRUTH for the production
-champion model's feature shape. Training and inference must read from
-this artifact (not from FeatureMerger's live state) so any new column
-silently added to FeatureMerger does not silently enter production.
+Why that's NOT the same as the real production contract:
+  - The probe captures TODAY's loader behavior. The trained
+    ``lgb_model.pkl`` was trained against a DIFFERENT (potentially
+    older) loader state. Names and order may not match.
+  - The Alpha158 segment is recorded as positional placeholders
+    (``alpha158_f000`` …). The trained model's real Alpha158 names
+    are not preserved by this exporter.
 
-Usage:
-    python scripts/export_feature_contract.py
+When this script IS useful:
+  - Diagnostic: "what shape would the contract take if I re-froze
+    today's loader state?" — useful for debugging the gate.
+  - Last-resort bootstrap: if the live contract artifact is lost
+    AND retraining is not yet possible, this gives a count-only
+    contract so the gate at least catches dim drift. Inference will
+    log a "no real-name strict gate" warning.
+
+For an authoritative contract, run ``scripts/train_lgb.py`` (which
+writes the contract BEFORE atomic-promoting the model). That is the
+production path.
 """
 from __future__ import annotations
 

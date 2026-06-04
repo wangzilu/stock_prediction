@@ -444,8 +444,51 @@ class MarketCollector:
                     r"\.(SH|SZ|BJ)$", "", regex=True,
                 )
 
+            # 2026-06-04 cx round 4 P1-6: validate required columns are
+            # present AND non-empty / parseable BEFORE returning. Pre-fix
+            # the function only checked len(df) >= 4500 — a ST_CLIENT
+            # field rename or schema drift would land an unusable frame
+            # that looked OK by row count and downstream sanitizer
+            # would silently misjudge everything.
+            required = ["代码", "名称", "最新价", "涨跌幅", "成交量"]
+            missing = [c for c in required if c not in df.columns]
+            if missing:
+                logger.warning(
+                    "ST_CLIENT spot fallback missing columns %s — refusing "
+                    "to return a partial frame", missing,
+                )
+                return None
+            # Non-empty fraction on the must-have identifying cols
+            id_nonempty = (
+                df["代码"].astype(str).str.strip().ne("").mean()
+                if len(df) else 0.0
+            )
+            name_nonempty = (
+                df["名称"].astype(str).str.strip().ne("").mean()
+                if len(df) else 0.0
+            )
+            # Numeric parseability on price/change/volume
+            price_numeric = pd.to_numeric(df["最新价"], errors="coerce").notna().mean()
+            chg_numeric = pd.to_numeric(df["涨跌幅"], errors="coerce").notna().mean()
+            vol_numeric = pd.to_numeric(df["成交量"], errors="coerce").notna().mean()
+            if id_nonempty < 0.98 or name_nonempty < 0.98:
+                logger.warning(
+                    "ST_CLIENT spot fallback identifying-col non-empty "
+                    "rate too low (code=%.2f%%, name=%.2f%%) — refusing.",
+                    id_nonempty * 100, name_nonempty * 100,
+                )
+                return None
+            if price_numeric < 0.95 or chg_numeric < 0.95 or vol_numeric < 0.90:
+                logger.warning(
+                    "ST_CLIENT spot fallback numeric-col parseable rate "
+                    "too low (price=%.2f%%, chg=%.2f%%, vol=%.2f%%) — refusing.",
+                    price_numeric * 100, chg_numeric * 100, vol_numeric * 100,
+                )
+                return None
+
             logger.info(
-                "Loaded %d stocks via ST_CLIENT realtime_list (full-market)",
+                "Loaded %d stocks via ST_CLIENT realtime_list (full-market, "
+                "validated cols)",
                 len(df),
             )
             return df

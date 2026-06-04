@@ -855,29 +855,32 @@ class DailyPipeline:
         """Format evening stock forecasts with trading strategy for each horizon."""
         lines = ["五、个股预测"]
 
-        # 2026-06-03 emergency fix: defensive-mode banner when ALL Top K
-        # across every horizon have model_score <= 0. The model is
-        # broadly bearish today; the user still needs to see relatively-
-        # best K names but with explicit warning.
+        # 2026-06-03 emergency fix + 2026-06-04 cx round 7 P2-7 fix:
+        # Defensive mode now REPLACES the strategy / buy templates with
+        # an observation-only block. Pre-fix the defensive banner sat
+        # ABOVE strategy lines that still said "下一开盘日买入｜止盈｜
+        # 止损", which contradicts the banner and misleads execution.
         all_items = []
         for items in forecast_groups.values():
             all_items.extend(items)
-        if all_items and all(
+        defensive_only = bool(all_items) and all(
             it.get("model_score", 0) <= 0 for it in all_items
-        ):
+        )
+        if defensive_only:
             lines.append(
-                "  ⚠️ 服务降级模式（防御候选 - 仅观察）：模型对今日所有候选"
-                "预测为负，可能由模型异常或全市场看空触发。以下为相对最优"
-                "Top K，**不构成买入建议**。建议查证 prediction_health 是否"
-                "RED，并等待修复后再视情况操作。"
+                "  ⚠️ 服务降级模式（防御观察 - 不建议交易）：模型对今日所有"
+                "候选预测为负，可能由模型异常或全市场看空触发。以下仅为"
+                "相对排序的**观察名单**，**不输出买入价/止盈/止损模板，"
+                "不构成交易指令**。建议查证 prediction_health 是否 RED，"
+                "并等待修复后再视情况操作。"
             )
             logger.warning(
                 "Evening forecasts: ALL %d candidates have model_score<=0 — "
-                "defensive-mode banner emitted",
+                "defensive observation mode (strategy templates suppressed)",
                 len(all_items),
             )
 
-        # Strategy specs per horizon
+        # Strategy specs per horizon (only used outside defensive mode)
         strategy = {
             "短线": {"hold": "5个交易日", "buy": "下一开盘日", "tp": 8, "sl": 5},
             "中线": {"hold": "20个交易日", "buy": "回调时分批", "tp": 15, "sl": 8},
@@ -885,8 +888,16 @@ class DailyPipeline:
             "综合": {"hold": "5-20个交易日", "buy": "下一开盘日", "tp": 10, "sl": 6},
         }
 
+        # cx round 7 P2-8: the "短线" metric used to be labelled
+        # "明日预测{x}%" where x was ``model_score * 100 / 5`` — a
+        # linear approximation of a 5-day return that ignores
+        # compounding AND mis-frames the horizon. The metric is the
+        # PER-DAY equivalent of a 5-DAY prediction, not a true next-day
+        # forecast. Relabel to make the 5-day basis explicit; do NOT
+        # change the numeric (downstream code uses next_day_change_pct
+        # for ranking).
         specs = [
-            ("短线", "短线前十", "明日预测"),
+            ("短线", "短线前十", "5日均/日"),
             ("中线", "中线前十", "中线分"),
             ("长线", "长线观察榜前十（仅供参考，非长期持有建议）", "长线分"),
             ("综合", "综合前十", "综合分"),
@@ -894,7 +905,15 @@ class DailyPipeline:
         for key, title, metric_label in specs:
             strat = strategy[key]
             lines.append(f"{title}：")
-            lines.append(f"  策略：持有{strat['hold']}｜{strat['buy']}买入｜止盈{strat['tp']}%｜止损{strat['sl']}%")
+            if defensive_only:
+                # No strategy / buy template in defensive mode — only
+                # the observation list.
+                lines.append("  策略：观察名单（不建议交易）")
+            else:
+                lines.append(
+                    f"  策略：持有{strat['hold']}｜{strat['buy']}买入｜"
+                    f"止盈{strat['tp']}%｜止损{strat['sl']}%"
+                )
             items = forecast_groups.get(key, [])
             if not items:
                 lines.append("  暂无有效候选")
@@ -905,7 +924,8 @@ class DailyPipeline:
                 price = f"¥{item['price']:.2f}" if item.get("price") and item["price"] > 0 else ""
 
                 if key == "短线":
-                    metric = f"预测{item['short_expected']:+.2f}%"
+                    # P2-8: "5日预测(均/日)" makes the basis explicit
+                    metric = f"5日预测均/日{item['short_expected']:+.2f}%"
                 elif key == "中线":
                     metric = f"中线分{item['mid_score']:+.4f}"
                 elif key == "长线":

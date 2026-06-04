@@ -269,8 +269,18 @@ class ShortTermModel:
         return df.head(TOP_K_STOCKS)
 
     @classmethod
-    def load_from_pickle(cls, model_path: str = None, dataset_path: str = None):
+    def load_from_pickle(cls, model_path: str = None):
         """Load pre-trained model and rebuild dataset for inference.
+
+        2026-06-04 cx round 8 P2-5: removed the ``dataset_path``
+        parameter. It was advertised in the signature but never
+        consulted — the method ALWAYS rebuilt the inference dataset
+        from Qlib over the last 29 days. Callers who thought they
+        could load a configured dataset artifact got a silent
+        substitution. Removing the param means a caller who needs
+        to evaluate against a specific historical window should use
+        ``models.production_inference.load_production_model`` (which
+        takes explicit (test_start, test_end) ranges).
 
         The dataset is rebuilt fresh from Qlib to avoid pickle
         incompatibility with Alpha158 handler across Qlib versions.
