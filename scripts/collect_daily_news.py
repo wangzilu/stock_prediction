@@ -328,16 +328,44 @@ def collect_daily_news(
         target_date = datetime.now().strftime("%Y-%m-%d")
 
     output_path = NEWS_DIR / f"{target_date}.jsonl"
+    manifest_path = NEWS_DIR / f"{target_date}.manifest.json"
 
-    # Skip if already collected today with sufficient data
+    # 2026-06-04 cx round 16 P1-3: pre-fix the skip rule was
+    # "≥1000 lines" — pure row count, no version check. A file written
+    # by a pre-fix collector (no recency cutoff, no portfolio-snapshot
+    # contract guard) sat on disk with 1000+ rows and got accepted as
+    # "already done", bypassing all the round 4 fixes. Now: a sibling
+    # manifest records collector_version, filter_version, recency
+    # cutoff. Mismatched manifest (or missing one) forces re-collection.
+    COLLECTOR_VERSION = 4  # bump when collector logic changes substantively
+    FILTER_VERSION = 4     # bump when filter logic changes substantively
     if output_path.exists():
         n_existing = sum(1 for _ in open(output_path))
-        if n_existing >= 1000:  # minimum viable for full-A coverage
-            logger.info(f"News already collected for {target_date} ({n_existing} items), skipping")
+        manifest_ok = False
+        if manifest_path.exists():
+            try:
+                m = json.loads(manifest_path.read_text())
+                manifest_ok = (
+                    m.get("collector_version") == COLLECTOR_VERSION
+                    and m.get("filter_version") == FILTER_VERSION
+                    and int(m.get("recency_cutoff_days", -1)) == _NEWS_RECENCY_DAYS
+                )
+            except Exception:
+                manifest_ok = False
+        if manifest_ok and n_existing >= 1000:
+            logger.info(f"News already collected for {target_date} ({n_existing} items, manifest matches), skipping")
             return output_path
+        if not manifest_ok:
+            logger.warning(
+                f"Existing {output_path.name} has no/stale manifest "
+                f"(collector_v={COLLECTOR_VERSION}, filter_v={FILTER_VERSION}, "
+                f"recency={_NEWS_RECENCY_DAYS}d) — re-collecting."
+            )
         else:
             logger.warning(f"Previous collection only got {n_existing} items, re-collecting")
-            os.remove(str(output_path))
+        os.remove(str(output_path))
+        if manifest_path.exists():
+            os.remove(str(manifest_path))
 
     # Get target stocks
     if use_portfolio:
@@ -383,6 +411,20 @@ def collect_daily_news(
     with open(output_path, "w", encoding="utf-8") as f:
         for item in all_results:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    # cx round 16 P1-3: manifest sidecar so the next-day skip-check
+    # can verify schema/version compatibility before reusing this
+    # file. See the top-of-function skip block.
+    manifest = {
+        "target_date": target_date,
+        "collector_version": COLLECTOR_VERSION,
+        "filter_version": FILTER_VERSION,
+        "recency_cutoff_days": _NEWS_RECENCY_DAYS,
+        "n_items": len(all_results),
+        "use_portfolio": bool(use_portfolio),
+        "collected_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
 
     logger.info(f"Collected {len(all_results)} news items for {len(stocks)} stocks -> {output_path}")
     return output_path

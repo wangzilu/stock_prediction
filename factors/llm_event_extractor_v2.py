@@ -347,9 +347,35 @@ class LLMEventExtractorV2:
                     continue
                 stock_news.setdefault(code, []).append(item)
 
+        # 2026-06-04 cx round 16 P2-5 + round 17 P1-2 fix: sort by
+        # priority before truncating. The publish_time tiebreaker now
+        # parses to a real timestamp (negated so newer = lower → first).
+        # The previous ``[::-1]`` reverse-string trick mis-ordered dates
+        # like "2026-06-03" vs "2026-06-04" because reversing the whole
+        # string scrambled the year/month/day order. Unparseable
+        # timestamps sort LAST (priority +inf) so missing-date rows
+        # cannot push newer rows out of the top slice.
+        import datetime as _dt
+        def _ts(item: dict) -> float:
+            raw = str(item.get("publish_time") or "").strip()
+            if not raw:
+                return float("inf")
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y%m%d", "%Y-%m-%dT%H:%M:%S"):
+                try:
+                    return -_dt.datetime.strptime(raw[:len(fmt)+8], fmt).timestamp()
+                except ValueError:
+                    continue
+            return float("inf")
+        def _priority_key(item: dict) -> tuple:
+            return (
+                -float(item.get("priority_score", 0.0)),
+                {"交易所公告": 0, "eastmoney": 1}.get(item.get("source", ""), 2),
+                _ts(item),
+            )
         tasks = []
         seen = set()
         for code, news_list in stock_news.items():
+            news_list = sorted(news_list, key=_priority_key)
             for item in news_list[:max_news_per_stock]:
                 title = item.get("title", "").strip()
                 if not title:

@@ -105,12 +105,29 @@ def fetch_announcements_for_date(date: str, page_size: int = 100, max_pages: int
 def collect_for_date(date: str) -> Path:
     """Collect announcements for a date and save to JSONL."""
     output_path = ANN_DIR / f"{date}.jsonl"
+    manifest_path = ANN_DIR / f"{date}.manifest.json"
 
-    if output_path.exists():
-        n = sum(1 for _ in open(output_path))
-        if n >= 50:
-            logger.info(f"  {date}: already {n} announcements, skip")
-            return output_path
+    # 2026-06-04 cx round 16 P2-6: the "≥50 lines → skip" rule
+    # accepted half-failed collections (full A-share day has thousands
+    # of announcements). Use a sibling manifest with
+    # ``finished=True`` + a sanity floor instead.
+    if output_path.exists() and manifest_path.exists():
+        try:
+            m = json.loads(manifest_path.read_text())
+            if m.get("finished") and int(m.get("n_items", 0)) >= 50:
+                n = int(m["n_items"])
+                logger.info(
+                    f"  {date}: finished collection ({n} announcements), "
+                    f"skip"
+                )
+                return output_path
+        except Exception:
+            pass
+        # Stale/invalid manifest — fall through to re-collect.
+        logger.warning(
+            f"  {date}: manifest missing/invalid, re-collecting "
+            f"(was len={sum(1 for _ in open(output_path))})"
+        )
 
     items = fetch_announcements_for_date(date)
 
@@ -124,11 +141,30 @@ def collect_for_date(date: str) -> Path:
         else:
             item["qlib_code"] = f"bj{code}"
 
-    with open(output_path, "w", encoding="utf-8") as f:
+    # 2026-06-04 cx round 17 P1-1: write to .tmp then atomic-replace
+    # so a half-failed write cannot overwrite a previously-good file.
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
         for item in items:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    os.replace(tmp_path, output_path)
 
-    logger.info(f"  {date}: {len(items)} announcements, {len(set(i['stock_code'] for i in items))} stocks")
+    # cx round 17 P1-1: WRITE the manifest sidecar after a successful
+    # save. Pre-fix only the SKIP path read the manifest; nothing wrote
+    # it, so every cron re-collected and an Eastmoney blip could
+    # overwrite a complete file with a half-empty one.
+    manifest = {
+        "target_date": date,
+        "finished": True,
+        "n_items": len(items),
+        "n_unique_stocks": len(set(i.get("stock_code", "") for i in items)),
+        "collected_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    manifest_tmp = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+    manifest_tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
+    os.replace(manifest_tmp, manifest_path)
+
+    logger.info(f"  {date}: {len(items)} announcements, {len(set(i['stock_code'] for i in items))} stocks (manifest finished=True)")
     return output_path
 
 

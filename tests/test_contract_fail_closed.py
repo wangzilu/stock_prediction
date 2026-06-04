@@ -119,18 +119,25 @@ def test_train_lgb_inject_not_in_try_except():
     )
 
 
-def test_train_lgb_raises_when_supp_cols_zero():
-    """When inject_supplementary_into_handler returns 0, train_lgb
-    MUST raise rather than silently train a 158-dim model and save
-    it under the production artifact name. Pin via source-text check
-    because the alternative (importing main() and forcing zero) needs
-    full qlib data."""
-    assert (
-        "Refusing to save a 158-dim model under the 242-dim contract"
-        in TRAIN_LGB
-    ), (
-        "P0-2 gate phrase missing — when inject returns 0 cols, "
-        "train_lgb must raise RuntimeError before model.fit()."
+def test_train_lgb_uses_profile_dimension_assert():
+    """When the injection step finishes, train_lgb MUST hard-fail on
+    any profile-vs-actual count mismatch rather than just checking
+    ``supp + custom > 0``. Pin via source-text check (full-qlib
+    import is too heavy for a unit test).
+
+    cx round 16 P1-3: round 8 P0-2 originally pinned the phrase
+    "Refusing to save a 158-dim model under the 242-dim contract".
+    That gate was replaced by the profile-aware
+    ``assert_profile_dimensions`` helper (which subsumes the old
+    158-dim refusal AND covers xgb_174). Test now pins the new
+    helper call site directly.
+    """
+    assert "assert_profile_dimensions(" in TRAIN_LGB, (
+        "train_lgb no longer calls assert_profile_dimensions — "
+        "P1-3 dim gate regressed."
+    )
+    assert "alpha_count=158" in TRAIN_LGB, (
+        "train_lgb dim gate must explicitly pass alpha_count=158."
     )
 
 

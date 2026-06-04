@@ -66,20 +66,31 @@ class FeatureMerger:
             )
             raise
 
-        # Find the base index from the handler.
+        # 2026-06-04 cx round 16 P1-1 fix: compute the union of all
+        # handler frames' indexes so D.features covers every frame's
+        # instrument × date span. Pre-fix the helper only used the
+        # first non-empty frame as the base, then assigned ``.values``
+        # to every frame — silently misaligning when _data / _learn /
+        # _infer had different lengths or orders. Now we collect the
+        # union, query D.features once, then reindex PER-FRAME using
+        # ``.loc`` so each frame gets the correct values for its own
+        # index (matches the supplementary path's correctness).
+        all_indexes = []
         for attr in ("_data", "_learn", "_infer"):
             df = getattr(handler, attr, None)
             if df is not None and len(df) > 0:
-                base_index = df.index
-                break
-        else:
+                all_indexes.append(df.index)
+        if not all_indexes:
             logger.warning(
                 "inject_qlib_custom_factors: no _data/_learn/_infer found"
             )
             return 0
+        union_index = all_indexes[0]
+        for idx in all_indexes[1:]:
+            union_index = union_index.union(idx)
 
-        instruments = list(set(str(c) for c in base_index.get_level_values(1)))
-        dates = sorted(base_index.get_level_values(0).unique())
+        instruments = list(set(str(c) for c in union_index.get_level_values(1)))
+        dates = sorted(union_index.get_level_values(0).unique())
         if not dates:
             return 0
         custom = D.features(
@@ -92,19 +103,28 @@ class FeatureMerger:
             logger.warning("inject_qlib_custom_factors: D.features returned empty")
             return 0
         custom.columns = [name for name, _expr in factor_specs]
-        custom = custom.swaplevel().sort_index().reindex(base_index)
+        # Swap levels so (datetime, instrument) order matches the handler's
+        # MultiIndex. Replace inf with NaN so XGB does not crash.
+        custom = custom.swaplevel().sort_index()
         custom = custom.replace([np.inf, -np.inf], np.nan)
 
+        # Per-frame .loc-based assignment so each frame gets values
+        # aligned to ITS OWN index, not to a shared union.
         for attr in ("_data", "_learn", "_infer"):
             df = getattr(handler, attr, None)
             if df is None or len(df) == 0:
                 continue
+            attr_common = custom.index.intersection(df.index)
             for col in custom.columns:
-                df[("feature", col)] = custom[col].values
+                df[("feature", col)] = np.nan
+                if len(attr_common):
+                    df.loc[attr_common, ("feature", col)] = custom.loc[
+                        attr_common, col
+                    ].values
 
         logger.info(
-            "inject_qlib_custom_factors: %d custom expression cols injected",
-            len(factor_specs),
+            "inject_qlib_custom_factors: %d custom expression cols injected "
+            "(per-frame aligned)", len(factor_specs),
         )
         return len(factor_specs)
 

@@ -358,14 +358,21 @@ class ShortTermModel:
         n_custom = merger.inject_qlib_custom_factors_into_handler(handler)
         print(f"[short_term] injected {n_supp} supp + {n_custom} qlib-custom "
               f"cols at inference (profile={PRODUCTION_MODEL_PROFILE})")
-        if (n_supp + n_custom) == 0:
-            raise FeatureContractViolation(
-                f"[short_term] both supplementary ({n_supp}) and "
-                f"qlib-custom ({n_custom}) injection returned 0 columns "
-                f"under profile={PRODUCTION_MODEL_PROFILE}. The model "
-                f"would silently degrade to 158-dim default-leaf "
-                f"predictions. Refusing to serve."
+        # cx round 16 P1-3: strict profile-aware dim assertion.
+        # cx round 18 P1-2: keep the "Refusing to serve" phrase so the
+        # serve-side fail-closed test still finds it. The old wording
+        # was load-bearing in tests + observability.
+        from config.production_features import assert_profile_dimensions
+        try:
+            assert_profile_dimensions(
+                alpha_count=158,
+                supp_count=int(n_supp or 0),
+                custom_count=int(n_custom or 0),
             )
+        except RuntimeError as exc:
+            raise FeatureContractViolation(
+                f"{exc}. Refusing to serve."
+            ) from exc
 
         # Sanity gate: booster feature count must match the prepared
         # feature matrix width, or predictions are silent garbage.

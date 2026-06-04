@@ -258,6 +258,12 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
         logger.debug(_tb.format_exc())
         try:
             import json as _json_fallback
+            # cx round 16 P2-4: fallback also enforces the same 7-day
+            # recency cutoff so stale news from older raw files cannot
+            # leak through the bypass. Pre-fix the fallback did only
+            # title dedup + 500 cap, leaving old news visible to the
+            # extractor when the upstream collector was bypassed.
+            from scripts.collect_daily_news import _is_recent_news
             if news_path.exists():
                 seen_titles: set[str] = set()
                 fallback_items: list[dict] = []
@@ -269,6 +275,8 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
                         try:
                             item = _json_fallback.loads(line)
                         except _json_fallback.JSONDecodeError:
+                            continue
+                        if not _is_recent_news(item.get("publish_time", "")):
                             continue
                         t = (item.get("title") or "").strip()
                         if not t or t in seen_titles:
@@ -375,17 +383,28 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
         return False
 
     # Step 3: Build factors
+    # 2026-06-04 cx round 16 P1-1: Pre-fix didn't pass ``source`` and
+    # the builder defaulted to ``source="jsonl"`` — so even though
+    # Step 2 wrote events into the EventStore, the production parquet
+    # was built from the JSONL with the older file_date semantics.
+    # Now request EventStore explicitly via env-var-tunable
+    # LLM_EVENT_FACTOR_SOURCE so a head-to-head IC comparison can
+    # flip the source without re-deploying.
     logger.info("[Step 3/3] Building quantitative factors...")
     try:
         from scripts.build_llm_event_factors import build_factors_range
-
+        import os as _os
+        factor_source = _os.environ.get("LLM_EVENT_FACTOR_SOURCE", "eventstore").strip().lower()
         df = build_factors_range(
             start_date=target_date,
             end_date=target_date,
             lookback_days=30,
+            source=factor_source,
         )
         n_stocks = len(df) if not df.empty else 0
-        logger.info(f"  Factors built for {n_stocks} stocks")
+        logger.info(
+            f"  Factors built for {n_stocks} stocks (source={factor_source})"
+        )
     except Exception as e:
         logger.error(f"  Factor building failed: {e}")
         logger.debug(traceback.format_exc())

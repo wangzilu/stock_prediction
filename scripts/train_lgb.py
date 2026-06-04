@@ -235,17 +235,21 @@ def main():
     # loaders. The xgb_242 profile has an empty custom factor list, so
     # this call is a no-op there.
     custom_cols = merger.inject_qlib_custom_factors_into_handler(handler)
-    total_injected = (supp_cols or 0) + (custom_cols or 0)
-    if not total_injected:
-        # xgb_242 expects supp_cols > 0; xgb_174 expects custom_cols > 0.
-        # Either one being zero on a profile that needs it is a hard
-        # fail — refuse to save a model with the wrong feature shape.
-        from config.production_features import PRODUCTION_MODEL_PROFILE
-        raise RuntimeError(
-            f"production training under profile={PRODUCTION_MODEL_PROFILE} "
-            f"received supp_cols={supp_cols}, custom_cols={custom_cols}. "
-            f"At least one injection must succeed."
-        )
+    # 2026-06-04 cx round 16 P1-2 fix: strict profile-aware dim check.
+    # Previously only checked ``supp + custom > 0`` — a partial custom
+    # factor failure under xgb_174 would still pass because
+    # capital_flow's 3 cols alone met the floor. Replaced by
+    # ``assert_profile_dimensions`` which requires the EXACT contract
+    # counts.
+    from config.production_features import (
+        PRODUCTION_MODEL_PROFILE,
+        assert_profile_dimensions,
+    )
+    assert_profile_dimensions(
+        alpha_count=158,
+        supp_count=int(supp_cols or 0),
+        custom_count=int(custom_cols or 0),
+    )
 
     # Verify injection worked for learn data + capture the real feature
     # name list for the artifact contract.
@@ -259,12 +263,18 @@ def main():
         for col in verify.columns.tolist()
     ]
     # 158 alpha158 cols + supp_cols supplementary cols
-    if verify.shape[1] != 158 + supp_cols:
+    # cx round 16 P0-1 fix: include custom_cols in the dim check.
+    # Pre-fix this was ``158 + supp_cols`` only; under xgb_174
+    # (supp=3, custom=13) it expected 161 instead of 174 and
+    # incorrectly raised on a healthy 174-dim training run.
+    expected_total = 158 + int(supp_cols or 0) + int(custom_cols or 0)
+    if verify.shape[1] != expected_total:
         raise RuntimeError(
             f"production training dim sanity failed: handler reports "
             f"{verify.shape[1]} features but expected "
-            f"{158 + supp_cols} (158 alpha158 + {supp_cols} supp). "
-            f"Refusing to save a model under a corrupt feature contract."
+            f"{expected_total} (158 alpha158 + {supp_cols} supp + "
+            f"{custom_cols} qlib_custom). Refusing to save a model "
+            f"under a corrupt feature contract."
         )
 
     # Model selection: XGB (better IC) or LGB (fallback)
@@ -285,8 +295,8 @@ def main():
                 "n_jobs": 4,
             },
         }
-        n_features = 158 + supp_cols
-        print(f"Training XGBoost ({n_features} features)...")
+        n_features = expected_total  # cx round 16 P0-1: include custom_cols
+        print(f"Training XGBoost ({n_features} features, profile={PRODUCTION_MODEL_PROFILE})...")
     else:
         model_config = {
             "class": "LGBModel",
@@ -413,12 +423,19 @@ def main():
         # write_contract to a TEMP DATA_DIR alias is overkill; we
         # instead write contract first, fail-loud on error, then
         # atomic-promote model knowing contract is already on disk.
+        # 2026-06-04 cx round 18 P0: contract's "supplementary_count" is
+        # really "everything-else after Alpha158". For xgb_174 that
+        # bucket holds capital_flow (3) + qlib custom (13) = 16. Pre-fix
+        # we passed supp_cols only, so the contract validator
+        # ``alpha158_count + supplementary_count == n_features`` failed
+        # with 158+3=161 vs n_features=174. Now pass supp+custom.
+        non_alpha_count = int(supp_cols or 0) + int(custom_cols or 0)
         write_contract(
             Path(DATA_DIR),
             model_pkl_path=str(MODEL_PATH),
             feature_names=list(feature_cols),
             alpha158_count=158,
-            supplementary_count=int(supp_cols),
+            supplementary_count=non_alpha_count,
             production_groups=PRODUCTION_SUPPLEMENTARY_GROUPS,
         )
     except Exception as contract_exc:

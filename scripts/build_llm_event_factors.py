@@ -335,6 +335,14 @@ def build_factors_range(
     source: str = "jsonl",
     allow_fallback: bool = False,
 ) -> pd.DataFrame:
+    # 2026-06-04 cx round 17 P1-3: REVERTED to ``jsonl`` default per
+    # cx feedback. cx round 16 P1-1 flipped this to ``eventstore``,
+    # but the CLI help block in main() still warned EventStore was
+    # "not for live production" and would change the factor
+    # distribution ~100x. Silently flipping the source is exactly the
+    # silent factor/model distribution change the contract gate
+    # exists to prevent. Switch only via explicit env var until a
+    # head-to-head IC + backtest is on file proving parity (or wins).
     """Build factors for a date range and save to parquet.
 
     Args:

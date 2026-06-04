@@ -75,19 +75,13 @@ SUPPLEMENTARY_GROUPS_BY_PROFILE: dict[str, tuple[str, ...]] = {
         "st_holder_number",
         "cross_market_regime",
     ),
-    # xgb_174 placeholder. The historical xgb_174 path actually used
-    # Alpha158 + 16 qlib-custom factors + capital_flow + a few one-off
-    # cols (see config/feature_path.py for the 205-col enumeration).
-    # That cannot be expressed as PURE FeatureMerger groups — the qlib
-    # custom factors come from D.features expressions, not parquets.
-    # Restoring xgb_174 therefore requires both:
-    #   (1) listing the FeatureMerger-side groups here (capital_flow
-    #       is the only supplementary loader the 174 profile used);
-    #   (2) wiring the qlib-custom expressions into the inference
-    #       dataset construction (scripts/train_lgb.py + ShortTermModel
-    #       and the production_inference helper).
-    # Until (2) is done, selecting PRODUCTION_MODEL_PROFILE=xgb_174 is
-    # a stub that the contract gate will reject.
+    # xgb_174 — Alpha158 (158) + capital_flow (3) + qlib-custom (13) =
+    # 174 features. Both injection paths (FeatureMerger supplementary
+    # for capital_flow + FeatureMerger.inject_qlib_custom_factors_into_handler
+    # for the expression factors) ARE wired in scripts/train_lgb.py,
+    # models/short_term.py and models/production_inference.py since
+    # cx round 10 + round 16 (2026-06-04). The PROFILE_EXPECTED_COUNTS
+    # block below pins the exact contract.
     "xgb_174": (
         "capital_flow",
     ),
@@ -161,4 +155,62 @@ QLIB_CUSTOM_FACTORS_BY_PROFILE: dict[str, tuple[tuple[str, str], ...]] = {
 def current_profile_qlib_custom_factors() -> tuple[tuple[str, str], ...]:
     """Qlib expression factors for the currently-selected profile."""
     return QLIB_CUSTOM_FACTORS_BY_PROFILE.get(PRODUCTION_MODEL_PROFILE, ())
+
+
+# Expected exact column counts per profile. Used by the
+# ``assert_profile_dimensions`` helper so train/inference paths cannot
+# silently produce a wrong-dim artifact.
+PROFILE_EXPECTED_COUNTS: dict[str, dict[str, int]] = {
+    "xgb_242": {
+        "alpha158": 158,
+        "supplementary": 84,
+        "qlib_custom": 0,
+        "total": 242,
+    },
+    "xgb_174": {
+        "alpha158": 158,
+        "supplementary": 3,    # capital_flow only
+        "qlib_custom": 13,     # PE/PB/Turn/amount + derivatives
+        "total": 174,
+    },
+}
+
+
+def assert_profile_dimensions(
+    *, alpha_count: int, supp_count: int, custom_count: int,
+    profile: str | None = None,
+) -> None:
+    """Hard-fail unless the (alpha + supp + custom) totals match the
+    currently-selected profile's contract. cx round 16 P1-3: previously
+    train/serve paths only checked ``supp + custom > 0`` — a partial
+    custom factor failure on xgb_174 would still pass that floor.
+    """
+    profile = (profile or PRODUCTION_MODEL_PROFILE).strip().lower()
+    spec = PROFILE_EXPECTED_COUNTS.get(profile)
+    if spec is None:
+        raise RuntimeError(
+            f"assert_profile_dimensions: unknown profile {profile!r}"
+        )
+    if alpha_count != spec["alpha158"]:
+        raise RuntimeError(
+            f"profile={profile} expected {spec['alpha158']} Alpha158 cols "
+            f"but got {alpha_count}"
+        )
+    if supp_count != spec["supplementary"]:
+        raise RuntimeError(
+            f"profile={profile} expected {spec['supplementary']} supplementary "
+            f"cols but got {supp_count}"
+        )
+    if custom_count != spec["qlib_custom"]:
+        raise RuntimeError(
+            f"profile={profile} expected {spec['qlib_custom']} qlib-custom "
+            f"cols but got {custom_count}"
+        )
+    total = alpha_count + supp_count + custom_count
+    if total != spec["total"]:
+        raise RuntimeError(
+            f"profile={profile} total dim mismatch: "
+            f"{alpha_count}+{supp_count}+{custom_count}={total} "
+            f"!= contract {spec['total']}"
+        )
 

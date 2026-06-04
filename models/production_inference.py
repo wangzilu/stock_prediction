@@ -135,12 +135,16 @@ def load_production_model(
     # expression factors. xgb_242 has no custom factors so this is a
     # no-op there.
     n_custom = merger.inject_qlib_custom_factors_into_handler(dataset.handler)
-    if (n_supp + n_custom) == 0:
-        raise FeatureContractViolation(
-            f"load_production_model: under profile={PRODUCTION_MODEL_PROFILE}, "
-            f"neither supplementary ({n_supp}) nor qlib-custom ({n_custom}) "
-            f"injection produced columns. Refusing to serve."
+    # cx round 16 P1-3: strict profile-aware dim assertion.
+    from config.production_features import assert_profile_dimensions
+    try:
+        assert_profile_dimensions(
+            alpha_count=158,
+            supp_count=int(n_supp or 0),
+            custom_count=int(n_custom or 0),
         )
+    except RuntimeError as exc:
+        raise FeatureContractViolation(str(exc)) from exc
 
     # Sanity gate identical to ShortTermModel.load_from_pickle.
     _xtest = dataset.prepare("test", col_set="feature",
