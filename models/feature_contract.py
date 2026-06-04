@@ -168,12 +168,23 @@ def update_legacy_contract_alias(data_dir: Path, profile: str | None = None) -> 
     """Atomically flip ``production_feature_contract.json`` to point
     at the profile's contract. Called from train_lgb AFTER the model
     artifact is saved so the legacy alias pair (model + contract) is
-    always consistent. cx round 25 P1-1 + P2-4.
+    always consistent. cx round 25 P1-1 + P2-4 + round 27 P2-3.
     """
     import os as _os
     from config.production_features import PRODUCTION_MODEL_PROFILE
     resolved = (profile or PRODUCTION_MODEL_PROFILE).strip().lower()
     target = contract_path(data_dir, resolved)
+    # cx round 27 P2-3: refuse to create a symlink to a missing target.
+    # Pre-fix the helper would happily create a dangling symlink; the
+    # next load_contract would fail with a confusing FileNotFoundError
+    # instead of explicit "contract target missing".
+    if not target.exists():
+        raise FeatureContractViolation(
+            f"update_legacy_contract_alias: target {target} does not "
+            f"exist. Refusing to create a dangling legacy symlink. "
+            f"This usually means write_contract was skipped or its "
+            f"output was deleted."
+        )
     legacy = legacy_contract_path(data_dir)
     tmp_link = legacy.with_suffix(legacy.suffix + ".symlink.tmp")
     try:
@@ -203,30 +214,38 @@ def load_contract(data_dir: Path, profile: str | None = None) -> dict | None:
     first retrain that writes a contract."""
     from config.production_features import PRODUCTION_MODEL_PROFILE
     resolved_profile = (profile or PRODUCTION_MODEL_PROFILE).strip().lower()
+
+    def _validate_profile(data: dict, *, source_label: str) -> None:
+        """cx round 27 P1-2: profile mismatch check applies to BOTH
+        the profile-specific path AND the legacy fallback. Pre-fix
+        only the legacy fallback validated, so a file named
+        ``production_feature_contract_xgb_242.json`` whose JSON had
+        ``profile: xgb_174`` would silently slip through."""
+        embedded = str(data.get("profile") or "").strip().lower()
+        if embedded and embedded != resolved_profile:
+            raise FeatureContractViolation(
+                f"load_contract: {source_label} carries "
+                f"profile={embedded!r} but caller requested "
+                f"{resolved_profile!r}. Refusing to serve a contract "
+                f"from the wrong profile."
+            )
+
     path = contract_path(data_dir, resolved_profile)
     if path.exists():
-        return json.loads(path.read_text())
+        data = json.loads(path.read_text())
+        _validate_profile(data, source_label=path.name)
+        return data
 
     # Fall back to the legacy single-file location for back-compat
-    # during migration. cx round 25 P1-2: legacy may carry a DIFFERENT
-    # profile's contract (e.g. the symlink points at xgb_242 but the
-    # caller asked for xgb_174). Accept only when the contract's
-    # ``profile`` field matches OR is empty (pre-profile artifact —
-    # one-shot warning during migration).
+    # during migration. cx round 25 P1-2 + round 27 P1-2: same
+    # profile validation as the primary path; pre-profile (empty
+    # ``profile``) artifacts get a one-shot warning.
     legacy = legacy_contract_path(data_dir)
     if not legacy.exists():
         return None
     legacy_data = json.loads(legacy.read_text())
+    _validate_profile(legacy_data, source_label=f"legacy alias {legacy.name}")
     legacy_profile = str(legacy_data.get("profile") or "").strip().lower()
-    if legacy_profile and legacy_profile != resolved_profile:
-        raise FeatureContractViolation(
-            f"load_contract: legacy alias {legacy.name} carries "
-            f"profile={legacy_profile!r} but caller requested "
-            f"{resolved_profile!r}. Refusing to serve a contract from "
-            f"the wrong profile. Run scripts/train_lgb.py under "
-            f"PRODUCTION_MODEL_PROFILE={resolved_profile} to produce "
-            f"the right contract."
-        )
     logger.warning(
         "load_contract: profile contract %s missing; using legacy %s "
         "(legacy profile=%s). Re-run scripts/train_lgb.py.",
