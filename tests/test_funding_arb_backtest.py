@@ -239,12 +239,36 @@ def test_apr_on_capital_below_apr_on_notional():
         perp_leverage=1.0,
     )
     res = backtest_funding_arb(df, cfg)
+    # cx round 29 P2: explicit > 0 assertion + strict ordering.
+    assert res.after_cost_apr_on_capital > 0, (
+        f"capital APR was 0 — return wiring regressed? "
+        f"metrics={res.summary()}"
+    )
     assert res.after_cost_apr_on_capital < res.after_cost_apr_on_notional, (
         f"capital APR={res.after_cost_apr_on_capital:.4f} should be less "
         f"than notional APR={res.after_cost_apr_on_notional:.4f}"
     )
     # The legacy alias points at the honest capital figure (round 28 P0-1)
     assert res.after_cost_apr == res.after_cost_apr_on_capital
+
+
+def test_capital_apr_field_actually_populated_when_pnl_positive():
+    """cx round 29 P2 inverted form: even when notional APR is the
+    same as before R28, the R28 return-wiring fix means
+    after_cost_apr_on_capital MUST NOT remain at the default 0.
+    Pre-fix the field was added but the return only set
+    after_cost_apr — this test would have caught the regression."""
+    df = _funding_panel([0.001] * 30)
+    res = backtest_funding_arb(df, FundingArbBacktestConfig(
+        capital_usd=3_400.0, capital_buffer_pct=0.0,
+        notional_per_trade_usd=1_500.0, perp_leverage=1.0,
+    ))
+    assert res.after_cost_apr_on_capital > 0, (
+        "after_cost_apr_on_capital still 0 — return wiring regressed"
+    )
+    assert res.after_cost_apr_on_notional > res.after_cost_apr_on_capital, (
+        "cx round 29 P2: notional figure must EXCEED capital figure"
+    )
 
 
 def test_acceptance_uses_capital_apr_not_notional():
