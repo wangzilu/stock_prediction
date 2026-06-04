@@ -53,6 +53,8 @@ class PromotionGate:
         experiment_id: str,
         champion_id: str = None,
         split_experiment_ids: list[str] = None,
+        *,
+        allow_no_splits: bool = False,
     ) -> dict:
         """Run all gate checks on an experiment.
 
@@ -60,11 +62,30 @@ class PromotionGate:
             experiment_id: The candidate experiment to evaluate.
             champion_id: Current champion for delta comparison. Optional.
             split_experiment_ids: Per-split experiment IDs for rolling gate.
-                If None, checks single-experiment artifacts only.
+                Pre-fix this was nullable and callers could just omit it,
+                degrading the "24 split positive delta" requirement to a
+                single-artifact aggregate check. 2026-06-04 cx round 6
+                P1-6: now ``None`` is REJECTED by default; pass
+                ``allow_no_splits=True`` to opt out explicitly (e.g.
+                for diagnostic / single-artifact checks where 24-split
+                isn't meaningful).
+            allow_no_splits: explicit opt-out from the split requirement.
 
         Returns:
             dict with keys: pass, failures, warnings, checks, recommendation
         """
+        if not split_experiment_ids and not allow_no_splits:
+            return {
+                "pass": False,
+                "failures": [
+                    "split_experiment_ids is required (cx round 6 P1-6). "
+                    "Pass the 24-split list or allow_no_splits=True for "
+                    "diagnostic single-artifact checks."
+                ],
+                "warnings": [],
+                "checks": {},
+                "recommendation": "reject",
+            }
         failures = []
         warnings = []
         checks = {}

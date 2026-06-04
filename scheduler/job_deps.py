@@ -40,8 +40,24 @@ JOB_DEPS: dict[str, list[str]] = {
     "regime_daily_update": ["qlib_data_update"],
     "global_chain_extract": ["global_industry_news"],
     "global_chain_factors": ["global_chain_extract"],
-    # Feature cache rebuild reads qlib + holder + flow into a single parquet
-    "feature_cache_rebuild": ["qlib_data_update", "fund_flow_update"],
+    # Feature cache rebuild reads qlib + holder + flow + valuation +
+    # regime into a single parquet.
+    # 2026-06-04 cx round 6 P1-7: added valuation_update,
+    # regime_daily_update, fetch_shareholder_data, and
+    # cross_market_regime as explicit deps. Pre-fix the DAG only
+    # required qlib_data_update + fund_flow_update, so a stale
+    # valuation / regime / holder source could land in the cache
+    # without the gate noticing — silently mixed-vintage features
+    # entered training.
+    "feature_cache_rebuild": [
+        "qlib_data_update",
+        "fund_flow_update",
+        "valuation_update",
+        "regime_daily_update",
+        # fetch_shareholder_data + cross_market_regime should also
+        # be deps once those become cron-driven jobs writing health
+        # records. Add here when ready (placeholder TODO).
+    ],
     # ---- Training and inference depend on fresh cache --------------------
     "midweek_train": ["feature_cache_rebuild"],
     "lgb_after_close_smoke": ["feature_cache_rebuild"],

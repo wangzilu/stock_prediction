@@ -76,14 +76,77 @@ def build_mask(stats_only: bool = False) -> pd.Series:
     # ---- Filter 1: ST stocks ----
     logger.info("Filter 1: ST stocks...")
     st_set = load_st_set()
-    if st_set:
-        # NOTE: This only knows CURRENT ST status. Ideally we'd have historical ST transitions.
-        # For now, this filters current ST stocks from ALL dates (conservative).
-        # TODO: load historical namechange data for accurate per-date ST filtering.
+    # 2026-06-04 cx round 6 P1-8: pre-fix this broadcast TODAY's ST
+    # set to all historical dates, which both (a) deletes training
+    # samples for periods when those stocks were NOT yet ST, and
+    # (b) leaves samples for periods when previously-ST-now-clean
+    # stocks were actually ST. That biases the training universe
+    # in an opaque way.
+    # Honest treatment: prefer the historical mask file
+    # ``data/storage/st_historical_mask.parquet`` (produced by
+    # ``scripts/build_st_historical_mask.py``, task #91) when it
+    # exists. Fall back to the current-set broadcast — but ONLY when
+    # the operator has explicitly opted in via the env var
+    # ``ALLOW_CURRENT_ST_BROADCAST=1``. Otherwise abort training
+    # universe construction so the upstream pipeline halts on a
+    # known-biased mask instead of silently accepting it.
+    import os as _os
+    _historical_st_path = (
+        Path(__file__).resolve().parents[1]
+        / "data" / "storage" / "st_historical_mask.parquet"
+    )
+    if _historical_st_path.exists():
+        try:
+            hist_st = pd.read_parquet(_historical_st_path)
+            # hist_st is expected to have a MultiIndex (datetime,
+            # instrument) and a boolean ``is_st`` column. Reindex to
+            # the current frame's index, default False (not ST) when
+            # missing.
+            aligned = hist_st["is_st"].reindex(index, fill_value=False)
+            n_st = int(aligned.sum())
+            mask &= ~aligned.values
+            filter_stats["st"] = n_st
+            logger.info(
+                "  ST (historical): removed %d (%.1f%%) per per-date "
+                "namechange mask", n_st, n_st / n_total * 100,
+            )
+        except Exception as e:
+            logger.error(
+                "  Failed to load %s for historical ST filter: %s",
+                _historical_st_path, e,
+            )
+            if _os.environ.get("ALLOW_CURRENT_ST_BROADCAST") != "1":
+                raise RuntimeError(
+                    "ST historical mask unreadable AND "
+                    "ALLOW_CURRENT_ST_BROADCAST not set — refusing "
+                    "to fall back to the biased current-ST broadcast. "
+                    "Fix the mask file or set the env var."
+                ) from e
+            logger.warning(
+                "  ALLOW_CURRENT_ST_BROADCAST=1 set — using biased "
+                "current-ST broadcast (training universe will be biased)."
+            )
+            is_st = instruments.isin(st_set) if st_set else np.zeros(n_total, dtype=bool)
+            n_st = int(is_st.sum())
+            mask &= ~is_st
+            filter_stats["st"] = n_st
+    elif st_set:
+        if _os.environ.get("ALLOW_CURRENT_ST_BROADCAST") != "1":
+            raise RuntimeError(
+                "No historical ST mask at "
+                f"{_historical_st_path} AND ALLOW_CURRENT_ST_BROADCAST "
+                "not set. Run scripts/build_st_historical_mask.py first "
+                "(task #91), or set the env var to accept biased "
+                "current-ST broadcast."
+            )
+        logger.warning(
+            "  ALLOW_CURRENT_ST_BROADCAST=1 — applying current ST set "
+            "to all historical dates (training universe will be biased)."
+        )
         is_st = instruments.isin(st_set)
-        n_st = is_st.sum()
+        n_st = int(is_st.sum())
         mask &= ~is_st
-        filter_stats["st"] = int(n_st)
+        filter_stats["st"] = n_st
         logger.info(f"  ST: removed {n_st:,} ({n_st/n_total*100:.1f}%)")
 
     # ---- Filter 2: IPO < 60 days ----
