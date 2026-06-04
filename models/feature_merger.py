@@ -29,6 +29,85 @@ class FeatureMerger:
     def __init__(self, data_dir: Path = DATA_DIR):
         self.data_dir = data_dir
 
+    def inject_qlib_custom_factors_into_handler(
+        self,
+        handler,
+        factor_specs: tuple[tuple[str, str], ...] | None = None,
+    ) -> int:
+        """Inject Qlib expression-language factors into the handler.
+
+        Used by the xgb_174 profile (and any future profile that needs
+        compute-on-the-fly factors derived from $-prefixed Qlib fields).
+        Pre-fix xgb_174 was inaccessible because FeatureMerger only
+        knew about parquet-backed loaders; the expression factors lived
+        in scripts/train_pit_baseline.py only.
+
+        Args:
+            handler: a Qlib DataHandlerLP with _data / _learn / _infer
+                attributes (or any subset).
+            factor_specs: tuple of ``(name, qlib_expr)`` pairs. When
+                None, looks up the current profile's factors via
+                ``config.production_features.current_profile_qlib_custom_factors``.
+
+        Returns:
+            Number of columns injected. Zero for profiles without
+            qlib_custom factors (e.g. xgb_242).
+        """
+        if factor_specs is None:
+            from config.production_features import current_profile_qlib_custom_factors
+            factor_specs = current_profile_qlib_custom_factors()
+        if not factor_specs:
+            return 0
+        try:
+            from qlib.data import D
+        except Exception as e:
+            logger.error(
+                "qlib not importable — cannot inject custom factors: %s", e,
+            )
+            raise
+
+        # Find the base index from the handler.
+        for attr in ("_data", "_learn", "_infer"):
+            df = getattr(handler, attr, None)
+            if df is not None and len(df) > 0:
+                base_index = df.index
+                break
+        else:
+            logger.warning(
+                "inject_qlib_custom_factors: no _data/_learn/_infer found"
+            )
+            return 0
+
+        instruments = list(set(str(c) for c in base_index.get_level_values(1)))
+        dates = sorted(base_index.get_level_values(0).unique())
+        if not dates:
+            return 0
+        custom = D.features(
+            instruments,
+            [expr for _name, expr in factor_specs],
+            start_time=str(min(dates))[:10],
+            end_time=str(max(dates))[:10],
+        )
+        if custom is None or custom.empty:
+            logger.warning("inject_qlib_custom_factors: D.features returned empty")
+            return 0
+        custom.columns = [name for name, _expr in factor_specs]
+        custom = custom.swaplevel().sort_index().reindex(base_index)
+        custom = custom.replace([np.inf, -np.inf], np.nan)
+
+        for attr in ("_data", "_learn", "_infer"):
+            df = getattr(handler, attr, None)
+            if df is None or len(df) == 0:
+                continue
+            for col in custom.columns:
+                df[("feature", col)] = custom[col].values
+
+        logger.info(
+            "inject_qlib_custom_factors: %d custom expression cols injected",
+            len(factor_specs),
+        )
+        return len(factor_specs)
+
     def inject_supplementary_into_handler(
         self,
         handler,

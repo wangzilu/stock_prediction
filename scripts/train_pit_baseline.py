@@ -177,6 +177,10 @@ def evaluate(pred, label, index):
     # return spread, the caller must re-evaluate with a label that
     # bypasses CSZScoreNorm (planned: train_pit_baseline_raw.py
     # — task #102 follow-up).
+    # cx round 12 P1-3: embed execution_schema so the reader can
+    # verify the artifact came from the same execution rules as any
+    # other artifact being compared.
+    from config.experiment import EXECUTION_SCHEMA
     return {
         "ic_mean": round(float(ic.mean()), 6),
         "ic_std": round(float(ic.std()), 6),
@@ -193,6 +197,7 @@ def evaluate(pred, label, index):
         "spread_pos_ratio": round(float(np.mean([s > 0 for s in spreads])) if spreads else 0, 4),
         "n_test_days": len(spreads),
         "n_samples": int(mask.sum()),
+        "execution_schema": dict(EXECUTION_SCHEMA),
     }
 
 

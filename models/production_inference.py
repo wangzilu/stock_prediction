@@ -122,17 +122,24 @@ def load_production_model(
 
     # Same supp injection as ShortTermModel.load_from_pickle.
     from models.feature_merger import FeatureMerger
-    from config.production_features import PRODUCTION_SUPPLEMENTARY_GROUPS
+    from config.production_features import (
+        PRODUCTION_SUPPLEMENTARY_GROUPS,
+        PRODUCTION_MODEL_PROFILE,
+    )
     merger = FeatureMerger()
     n_supp = merger.inject_supplementary_into_handler(
         dataset.handler, preprocess=False,
         groups=PRODUCTION_SUPPLEMENTARY_GROUPS,
     )
-    if n_supp == 0:
+    # cx round 10 follow-up: xgb_174 profile also injects qlib-custom
+    # expression factors. xgb_242 has no custom factors so this is a
+    # no-op there.
+    n_custom = merger.inject_qlib_custom_factors_into_handler(dataset.handler)
+    if (n_supp + n_custom) == 0:
         raise FeatureContractViolation(
-            "load_production_model: inject_supplementary_into_handler "
-            "returned 0 supp columns; refusing to evaluate against the "
-            "242-dim production model."
+            f"load_production_model: under profile={PRODUCTION_MODEL_PROFILE}, "
+            f"neither supplementary ({n_supp}) nor qlib-custom ({n_custom}) "
+            f"injection produced columns. Refusing to serve."
         )
 
     # Sanity gate identical to ShortTermModel.load_from_pickle.

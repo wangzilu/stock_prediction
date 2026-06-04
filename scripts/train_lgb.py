@@ -228,12 +228,23 @@ def main():
         preprocess=False,
         groups=PRODUCTION_SUPPLEMENTARY_GROUPS,
     )
-    if not supp_cols:
+    # 2026-06-04 cx round 10 follow-up: when the profile is xgb_174,
+    # also inject the qlib-custom expression factors (PE / PB / Turn /
+    # amount + their momenta + EP/BP/price_pos) — these come from
+    # ``D.features`` on the fly, not from FeatureMerger parquet
+    # loaders. The xgb_242 profile has an empty custom factor list, so
+    # this call is a no-op there.
+    custom_cols = merger.inject_qlib_custom_factors_into_handler(handler)
+    total_injected = (supp_cols or 0) + (custom_cols or 0)
+    if not total_injected:
+        # xgb_242 expects supp_cols > 0; xgb_174 expects custom_cols > 0.
+        # Either one being zero on a profile that needs it is a hard
+        # fail — refuse to save a model with the wrong feature shape.
+        from config.production_features import PRODUCTION_MODEL_PROFILE
         raise RuntimeError(
-            "production training requires "
-            "PRODUCTION_SUPPLEMENTARY_GROUPS to inject the supplementary "
-            "block; inject_supplementary_into_handler returned 0 columns. "
-            "Refusing to save a 158-dim model under the 242-dim contract."
+            f"production training under profile={PRODUCTION_MODEL_PROFILE} "
+            f"received supp_cols={supp_cols}, custom_cols={custom_cols}. "
+            f"At least one injection must succeed."
         )
 
     # Verify injection worked for learn data + capture the real feature

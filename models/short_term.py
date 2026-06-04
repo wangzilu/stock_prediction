@@ -344,6 +344,7 @@ class ShortTermModel:
         from models.feature_merger import FeatureMerger
         from config.production_features import (
             PRODUCTION_SUPPLEMENTARY_GROUPS,
+            PRODUCTION_MODEL_PROFILE,
         )
         handler = instance._dataset.handler
         merger = FeatureMerger()
@@ -351,13 +352,19 @@ class ShortTermModel:
             handler, preprocess=False,
             groups=PRODUCTION_SUPPLEMENTARY_GROUPS,
         )
-        print(f"[short_term] injected {n_supp} supplementary cols at inference")
-        if n_supp == 0:
+        # cx round 10 follow-up: profile-dispatched qlib-custom factor
+        # injection. xgb_174 needs it (13 PE/PB/Turn/amount factors);
+        # xgb_242 has empty list so this is a no-op.
+        n_custom = merger.inject_qlib_custom_factors_into_handler(handler)
+        print(f"[short_term] injected {n_supp} supp + {n_custom} qlib-custom "
+              f"cols at inference (profile={PRODUCTION_MODEL_PROFILE})")
+        if (n_supp + n_custom) == 0:
             raise FeatureContractViolation(
-                "[short_term] inject_supplementary_into_handler returned 0 "
-                "columns at inference. The 242-dim production champion "
-                "would silently degrade to 158-dim default-leaf "
-                "predictions. Refusing to serve."
+                f"[short_term] both supplementary ({n_supp}) and "
+                f"qlib-custom ({n_custom}) injection returned 0 columns "
+                f"under profile={PRODUCTION_MODEL_PROFILE}. The model "
+                f"would silently degrade to 158-dim default-leaf "
+                f"predictions. Refusing to serve."
             )
 
         # Sanity gate: booster feature count must match the prepared

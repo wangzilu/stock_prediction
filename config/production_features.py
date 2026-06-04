@@ -127,3 +127,38 @@ SHADOW_SUPPLEMENTARY_GROUPS: tuple[str, ...] = ()
 # explicit) without forcing research code to hand-list 11 group names.
 RESEARCH_ALL_LOADERS: str = "_research_all_"
 
+
+# ---------------------------------------------------------------------------
+# Qlib custom expression profile (cx round 10 follow-up, 2026-06-04)
+# ---------------------------------------------------------------------------
+# The xgb_174 profile needs not just FeatureMerger groups but ALSO a set
+# of Qlib expression-language factors (PE / PB / Turn / amount + their
+# momenta / vol). These come from ``D.features(instruments, exprs, ...)``
+# at training and inference time, not from parquet loaders. Recording
+# them here so train_lgb / production_inference can dispatch the
+# correct injection.
+
+QLIB_CUSTOM_FACTORS_BY_PROFILE: dict[str, tuple[tuple[str, str], ...]] = {
+    "xgb_174": (
+        ("pe",              "$pe"),
+        ("pb",              "$pb"),
+        ("turn_raw",        "$turn"),
+        ("amount_raw",      "$amount"),
+        ("pe_mom20",        "$pe / Ref($pe, 20) - 1"),
+        ("pb_mom20",        "$pb / Ref($pb, 20) - 1"),
+        ("turn_anom20",     "$turn / Mean($turn, 20)"),
+        ("turn_anom60",     "$turn / Mean($turn, 60)"),
+        ("amount_anom20",   "$amount / Mean($amount, 20)"),
+        ("turn_vol20",      "Std($turn, 20)"),
+        ("ep",              "1.0 / If(Abs($pe) > 0.01, $pe, 1.0)"),
+        ("bp",              "1.0 / If(Abs($pb) > 0.01, $pb, 1.0)"),
+        ("price_pos20",     "($close - Min($close, 20)) / (Max($close, 20) - Min($close, 20) + 1e-8)"),
+    ),
+    "xgb_242": (),  # 242 path is FeatureMerger-only
+}
+
+
+def current_profile_qlib_custom_factors() -> tuple[tuple[str, str], ...]:
+    """Qlib expression factors for the currently-selected profile."""
+    return QLIB_CUSTOM_FACTORS_BY_PROFILE.get(PRODUCTION_MODEL_PROFILE, ())
+

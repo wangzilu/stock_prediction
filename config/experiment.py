@@ -26,8 +26,29 @@ TARGET_LABEL_NAME = "target_label_5d"
 PNL_RETURN_EXPR = "Ref($close, -1) / $close - 1"  # 1-day close-to-close
 PNL_RETURN_NAME = "pnl_return_1d"
 
-# Execution assumption
+# Execution assumption (legacy free-text — kept for back-compat)
 EXECUTION_ASSUMPTION = "T+1 close-to-close"  # Signal on T close, PnL from T+1 close to T+2 close
+
+
+# 2026-06-04 cx round 12 P1-3: machine-readable execution schema.
+# Pre-fix config said "T+1 close-to-close" but backtest/portfolio_backtest.py
+# implemented "T close signal, T+1 open execution OR close-to-close
+# fallback". The free-text disagreement made comparing artifacts (174
+# old vs 242 new vs upgraded Track B) error-prone. Every backtest
+# artifact must now embed the dict below verbatim under the
+# ``execution_schema`` key so readers can MACHINE-CHECK the same
+# execution was used.
+EXECUTION_SCHEMA: dict = {
+    "schema_version": "v1",
+    "signal_time": "T_close",
+    "execution_price": "T+1_open",        # primary — matches Track B upgraded
+    "execution_price_fallback": "T+1_close",  # used when T+1 open is missing
+    "return_window_start": "T+1_open",
+    "return_window_end": "T+2_open",
+    "ipo_min_age_trading_days": 60,
+    "valuation_freeze_policy": "T-1_snapshot",
+    "label_unit": "raw_forward_return",  # required for top20_raw_return_spread
+}
 
 # ============================================================
 # SPLIT CONFIGURATION
