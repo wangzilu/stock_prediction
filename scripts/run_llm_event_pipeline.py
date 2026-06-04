@@ -383,18 +383,16 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
         return False
 
     # Step 3: Build factors
-    # 2026-06-04 cx round 16 P1-1: Pre-fix didn't pass ``source`` and
-    # the builder defaulted to ``source="jsonl"`` — so even though
-    # Step 2 wrote events into the EventStore, the production parquet
-    # was built from the JSONL with the older file_date semantics.
-    # Now request EventStore explicitly via env-var-tunable
-    # LLM_EVENT_FACTOR_SOURCE so a head-to-head IC comparison can
-    # flip the source without re-deploying.
+    # 2026-06-04 cx round 17 P1-3 + round 19 P1-1: production
+    # default is ``jsonl`` to match the builder default and the
+    # CLI help block ("EventStore changes factor distribution ~100x,
+    # not for live"). Flipping the production source is now an
+    # opt-in via env LLM_EVENT_FACTOR_SOURCE=eventstore only.
     logger.info("[Step 3/3] Building quantitative factors...")
     try:
         from scripts.build_llm_event_factors import build_factors_range
         import os as _os
-        factor_source = _os.environ.get("LLM_EVENT_FACTOR_SOURCE", "eventstore").strip().lower()
+        factor_source = _os.environ.get("LLM_EVENT_FACTOR_SOURCE", "jsonl").strip().lower()
         df = build_factors_range(
             start_date=target_date,
             end_date=target_date,
