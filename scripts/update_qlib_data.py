@@ -1491,14 +1491,13 @@ def _main_inner(args: argparse.Namespace) -> int:
     logger.info("Update complete: %s stocks updated, %s failed, source=%s", success, fail, source)
     logger.info("Data stored in %s", args.qlib_dir)
 
-    write_health("qlib_data_update", HealthStatus(
-        success=True,
-        n_items=success,
-        latest_date=args.end_date,
-        network_profile="domestic",
-    ))
-
-    # --check-today: verify latest data date matches the most recent trading day
+    # 2026-06-04 cx round 4 P0-1: --check-today MUST run BEFORE the
+    # success-health write. Pre-fix, write_health("qlib_data_update",
+    # success=True) fired first; if --check-today then found 3+ sample
+    # stocks stale and returned 1, the success-health was still on
+    # disk and downstream stages (feature_cache_rebuild → smoke →
+    # morning_recommendation) read it as green and proceeded on stale
+    # data.
     if getattr(args, "check_today", False):
         today = datetime.now()
         today_str = today.strftime("%Y-%m-%d")
@@ -1515,6 +1514,7 @@ def _main_inner(args: argparse.Namespace) -> int:
         qlib_dir = args.qlib_dir
         sample_stocks = ["sh600000", "sz000001", "sh601398", "sz000002", "sh600519"]
         stale_count = 0
+        stale_detail = []
         for stock in sample_stocks:
             day_file = qlib_dir / "instruments" / f"{stock}.txt"
             if not day_file.exists():
@@ -1529,6 +1529,7 @@ def _main_inner(args: argparse.Namespace) -> int:
                     latest = parts[-1].strip()
                     if latest < expected_date:
                         stale_count += 1
+                        stale_detail.append(f"{stock}:{latest}")
                         logger.warning(f"  {stock} latest date = {latest} "
                                        f"(expected={expected_date})")
 
@@ -1538,9 +1539,32 @@ def _main_inner(args: argparse.Namespace) -> int:
                 f"do not have expected date ({expected_date}). "
                 f"Data source may not have published yet."
             )
+            # Record the failure BEFORE returning so downstream cron
+            # stages see qlib_data_update as RED, not green.
+            write_health("qlib_data_update", HealthStatus(
+                success=False,
+                error_type="FreshnessFail",
+                error_message=(
+                    f"{stale_count}/{len(sample_stocks)} sample stocks "
+                    f"behind expected={expected_date}; "
+                    f"details={','.join(stale_detail)[:160]}"
+                ),
+                n_items=success,
+                latest_date=args.end_date,
+                network_profile="domestic",
+            ))
             return 1
         else:
             logger.info(f"--check-today: data freshness OK (expected={expected_date})")
+
+    # Only NOW is it safe to declare success — both the update and
+    # any requested freshness check have passed.
+    write_health("qlib_data_update", HealthStatus(
+        success=True,
+        n_items=success,
+        latest_date=args.end_date,
+        network_profile="domestic",
+    ))
 
     return 0 if success > 0 and fail == 0 else 0
 

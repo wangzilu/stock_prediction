@@ -1,13 +1,28 @@
-"""Model promotion gate: shadow run → promote/rollback.
+"""Legacy promotion script — DISABLED 2026-06-04 (cx round 6 P0-1).
 
-Checks candidate model quality vs production model.
-Promotes only if candidate is better for 3+ consecutive days.
-Rollbacks if production model degrades for 3+ days.
+This script bypassed every promotion safeguard the codebase has
+since added:
+  * No PIT audit (look-ahead candidates pass freely).
+  * No feature_contract check (would have NOT caught the 6-3 22:00
+    158-vs-242 mismatch).
+  * No 24-split / hold-out / cost-adjusted PnL check.
+  * Does not sync the contract / dataset artifact when swapping
+    lgb_candidate_model.pkl into lgb_model.pkl.
+  * Single ``cand_ic > prod_ic * 1.1`` threshold, IC-only.
 
-Usage:
-    python scripts/promote_model.py --check        # check if promotion is due
-    python scripts/promote_model.py --promote      # force promote candidate
-    python scripts/promote_model.py --rollback     # force rollback to previous
+A single ``python scripts/promote_model.py --promote`` could swap a
+candidate that fails any of the above into production.
+
+To promote a candidate now, use the unified flow:
+  1. ``tracker/promotion_gate.PromotionGate.check(...)``
+  2. After PASS, run ``scripts/train_lgb.py`` against the chosen
+     feature set — that path enforces PRODUCTION_SUPPLEMENTARY_GROUPS,
+     writes the feature contract artifact, and atomic-saves the
+     model only after prediction-health passes.
+
+Running this script aborts immediately with a pointer to the new
+flow. The implementation is kept for git-history reference but
+gated behind the abort. Delete the file once the team is comfortable.
 """
 import argparse
 import json
@@ -23,6 +38,18 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _abort_legacy_entry() -> int:
+    logger.error(
+        "scripts/promote_model.py is DISABLED (cx round 6 P0-1 — 2026-06-04). "
+        "It bypassed PIT audit, feature_contract check, 24-split, and "
+        "cost-adjusted gate. Use tracker/promotion_gate.PromotionGate.check() "
+        "then scripts/train_lgb.py instead. To re-enable for an emergency "
+        "rollback ONLY, set environment variable "
+        "LEGACY_PROMOTE_OVERRIDE=acknowledge_unsafe."
+    )
+    return 2
 
 DATA_DIR = PROJECT_ROOT / "data" / "storage"
 PROD_MODEL = DATA_DIR / "lgb_model.pkl"
@@ -153,7 +180,19 @@ def _log_event(action: str, reason: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Model promotion gate")
+    # cx round 6 P0-1: hard-block every code path by default. The
+    # legacy --check / --promote / --rollback subcommands are kept in
+    # this module's source for git-blame archaeology but cannot run
+    # unless an explicit override is set in the environment.
+    if os.environ.get("LEGACY_PROMOTE_OVERRIDE") != "acknowledge_unsafe":
+        return _abort_legacy_entry()
+
+    logger.warning(
+        "LEGACY_PROMOTE_OVERRIDE=acknowledge_unsafe detected — "
+        "running legacy promotion path. This bypasses contract / "
+        "PIT / cost-adjusted gates. ONLY for emergency rollback."
+    )
+    parser = argparse.ArgumentParser(description="Model promotion gate (LEGACY)")
     parser.add_argument("--check", action="store_true", help="Check promotion status")
     parser.add_argument("--promote", action="store_true", help="Force promote candidate")
     parser.add_argument("--rollback", action="store_true", help="Force rollback")
@@ -175,7 +214,8 @@ def main():
             do_rollback()
         else:
             logger.info(f"Action: {result['action']} — {result['reason']}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

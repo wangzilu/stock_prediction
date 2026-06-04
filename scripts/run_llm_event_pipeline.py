@@ -232,16 +232,66 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
         else:
             logger.info("  News file not found, skipping filter")
 
-    except ImportError:
-        logger.warning(
-            "  event_filter not importable — falling back to unfiltered news"
-        )
+    except ImportError as ie:
+        # 2026-06-04 cx round 4 P0-3: pre-fix this only warned and
+        # let Step 2 fan 5113 raw articles into the LLM. That is
+        # exactly the path that produced today's HTTP 429 RPM=1002
+        # storm + 7200s wrapper timeout. ImportError of the filter
+        # means a deploy is incomplete — fail closed.
+        raise RuntimeError(
+            f"event_filter not importable ({ie}); refusing to fan "
+            f"unfiltered news into LLM extractor — that's the path "
+            f"that produced today's RPM=1002 + 7200s wrapper kill."
+        ) from ie
     except Exception as e:
+        # Same logic for any other filter failure: applying a
+        # minimum conservative fallback (date cutoff + title dedup +
+        # absolute cap) so we never fan-out raw news. The fallback
+        # cap mirrors what select_for_llm would have done at
+        # the configured ceiling.
         logger.warning(
-            "  event_filter failed (non-fatal, using unfiltered news): %s", e
+            "  event_filter failed (%s) — applying conservative "
+            "fallback (title dedup + 500-item cap) instead of raw fan-out",
+            e,
         )
         import traceback as _tb
         logger.debug(_tb.format_exc())
+        try:
+            import json as _json_fallback
+            if news_path.exists():
+                seen_titles: set[str] = set()
+                fallback_items: list[dict] = []
+                with open(news_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            item = _json_fallback.loads(line)
+                        except _json_fallback.JSONDecodeError:
+                            continue
+                        t = (item.get("title") or "").strip()
+                        if not t or t in seen_titles:
+                            continue
+                        seen_titles.add(t)
+                        fallback_items.append(item)
+                        if len(fallback_items) >= 500:
+                            break
+                fallback_dir = news_path.parent.parent / "daily_news_filtered"
+                fallback_dir.mkdir(parents=True, exist_ok=True)
+                filtered_path = fallback_dir / news_path.name
+                with open(filtered_path, "w", encoding="utf-8") as f:
+                    for item in fallback_items:
+                        f.write(_json_fallback.dumps(item, ensure_ascii=False) + "\n")
+                logger.warning(
+                    "  event_filter fallback wrote %d items (cap=500) to %s",
+                    len(fallback_items), filtered_path,
+                )
+        except Exception as fallback_exc:
+            raise RuntimeError(
+                f"event_filter failed AND conservative fallback "
+                f"failed ({fallback_exc}); refusing to feed LLM."
+            ) from fallback_exc
 
     news_path = filtered_path
 

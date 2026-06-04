@@ -294,58 +294,72 @@ def main():
         }
         print("Training LightGBM (fallback)...")
     # ---- Apply tradable mask: filter ST/IPO/suspended/一字板 from training data ----
+    # 2026-06-04 cx round 6 P0-2: previously this block swallowed
+    # mask-application errors and continued training on the full
+    # universe — that drifts the training set away from the serve-time
+    # universe (which DOES filter ST/IPO/suspended) and produces a
+    # champion that's optimistic on stocks the inference path will
+    # then refuse. Also: missing mask file was a silent warning.
+    # Both modes now hard-fail; the operator must regenerate the mask
+    # or pass TRAIN_LGB_ALLOW_NO_MASK=1 for an explicit override.
     tradable_mask_path = os.path.join(DATA_DIR, "tradable_mask.parquet")
     winsorized_label_path = os.path.join(DATA_DIR, "label_5d_winsorized.parquet")
 
     if os.path.exists(tradable_mask_path):
-        try:
-            from qlib.data.dataset.handler import DataHandlerLP
+        from qlib.data.dataset.handler import DataHandlerLP
 
-            mask_df = pd.read_parquet(tradable_mask_path)
-            tradable = mask_df["tradable"]
+        mask_df = pd.read_parquet(tradable_mask_path)
+        tradable = mask_df["tradable"]
 
-            handler = dataset.handler
+        handler = dataset.handler
+        for attr in ('_learn', '_data'):
+            df = getattr(handler, attr, None)
+            if df is None:
+                continue
+            # Align mask to handler index
+            common = tradable.index.intersection(df.index)
+            untradable_idx = tradable.loc[common]
+            untradable_idx = untradable_idx[~untradable_idx].index  # indices where tradable=False
+
+            if len(untradable_idx) > 0:
+                drop_idx = untradable_idx.intersection(df.index)
+                n_before = len(df)
+                # Drop untradable rows entirely (NaN label causes XGB crash)
+                setattr(handler, attr, df.drop(drop_idx))
+                n_after = len(getattr(handler, attr))
+                print(f"Tradable mask applied to {attr}: dropped {n_before - n_after} untradable rows ({n_before} -> {n_after})")
+
+        # Optionally apply winsorized labels (only overwrite non-NaN values)
+        if os.path.exists(winsorized_label_path):
+            win_df = pd.read_parquet(winsorized_label_path)
+            win_label = win_df["label_5d_win"]
             for attr in ('_learn', '_data'):
                 df = getattr(handler, attr, None)
                 if df is None:
                     continue
-                # Align mask to handler index
-                common = tradable.index.intersection(df.index)
-                untradable_idx = tradable.loc[common]
-                untradable_idx = untradable_idx[~untradable_idx].index  # indices where tradable=False
+                label_cols = [c for c in df.columns if c[0] == "label"]
+                if label_cols:
+                    lc = label_cols[0]
+                    common = win_label.index.intersection(df.index)
+                    valid_win = win_label.loc[common].dropna()
+                    valid_win = valid_win[valid_win.index.isin(df.index)]
+                    if len(valid_win) > 0:
+                        df.loc[valid_win.index, lc] = valid_win.values
+                        print(f"Winsorized labels applied to {attr}: {len(valid_win)} samples")
 
-                if len(untradable_idx) > 0:
-                    drop_idx = untradable_idx.intersection(df.index)
-                    n_before = len(df)
-                    # Drop untradable rows entirely (NaN label causes XGB crash)
-                    setattr(handler, attr, df.drop(drop_idx))
-                    n_after = len(getattr(handler, attr))
-                    print(f"Tradable mask applied to {attr}: dropped {n_before - n_after} untradable rows ({n_before} -> {n_after})")
-
-            # Optionally apply winsorized labels (only overwrite non-NaN values)
-            if os.path.exists(winsorized_label_path):
-                win_df = pd.read_parquet(winsorized_label_path)
-                win_label = win_df["label_5d_win"]
-                for attr in ('_learn', '_data'):
-                    df = getattr(handler, attr, None)
-                    if df is None:
-                        continue
-                    label_cols = [c for c in df.columns if c[0] == "label"]
-                    if label_cols:
-                        lc = label_cols[0]
-                        common = win_label.index.intersection(df.index)
-                        valid_win = win_label.loc[common].dropna()
-                        valid_win = valid_win[valid_win.index.isin(df.index)]
-                        if len(valid_win) > 0:
-                            df.loc[valid_win.index, lc] = valid_win.values
-                            print(f"Winsorized labels applied to {attr}: {len(valid_win)} samples")
-
-        except Exception as e:
-            print(f"Tradable mask application failed (continuing without filter): {e}")
-            import traceback; traceback.print_exc()
+    elif os.environ.get("TRAIN_LGB_ALLOW_NO_MASK") == "1":
+        print(
+            "No tradable mask found — TRAIN_LGB_ALLOW_NO_MASK=1 set, "
+            "proceeding on full universe (THIS DRIFTS TRAIN vs SERVE)."
+        )
     else:
-        print("No tradable mask found — training on full universe")
-        print("  Run: python scripts/build_tradable_mask.py")
+        raise RuntimeError(
+            "Tradable mask not found at "
+            f"{tradable_mask_path}. Production training MUST run on "
+            "the same ST / IPO / suspended-filtered universe that "
+            "inference uses. Run: python scripts/build_tradable_mask.py "
+            "(or set TRAIN_LGB_ALLOW_NO_MASK=1 for an explicit override)."
+        )
 
     model = init_instance_by_config(model_config)
     model.fit(dataset)

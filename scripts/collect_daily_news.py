@@ -106,6 +106,15 @@ def get_portfolio_stocks() -> list[dict]:
 
     Returns:
         List of dicts with keys: code, name, qlib_code
+
+    2026-06-04 cx round 4 P1-5: pre-fix this iterated ``data`` directly,
+    assuming a top-level list. The actual payload (per
+    scheduler/jobs.py overnight_stock_forecasts writer) is a dict
+    ``{created_at, source_date, target_date, lgb_status, groups,
+    items: [...]}``. Iterating a dict yields STRING KEYS, so
+    ``item.get(...)`` blew up and the function silently fell through
+    to ``get_liquid_stocks()`` — i.e. ``--portfolio`` mode was secretly
+    collecting full-market news every cron tick.
     """
     snapshot_path = DATA_DIR / "overnight_stock_forecasts.json"
     if not snapshot_path.exists():
@@ -116,8 +125,28 @@ def get_portfolio_stocks() -> list[dict]:
         with open(snapshot_path) as f:
             data = json.load(f)
 
+        # Tolerate either the current dict format (with "items") or
+        # the legacy top-level list format. Anything else is a hard
+        # error — do NOT silently fall back to full-market.
+        if isinstance(data, dict):
+            items = data.get("items")
+            if not isinstance(items, list):
+                raise RuntimeError(
+                    "overnight snapshot is a dict but has no 'items' list "
+                    "(P1-5 contract guard)"
+                )
+        elif isinstance(data, list):
+            items = data  # legacy format
+        else:
+            raise RuntimeError(
+                f"overnight snapshot has unexpected top-level type "
+                f"{type(data).__name__}"
+            )
+
         results = []
-        for item in data:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
             qlib_code = item.get("code", "")
             if len(qlib_code) < 8:
                 continue
@@ -128,10 +157,53 @@ def get_portfolio_stocks() -> list[dict]:
                 "qlib_code": qlib_code,
             })
         logger.info(f"Got {len(results)} portfolio stocks from snapshot")
+        if not results:
+            # Empty portfolio after parsing → still better to fail
+            # than silently expand to full market.
+            raise RuntimeError(
+                "overnight snapshot parsed but yielded 0 portfolio stocks"
+            )
         return results
     except Exception as e:
-        logger.error(f"Failed to load portfolio snapshot: {e}")
-        return get_liquid_stocks()
+        # Hard fail: --portfolio means the caller wants only the
+        # portfolio. Silently returning full market via
+        # get_liquid_stocks() defeats the request AND drowns the LLM
+        # pipeline in 5000-stock fan-out (cx round 4 P1-5 + P0-2).
+        logger.error(
+            f"Failed to load portfolio snapshot: {e}. "
+            f"Refusing to silently expand to full-market liquidity."
+        )
+        raise
+
+
+_NEWS_RECENCY_DAYS = 7  # cx round 4 P0-2: stale-news cutoff
+
+
+def _is_recent_news(publish_time: str, *, max_age_days: int = _NEWS_RECENCY_DAYS,
+                    now: datetime | None = None) -> bool:
+    """Return True iff publish_time is within max_age_days of now.
+
+    Acceptable formats: ``YYYY-MM-DD``, ``YYYY-MM-DD HH:MM:SS``,
+    ``YYYY/MM/DD ...``, ``YYYY-MM-DDTHH:MM:SS``. Anything else (empty
+    string, unparseable, future) is rejected — the safer side of
+    feeding stale noise into LLM extractors that already get RPM
+    rate-limited at 1002 (see 2026-06-04 incident, task #104).
+    """
+    if not publish_time:
+        return False
+    text = str(publish_time).strip().replace("/", "-").replace("T", " ")
+    # Trim trailing time/timezone if present so we can parse the date.
+    head = text.split(" ", 1)[0]
+    try:
+        dt = datetime.strptime(head, "%Y-%m-%d")
+    except ValueError:
+        return False
+    now = now or datetime.now()
+    age = (now - dt).days
+    if age < 0:
+        # Future-dated news is suspicious — reject.
+        return False
+    return age <= max_age_days
 
 
 def collect_news_for_stock(code: str, name: str, max_items: int = 10) -> list[dict]:
@@ -143,7 +215,9 @@ def collect_news_for_stock(code: str, name: str, max_items: int = 10) -> list[di
         max_items: max news items to return
 
     Returns:
-        List of news dicts with standardized fields
+        List of news dicts with standardized fields. Items older than
+        ``_NEWS_RECENCY_DAYS`` are dropped at this layer (cx round 4
+        P0-2) so the LLM never sees 60%+ stale news fan-out.
     """
     # Try ST_CLIENT news first (anns_d for announcements)
     try:
@@ -156,16 +230,21 @@ def collect_news_for_stock(code: str, name: str, max_items: int = 10) -> list[di
             result = st.anns_d(ts_code=ts_code)
             if isinstance(result, list) and result:
                 records = []
-                for item in result[:max_items]:
+                for item in result:
+                    pub = str(item.get("ann_date", ""))
+                    if not _is_recent_news(pub):
+                        continue
                     records.append({
                         "stock_code": code,
                         "stock_name": name,
                         "title": str(item.get("title", "")),
                         "content_snippet": str(item.get("content", ""))[:500],
                         "source": "交易所公告",
-                        "publish_time": str(item.get("ann_date", "")),
+                        "publish_time": pub,
                         "url": str(item.get("url", "")),
                     })
+                    if len(records) >= max_items:
+                        break
                 if records:
                     return records
     except Exception:
@@ -206,7 +285,10 @@ def collect_news_for_stock(code: str, name: str, max_items: int = 10) -> list[di
             articles = []
 
         records = []
-        for item in articles[:max_items]:
+        for item in articles:
+            pub = item.get("date", "")
+            if not _is_recent_news(pub):
+                continue
             title = item.get("title", "").replace("<em>", "").replace("</em>", "")
             content = item.get("content", "").replace("<em>", "").replace("</em>", "")
             records.append({
@@ -215,9 +297,11 @@ def collect_news_for_stock(code: str, name: str, max_items: int = 10) -> list[di
                 "title": title,
                 "content_snippet": content[:500],
                 "source": item.get("mediaName", "eastmoney"),
-                "publish_time": item.get("date", ""),
+                "publish_time": pub,
                 "url": item.get("url", ""),
             })
+            if len(records) >= max_items:
+                break
         return records
 
     except Exception as e:

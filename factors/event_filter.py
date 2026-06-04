@@ -117,7 +117,11 @@ DIRECT_CLASSIFY_RULES: list[tuple] = [
      ("share_unlock", 0, 0.85, "限售股解禁")),
 ]
 
-# Drop patterns: items definitely not worth a slot. Conservative — only obvious noise.
+# Drop patterns: items definitely not worth a slot.
+# 2026-06-04 cx round 4 P1-4: extended with the 东财 "generic template"
+# titles that were leaking into L1 and chewing LLM RPM (see today's
+# RPM=1002 429 storm, task #104). These are list-style aggregations
+# with no per-stock event content — they should never reach the LLM.
 DROP_PATTERNS: list[tuple[re.Pattern, str]] = [
     # Empty / whitespace-only or absurdly short titles (will not yield extractable event)
     (re.compile(r"^.{0,7}$"), "title_too_short"),
@@ -125,6 +129,20 @@ DROP_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"^(今日|盘中|尾盘|早盘)[价涨跌幅\d\s\.\%]+$"), "pure_price_chatter"),
     # Tagged share-action signature lines that aren't really announcements
     (re.compile(r"^\s*$"), "empty"),
+    # Generic aggregation templates from 东财 / 证券媒体 — list-style
+    # "看好/精选/调研名单" articles with no per-stock fact extraction value.
+    (re.compile(r"融资客.*(看好|加仓|爆买|抢筹).*(个股|名单|一览)"),
+     "generic_financing_template"),
+    (re.compile(r"(突破|跌破).{0,8}(均线|年线|月线|季线|周线|新高|新低|压力|支撑|平台).*(多股|个股|榜|名单|共振|池)|(多股|个股|榜).{0,8}(突破|跌破).{0,8}(均线|年线|月线|季线|周线|新高|新低)"),
+     "generic_breakout_template"),
+    (re.compile(r"(高股息|高分红|低估值|低市盈率).*(精选|名单|一览|榜单)"),
+     "generic_dividend_template"),
+    (re.compile(r"(机构|游资|北向|外资|主力).*(调研|抢筹|加仓|减仓|净买入).*(名单|个股|一览|榜)"),
+     "generic_flow_template"),
+    (re.compile(r"(涨停|跌停|盘中|尾盘).*(数量|个数|榜单|名单|池|一览)"),
+     "generic_limit_template"),
+    (re.compile(r"(强势股|龙头股|风险股|妖股).*(池|名单|榜|一览)"),
+     "generic_pool_template"),
 ]
 
 # L2 hint: items likely needing reasoning model (multi-entity / supply chain / long impact chain).
