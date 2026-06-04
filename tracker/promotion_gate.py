@@ -80,6 +80,32 @@ class PromotionGate:
         if validation["warnings"]:
             warnings.extend(validation["warnings"])
 
+        # 2026-06-04 cx round 6 P1-3: PIT audit gate. Pre-fix the
+        # module docstring promised "PIT audit pass" but the code did
+        # NOT check any PIT artifact. A look-ahead candidate with good
+        # IC/backtest could slip the gate. The artifact ``pit_audit.json``
+        # is now mandatory: it must exist AND contain ``passed: true``.
+        # Producers (e.g. shadow runners) record this after running a
+        # source-time / as-of-replay audit.
+        pit_audit = art.load_aux("pit_audit") if hasattr(art, "load_aux") else None
+        if pit_audit is None:
+            # Older artifacts pre-date load_aux helper; try direct read.
+            try:
+                import json as _json_pit
+                from tracker.artifact_contract import EXPERIMENTS_DIR as _ED
+                _pit_path = Path(_ED) / experiment_id / "pit_audit.json"
+                if _pit_path.exists():
+                    pit_audit = _json_pit.loads(_pit_path.read_text())
+            except Exception:
+                pit_audit = None
+        checks["pit_audit"] = bool(pit_audit and pit_audit.get("passed"))
+        if not checks["pit_audit"]:
+            failures.append(
+                "PIT audit missing or failed (pit_audit.json must have "
+                "passed=true). The shadow runner is expected to produce "
+                "this artifact after a source-time / as-of-replay audit."
+            )
+
         # 2. Metrics checks
         metrics = art.load_metrics()
         if metrics:
@@ -135,16 +161,28 @@ class PromotionGate:
         else:
             failures.append("No backtest.json — portfolio-level validation required for shadow")
 
-        # 3b. Executable PnL criteria (WARNINGS only — most experiments don't have these yet)
+        # 3b. Executable PnL criteria.
+        # 2026-06-04 cx round 6 P1-4: cost_adjusted_spread used to be
+        # a WARNING — a model with no after-cost alpha could still
+        # pass=True and earn promote_to_shadow. That defeats the
+        # point of a promotion gate. Now: missing OR non-positive
+        # cost_adjusted_spread is a HARD FAILURE. Producers must
+        # compute and record this in backtest.json (see
+        # PortfolioBacktest implementation).
         if bt:
             cost_adj_spread = bt.get("cost_adjusted_spread")
-            if cost_adj_spread is not None:
+            if cost_adj_spread is None:
+                failures.append(
+                    "cost_adjusted_spread missing from backtest.json — "
+                    "executable-after-cost criterion is mandatory."
+                )
+            else:
                 checks["cost_adjusted_spread"] = cost_adj_spread
                 if cost_adj_spread < self.thresholds["min_cost_adjusted_spread"]:
-                    warnings.append(
+                    failures.append(
                         f"cost_adjusted_spread={cost_adj_spread:.4f} < "
                         f"threshold={self.thresholds['min_cost_adjusted_spread']} "
-                        f"(negative after-cost spread)"
+                        f"(no after-cost alpha — refusing to promote)"
                     )
 
             avg_turnover = bt.get("avg_turnover")
@@ -276,15 +314,21 @@ class PromotionGate:
                     warnings.append(f"Could not load champion {champion_id}")
 
         # 6. Negative control check
-        nc = metrics.get("negative_control_ic")
-        if nc is not None:
-            checks["negative_control_ic"] = nc
-            if abs(nc) > self.thresholds["negative_control_ic_threshold"]:
-                failures.append(
-                    f"negative_control_ic={nc:.4f} > "
-                    f"threshold={self.thresholds['negative_control_ic_threshold']} "
-                    f"(possible data leak)"
-                )
+        # 2026-06-04 cx round 6 P1-5: pre-fix this unconditionally
+        # called ``metrics.get(...)`` even when ``metrics`` was None
+        # (no metrics.json branch above just appends a failure). That
+        # crashed with AttributeError, masking the real "no metrics"
+        # failure with an exception. Guard explicitly.
+        if metrics is not None:
+            nc = metrics.get("negative_control_ic")
+            if nc is not None:
+                checks["negative_control_ic"] = nc
+                if abs(nc) > self.thresholds["negative_control_ic_threshold"]:
+                    failures.append(
+                        f"negative_control_ic={nc:.4f} > "
+                        f"threshold={self.thresholds['negative_control_ic_threshold']} "
+                        f"(possible data leak)"
+                    )
 
         # Recommendation
         passed = len(failures) == 0
