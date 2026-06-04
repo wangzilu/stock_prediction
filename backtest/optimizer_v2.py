@@ -156,15 +156,68 @@ class TurnoverConstrainedOptimizer:
         return target_weights
 
     def _apply_weight_bounds(self, weights: dict[str, float]) -> dict[str, float]:
-        """Cap individual weights and re-normalize."""
-        capped = {}
-        for s, w in weights.items():
-            capped[s] = min(w, self.max_single_weight)
+        """Cap individual weights at ``max_single_weight`` using a
+        proper capped-simplex allocation.
 
-        total = sum(capped.values())
-        if total > 0:
-            capped = {s: w / total for s, w in capped.items()}
-        return capped
+        2026-06-04 cx round 5 P1-1: pre-fix this did
+            ``capped = {s: min(w, cap) for s, w in weights.items()}``
+        then normalized ALL stocks back to sum=1. When only K of N
+        stocks needed capping, the renormalize re-amplified the
+        un-capped weights past the cap — e.g. 10 stocks each capped
+        at 5% summed to 50%, after renormalize each became 10%, cap
+        defeated.
+        The correct treatment: fix the capped stocks at ``cap`` and
+        re-distribute the residual weight proportionally to the
+        uncapped stocks. If that re-distribution pushes any
+        previously-uncapped stock above ``cap``, iterate: cap it,
+        re-distribute again. The loop converges in at most N
+        iterations because the capped set only grows.
+        """
+        cap = float(self.max_single_weight)
+        total_target = sum(weights.values()) or 1.0  # preserve gross
+        if cap <= 0 or cap >= 1.0:
+            # cap disabled or pathological — fall back to normalization
+            return {s: float(w) / total_target for s, w in weights.items()}
+
+        capped_set: set[str] = set()
+        result = {s: float(w) for s, w in weights.items()}
+
+        for _ in range(len(result) + 1):  # safe upper bound
+            # Stocks currently above cap (excluding already-capped set)
+            over = {s for s in result if s not in capped_set and result[s] > cap}
+            if not over:
+                break
+            # Cap them, then redistribute the released weight to the
+            # remaining uncapped stocks proportionally.
+            released = sum(result[s] - cap for s in over)
+            capped_set |= over
+            for s in over:
+                result[s] = cap
+            uncapped = [s for s in result if s not in capped_set]
+            if not uncapped or released <= 0:
+                break
+            uncapped_sum = sum(result[s] for s in uncapped)
+            if uncapped_sum <= 0:
+                # Nothing to scale — distribute equally
+                each = released / len(uncapped)
+                for s in uncapped:
+                    result[s] += each
+            else:
+                # Scale proportionally
+                scale = (uncapped_sum + released) / uncapped_sum
+                for s in uncapped:
+                    result[s] *= scale
+
+        # Final normalization to preserve the original gross. If the
+        # capped portion alone exceeds total_target (e.g. cap=0.05 +
+        # 25 stocks = 125%), shrink uniformly.
+        gross = sum(result.values())
+        if gross > 0:
+            result = {s: w * total_target / gross for s, w in result.items()}
+        # Re-clip after final scale — gross-conservation may push a
+        # capped stock fractionally above cap when total_target < gross.
+        result = {s: min(w, cap) for s, w in result.items()}
+        return result
 
     def _apply_turnover_constraint(
         self,
