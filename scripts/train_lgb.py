@@ -523,7 +523,13 @@ def main():
             # contract empty. Now feature_cols is set above from the
             # actual handler columns after supplementary merge.
             feature_list=list(feature_cols),
-            label_column=LABEL_EXPR,
+            # cx round 25 follow-up: ``LABEL_EXPR`` was never defined as
+            # a module-level constant in this script; the artifact-save
+            # path raised NameError every run, which the try/except
+            # converted to "Artifact save failed (non-fatal)". Build
+            # the expression inline from PREDICTION_HORIZON_DAYS so the
+            # artifact correctly records the training label.
+            label_column=f"Ref($close, -{PREDICTION_HORIZON_DAYS}) / Ref($close, -1) - 1",
             data_asof_date=train_end,
             n_features=n_features,
             train_start=train_start,
