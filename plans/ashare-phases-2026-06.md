@@ -214,7 +214,214 @@ when Phases C/D/E land new shadow factors.
 
 ---
 
-## Phase B — Ablation (after Phase A + A.5 verdict)
+## Phase A.6 — Data Pipeline Truthfulness Audit (this week, parallel with A.5)
+
+**Goal:** every collector writes a HONEST health record. "Exit 0" must
+stop meaning "data is fresh and complete." Stop the class of bugs
+where scripts succeed but the data they're supposed to produce is
+stale, empty, or half-fetched, and the downstream model + scheduler
+treat it as green.
+
+**Gate to exit Phase A.6:** every `PRODUCTION_GROUP_TO_HEALTH_SOURCE`
+entry maps to a collector whose health row reflects the actual
+freshness of THAT specific data source — no piggybacking, no `success
+= True` after silent sub-source failure, no future-file reads.
+
+Phase A.6 lives alongside A.5 because both fix correctness bugs that
+make Phase B / C / D / E meaningless. Specifically: Phase B ablation
+results can be polluted by stale fund_flow or stale northbound that
+the gate currently thinks is fresh; Phase E policy factor work cannot
+build on a health system that lies.
+
+### A6-1 (P0) — `global_chain_extract` / `global_chain_factors` cron rows have NO `enforce_deps`
+
+`scripts/install_crontab.py:104-113` registers the two chain jobs
+without `enforce_deps=True`. The DAG in `scheduler/job_deps.py:41`
+declares `global_industry_news → global_chain_extract →
+global_chain_factors` but cron does not enforce it. If `global_industry_news`
+times out or returns an empty file, the downstream chain jobs still
+run on stale / empty inputs.
+
+Fix:
+- Add `enforce_deps=True, dep_wait_seconds=3600` to both `global_chain_extract`
+  and `global_chain_factors` rows.
+- `global_chain_factors` empty-result or build-failure path MUST
+  `sys.exit(1)`, not silently `print("No factors produced.")` and exit 0.
+
+### A6-2 (P0) — `build_global_chain_factors.py` keeps the old parquet on empty input
+
+`scripts/build_global_chain_factors.py:374` returns an empty DataFrame
+on no events; L487-490 just prints `"No factors produced."` and exits 0.
+The previous day's `global_chain_factors.parquet` survives untouched —
+the next read finds yesterday's rows and treats them as today's. No
+health record written for the failure case.
+
+Fix:
+- Empty events / empty factor MUST write `global_chain_factors` health
+  with `success=False` AND `sys.exit(1)`.
+- The parquet writer must either overwrite same-date rows or refuse
+  to keep yesterday's rows when today's input is empty.
+
+### A6-3 (P0 — most lethal) — `regime_daily_update` writes `success=True` even when every sub-source fails
+
+`scripts/update_regime_daily.py:177-198`. The outer `try` wraps
+EVERYTHING; the ST_CLIENT `try / except` swallows the entire margin /
+limit_list / hsgt block; the AKShare `update_futures_akshare()` and
+`update_usdcny_akshare()` have no documented error gating. If every
+single sub-source fails, the script still falls through to
+`write_health("regime_daily_update", HealthStatus(success=True,
+n_items=5, latest_date=today))`. **The model sees a green light on a
+day with zero fresh regime data.**
+
+This is the worst bug in the audit because every other "is this data
+fresh?" decision downstream is anchored to this health row.
+
+Fix:
+- Each sub-collector returns `{ok, n_rows, latest_date}`.
+- Final health is `success = all(ok for critical sub-sources)`.
+- Critical set defined here: `margin_detail`, `limit_list_d`,
+  `moneyflow_hsgt`. Any of them failing flips to
+  `success=False, partial=True`.
+- Non-critical sub-source failures (futures / USDCNY) still report
+  `partial=True` so the gate can downgrade non-critical features.
+- Each sub-source's `latest_date` recorded as `latest_date_<source>`
+  so the gate can downgrade per-feature rather than all-or-nothing.
+
+### A6-4 (P0) — `update_qlib_data.py` early-exit path skips `write_health`
+
+`scripts/update_qlib_data.py:1386-1410`. When `start_by_code` is empty
+(every symbol already up to date) the script validates and returns 0
+without writing `data_health/<date>/qlib_data_update.json`. The wrapper
+flags job_status green, but the data_health row stays as yesterday's
+record — the freshness gate downstream still sees the previous
+`latest_date`.
+
+Fix:
+- The early-exit path also calls `write_health("qlib_data_update",
+  HealthStatus(success=True, ..., latest_date=<actual latest from
+  Qlib calendar>))`.
+- `latest_date` reads from `D.calendar()[-1]` (or the instruments file)
+  rather than `args.end_date`, so a no-op exit still publishes the
+  real freshness.
+
+### A6-5 (P1) — `fund_flow_update` ignores `northbound` freshness
+
+`scripts/fetch_fund_flow_history.py:687-705`. `latest_date` is set
+only when `flow_df` updates; `nb_df` can fail / return empty without
+affecting the health record. fund_flow_update goes green even when
+northbound data is days stale.
+
+Fix:
+- Split into two health rows: `fund_flow_update` and
+  `northbound_update`. Wire `PRODUCTION_GROUP_TO_HEALTH_SOURCE` so the
+  `northbound` group reads `northbound_update`.
+- If splitting is too disruptive short-term, at minimum record
+  `flow_latest_date` AND `northbound_latest_date` on the existing
+  row; gate `success = True` only when both meet the freshness bar.
+
+### A6-6 (P1) — `PRODUCTION_GROUP_TO_HEALTH_SOURCE` has piggyback freshness
+
+`scheduler/data_health.py:394`. Five of eleven groups map their
+freshness check onto `qlib_data_update`:
+
+```
+shareholder     -> qlib_data_update
+northbound      -> qlib_data_update
+st_daily_basic  -> qlib_data_update
+st_moneyflow    -> qlib_data_update
+st_holder_number -> qlib_data_update
+```
+
+These are NOT in the Qlib daily update path. The gate is asking
+"is Qlib fresh?" and accepting that as proxy for five unrelated
+sources. **Five of the 84 production supp cols can silently go stale
+and the gate sees green.**
+
+Fix:
+- Wire each group to its real source health (`fetch_shareholder_data`,
+  `northbound_update` after A6-5, `fetch_st_data_*` etc).
+- For groups that lack a real collector job today, either add one or
+  drop the group out of PRODUCTION_SUPPLEMENTARY_GROUPS into shadow
+  until a real freshness source exists.
+
+### A6-7 (P1) — `--universe-source baostock` is still hardcoded in cron
+
+`scripts/install_crontab.py:141` and `scripts/update_qlib_data.py:1269`
+pin `--universe-source baostock`. Even if the price provider auto-rolls
+to Tushare, the universe (set of tradable codes) still comes from
+baostock. Tushare migration is incomplete.
+
+Fix:
+- `--universe-source` supports `tushare`; cron flips to it once the
+  universe path is validated.
+- Health row records both `provider` (price) and `universe_source`;
+  startup validation refuses to launch if they don't match expected.
+
+### A6-8 (P1) — LLM pipeline writes no `data_health`
+
+`scripts/run_llm_event_pipeline.py:433` does not call `write_health`.
+`scheduler/data_health.OVERLAY_SOURCES = ["llm_event_pipeline"]`
+expects a health row that never gets written, so the overlay freshness
+gate reads the previous day's record indefinitely.
+
+Fix:
+- Pipeline final step writes `write_health("llm_event_pipeline",
+  HealthStatus(success=<actual>, partial=<actual>, n_items=n_factors,
+  latest_date=target_date, ...))`.
+- Partial / timeout / rate-limit-degraded runs MUST write
+  `partial=True` rather than `success=True`.
+
+### A6-9 (P1) — `collect_daily_news.py` returns success on zero stocks / zero news
+
+`scripts/collect_daily_news.py:376` returns `output_path` even when
+`not stocks`. L429 writes an empty file and returns it. The downstream
+filter / extractor runs on zero input and silently produces zero
+factors.
+
+Fix:
+- `not stocks` → `raise RuntimeError(...)`.
+- Below-threshold coverage → fail or write `partial=True` health.
+  Threshold examples: full-A mode requires `len(all_results) >= 500`;
+  portfolio mode requires coverage `>= portfolio_size * 0.5`.
+
+### A6-10 (P2) — `collect_global_industry_news.py` lacks publish-time freshness
+
+`scripts/collect_global_industry_news.py:59` and `:262` dedup by
+title but do not filter by `published_at`. GDELT and Google RSS both
+return old articles; the supply-chain extractor's 10-day lookback then
+restacks them as if they were fresh.
+
+Fix:
+- Apply the same `_is_recent_news` cutoff (7 trading days) as the
+  A-share daily news path.
+- Health row records `old_dropped` and `dedup_dropped` counts.
+- Supply-chain event collector reads `published_at` for PIT, not
+  `file_date`.
+
+### A6-11 — Truthfulness audit doc `docs/health_truthfulness_audit_20260606.md`
+
+Per fix above:
+- Pre-fix: paste the green health row from a date the source was
+  actually stale.
+- Replay: rerun the collector with a forced failure and show the new
+  health row is red / partial.
+- Post-fix DAG diagram: every PRODUCTION_GROUP_TO_HEALTH_SOURCE
+  arrow points to a real source.
+- Sign-off gate before Phase B same as A.5.
+
+### Priority of execution (user-flagged top 4)
+
+1. **A6-3 (P0 worst)** — regime sub-source health.
+2. **A6-1 + A6-2 (P0)** — chain enforce_deps + empty exit 1.
+3. **A6-5 + A6-6 (P1)** — split fund_flow vs northbound + clean up
+   piggyback mappings.
+4. **A6-8 (P1)** — LLM pipeline write health.
+
+The rest fall in after these four ship.
+
+---
+
+## Phase B — Ablation (after Phase A + A.5 + A.6 verdict)
 
 **Goal:** know which of the 11 PRODUCTION_SUPPLEMENTARY_GROUPS actually
 contribute. Two-stage to avoid the 11×24-split cost.
