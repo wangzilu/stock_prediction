@@ -295,6 +295,127 @@ overlays with weight 0.1–0.3.
 
 ---
 
+## Phase E — Policy Event Factors (independent track, 4-6 weeks)
+
+**Goal:** policy / central-bank / state-media texts are more
+authoritative, sparser, and have more persistent industry / style
+impact than ordinary news. Build a PIT-safe policy event database
+and turn it into low-frequency alpha + regime overlay — NOT into "let
+the LLM predict A-share returns."
+
+**Why a separate Phase, not part of Phase C:**
+The legacy `_load_macro` was disabled because its parquet was a
+single-row latest snapshot broadcast back into history (the look-ahead
+bias incident, cx round 3 P1). Policy events MUST be PIT-safe from day
+one, on an independent pipeline. Reusing the macro loader would
+re-import the same incident class.
+
+**Gate to enter Phase E:** Phase C.4 (EventStore PIT canonical) live —
+this reuses that infrastructure rather than rebuilding it.
+
+### E.1 — PBOC liquidity factor (PE-1)
+
+```
+scripts/collect_policy_texts.py   --source pbc
+  -> data/storage/policy_texts/<YYYY-MM-DD>.jsonl
+scripts/extract_policy_events.py  --source pbc
+  -> data/storage/policy_events/<YYYY-MM-DD>.jsonl  +  EventStore
+scripts/build_policy_factors.py   --source pbc
+  -> data/storage/pbc_liquidity_factors.parquet
+```
+
+Extracted fields (LLM extracts FACTS, not direction):
+`policy_stance` | `liquidity_injection_amount` | `net_injection` |
+`repo_rate_change` | `tool_type` | `duration_days` | `unexpectedness`.
+
+Factors produced: `pbc_liquidity_zscore_20d`,
+`pbc_easing_dummy`, `pbc_tightening_dummy`, `short_rate_pressure`.
+
+Use as **regime / position sizing input**, not direct stock alpha.
+
+### E.2 — Industry policy support (PE-2)
+
+State Council and ministry policy documents from `gov.cn`.
+
+Extracted fields: `target_industries`, `policy_direction`,
+`policy_strength`, `fiscal_support`, `subsidy_or_tax`,
+`regulatory_tightening`, `implementation_deadline`.
+
+Factors: `industry_policy_support_5d`, `industry_policy_support_20d`,
+`industry_policy_novelty`. Mapped to per-stock via the industry
+classification at execution time (not retroactively).
+
+### E.3 — Macro surprise from statistics interpretation (PE-3)
+
+NBS data and the official data portal interpretations (CPI / PPI /
+PMI / 社零 / 工业增加值 / etc).
+
+Extracted fields: `macro_surprise`, `inflation_pressure`,
+`ppi_upstream_pressure`, `consumption_recovery`,
+`manufacturing_momentum`, `real_estate_pressure`, `export_pressure`.
+
+Schema retains `actual` vs `consensus` diff so a downstream surprise
+calc does not have to re-parse the headline number.
+
+### E.4 — Xinwen Lianbo theme attention (PE-4)
+
+CCTV Xinwen Lianbo program page + transcript-style summaries.
+
+Extracted fields: `state_media_attention`, `industry_mentions`,
+`policy_narrative_score`, `geopolitical_tone`,
+`technology_self_reliance_score`, `consumption_stimulus_score`.
+
+Themes (initial 9): 科技自立 / 扩大内需 / 房地产 / 民营经济 /
+资本市场 / 机器人 AI / 新能源 / 军工安全 / 一带一路.
+
+Factors: `xinwenlianbo_theme_attention_{theme}_1d`,
+`{theme}_5d`, `{theme}_acceleration`.
+
+Use as **industry / theme rotation overlay**, never as a short-term
+stock signal.
+
+### E.5 — Strict PIT timing chain (PE-5)
+
+Every policy_factors.parquet row carries:
+`publish_time` / `available_time` / `signal_date` / `execution_date`.
+
+PIT rules:
+- PBOC 09:20 publish → intraday usable, training uses T+1 open.
+- Xinwen Lianbo 19:00-19:30 → 22:00 visible, next-day open execution.
+- State Council / ministry intraday publishes → use real publish_time;
+  publishes after 15:00 only act on next trading day.
+- NBS 09:30 / 10:00 publishes → intraday usable, training uses next_open.
+
+**Backtests must never use `filename date`.** Validator in
+`scripts/build_policy_factors.py` refuses to save a row whose
+`signal_date <= publish_time` would be physically impossible.
+
+### E.6 — Event study validation (PE-6)
+
+**No training before event study.** For each factor:
+
+- Supportive policy vs target industry T+1 / T+5 excess return.
+- Restrictive policy vs target industry T+1 / T+5 excess return.
+- Xinwen Lianbo theme intensity vs basket return on T+1 / T+5.
+- PBOC net injection vs small-cap / growth / high-beta excess.
+
+Only factors that pass event study graduate to 6-split ablation
+(Phase C.6 pattern: baseline / baseline + policy_overlay / baseline +
+policy_features). LLM noise + low base rate means single-window IC is
+not enough.
+
+### E.7 — Production integration (gated)
+
+If E.6 lands a real edge:
+- Policy overlay enters as a shadow scorer first (`scheduler/jobs.py`
+  scorer slot, weight 0).
+- After one month of shadow IC + drawdown that beats the static
+  baseline, weight rises in 0.05 increments per week.
+- Never enters PRODUCTION_SUPPLEMENTARY_GROUPS for the trained
+  model until 90 days of clean event-study evidence.
+
+---
+
 ## Cross-Cutting
 
 ### Experiment ledger discipline
