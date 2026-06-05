@@ -141,10 +141,17 @@ def main():
     logger.info("[3/4] Preparing the materialised feature frame ...")
     t_prep = time.time()
     X = dataset.prepare("full", col_set="feature", data_key=DK.DK_I)
-    y = dataset.prepare("full", col_set="label", data_key=DK.DK_L)
+    # 2026-06-05 fix: use DK_I for label too so y aligns to X row-by-row.
+    # DK_L drops rows whose label is NaN (Qlib's learning-key semantics),
+    # which left y 151 rows shorter than X and crashed the next
+    # ``cache["__label_5d"] = y.values`` assignment. Cache consumers can
+    # filter NaN labels themselves at train time — the cache should
+    # mirror the full inference grid.
+    y = dataset.prepare("full", col_set="label", data_key=DK.DK_I)
     if isinstance(y, pd.DataFrame):
         y = y.iloc[:, 0]
-    logger.info("    Feature frame: %s in %.1fs", X.shape, time.time() - t_prep)
+    y = y.reindex(X.index)  # belt-and-braces — make absolutely sure
+    logger.info("    Feature frame: %s in %.1fs (label aligned to X.index)", X.shape, time.time() - t_prep)
 
     actual_dim = int(X.shape[1])
     expected = PROFILE_EXPECTED_COUNTS.get(PRODUCTION_MODEL_PROFILE, {}).get("total")
