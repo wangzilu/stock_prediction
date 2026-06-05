@@ -291,6 +291,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "collide with the historical 5-25 3-model checkpoints. "
              "Defaults to a per-preset+models autotag.",
     )
+    p.add_argument(
+        "--cache-path", default=None,
+        help="Override the feature cache parquet. Defaults to the legacy "
+             "174-family cache feature_cache_174_holder_regime_ma.parquet. "
+             "For xgb_242 head-to-head, pass "
+             "data/storage/feature_cache_242_production.parquet "
+             "(built by scripts/build_feature_cache_242.py).",
+    )
     return p
 
 
@@ -370,8 +378,9 @@ def main():
     print("=" * 70)
 
     # ── 1. Load feature cache ───────────────────────────────────────────
-    print(f"\n[1/5] Loading feature cache: {FEATURE_CACHE}")
-    df = pd.read_parquet(FEATURE_CACHE)
+    feature_cache_path = Path(args.cache_path) if args.cache_path else FEATURE_CACHE
+    print(f"\n[1/5] Loading feature cache: {feature_cache_path}")
+    df = pd.read_parquet(feature_cache_path)
     print(f"  Shape: {df.shape}")
     dates_all = df.index.get_level_values("datetime")
     print(f"  Date range: {dates_all.min()} ~ {dates_all.max()}")
@@ -676,6 +685,49 @@ def main():
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2, default=str)
     print(f"  Summary saved: {summary_path}")
+
+    # 2026-06-05: record one ledger row per trainer so the three-way
+    # head-to-head comparator (174 / 175 / 242 / future profiles) has
+    # a single jsonl to consume instead of crawling per-experiment
+    # ExperimentArtifact dirs. Each row is independent — a future LOO
+    # ablation run would call record_run again with dropped_groups set.
+    try:
+        from tracker.experiment_ledger import record_run
+        for mname in MODEL_NAMES:
+            metrics_for_ledger = full_metrics.get(mname, {})
+            if "error" in metrics_for_ledger:
+                continue
+            exp_id_for_ledger = f"{mname}_174_{args.preset}_{timestamp}"
+            record_run(
+                experiment_id=exp_id_for_ledger,
+                model_profile=f"{mname}_174",
+                feature_count=len(feat_cols),
+                data_end=str(args.end_date or datetime.now().date().isoformat()),
+                split_config=args.preset,
+                cache_path=str(feature_cache_path),
+                feature_groups=[],
+                dropped_groups=[],
+                metrics={
+                    "rank_ic_mean": metrics_for_ledger.get("rank_ic_mean"),
+                    "rank_icir": metrics_for_ledger.get("rank_icir"),
+                    "spread_top20": metrics_for_ledger.get("spread_top20"),
+                    "spread_top100": metrics_for_ledger.get("spread_top100"),
+                    "n_days": metrics_for_ledger.get("n_days"),
+                },
+                artifact_dir=str(
+                    PROJECT_ROOT / "data" / "storage" / "experiments" / exp_id_for_ledger
+                ),
+                extra={
+                    "checkpoint_dir": str(checkpoint_dir),
+                    "n_estimators": args.n_estimators,
+                    "early_stopping_rounds": xgb_early_stop,
+                    "n_splits": len(splits),
+                },
+            )
+        print("  Ledger rows appended.")
+    except Exception as ledger_exc:  # noqa: BLE001
+        # Ledger failures must NOT kill a successful 5-hour run.
+        print(f"  Ledger append failed (non-fatal): {ledger_exc}")
 
     # ── Final comparison table ──────────────────────────────────────────
     print(f"\n{'=' * 70}")
