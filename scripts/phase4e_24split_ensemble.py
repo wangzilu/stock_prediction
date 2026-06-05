@@ -9,8 +9,20 @@ Output:
     data/storage/experiments/{exp_id}/pred.pkl             — full OOF preds
     data/storage/phase4e_24split/summary.json              — metrics
 
-Usage: python scripts/phase4e_24split_ensemble.py
+Usage:
+    # Default: 24-split, all 3 models (XGB+LGB+CatBoost), 500 estimators
+    python scripts/phase4e_24split_ensemble.py
+
+    # 6-26 optimization: xgb-only validation run
+    python scripts/phase4e_24split_ensemble.py --models xgb
+
+    # Fast sanity (6 splits, xgb-only)
+    python scripts/phase4e_24split_ensemble.py --preset 6split --models xgb
+
+    # The xgb_174 single-model 24-split validation (~2h instead of ~10h)
+    python scripts/phase4e_24split_ensemble.py --models xgb --preset 24split
 """
+import argparse
 import json
 import os
 import pickle
@@ -107,8 +119,20 @@ def compute_metrics(pred: pd.Series, label: pd.Series) -> dict:
 
 # ── Model Trainers ──────────────────────────────────────────────────────
 
-def train_xgboost(X_train, y_train, X_valid, y_valid, feat_cols):
-    """Train XGBoost regressor with early stopping."""
+def train_xgboost(X_train, y_train, X_valid, y_valid, feat_cols,
+                  n_estimators: int = 500,
+                  early_stopping_rounds: int | None = 30):
+    """Train XGBoost regressor with REAL early stopping.
+
+    Pre-fix (2026-06-05): docstring claimed early stopping but ``fit()``
+    never passed ``early_stopping_rounds`` / ``callbacks``, so XGB
+    silently ran the full ``n_estimators`` every time. Result: 24-split
+    runner training-time was 2-3× larger than necessary.
+
+    Post-fix: ``early_stopping_rounds`` is added to the XGBRegressor
+    init (xgboost ≥ 1.6 API). Pass ``early_stopping_rounds=None`` to
+    revert to old fixed-rounds behaviour.
+    """
     import xgboost as xgb
 
     params = {
@@ -120,11 +144,13 @@ def train_xgboost(X_train, y_train, X_valid, y_valid, feat_cols):
         "colsample_bytree": 0.88,
         "reg_alpha": 205.7,
         "reg_lambda": 580.98,
-        "n_estimators": 500,
+        "n_estimators": n_estimators,
         "n_jobs": 4,
         "verbosity": 0,
         "tree_method": "hist",
     }
+    if early_stopping_rounds is not None:
+        params["early_stopping_rounds"] = int(early_stopping_rounds)
 
     X_tr = np.nan_to_num(X_train.replace([np.inf, -np.inf], np.nan).values, nan=0.0)
     X_va = np.nan_to_num(X_valid.replace([np.inf, -np.inf], np.nan).values, nan=0.0)
@@ -232,22 +258,115 @@ def is_split_complete(split_id: int, model_names: list[str]) -> bool:
 
 # ── Main ────────────────────────────────────────────────────────────────
 
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--preset", choices=["24split", "12split", "6split"],
+        default="24split",
+        help="Rolling split preset (default: 24split, matches 5-26 baseline)",
+    )
+    p.add_argument(
+        "--models", nargs="+",
+        choices=["xgb", "lgb", "catboost"],
+        default=["xgb", "lgb", "catboost"],
+        help="Which models to train. xgb-only cuts runtime ~3× when "
+             "validating xgb_174 alone (default: all 3).",
+    )
+    p.add_argument(
+        "--n-estimators", type=int, default=500,
+        help="Tree count cap before early stopping (default: 500)",
+    )
+    p.add_argument(
+        "--early-stopping-rounds", type=int, default=30,
+        help="Stop after this many rounds without improvement on valid. "
+             "Set 0 to disable (revert to fixed n_estimators).",
+    )
+    p.add_argument(
+        "--end-date", default=None,
+        help="Last calendar date for split generation. Defaults to today.",
+    )
+    p.add_argument(
+        "--checkpoint-tag", default=None,
+        help="Append a tag to the checkpoint dir so xgb-only runs don't "
+             "collide with the historical 5-25 3-model checkpoints. "
+             "Defaults to a per-preset+models autotag.",
+    )
+    return p
+
+
 def main():
     from config.rolling_splits import get_standard_splits
     from models.ensemble_fusion import fuse_rank_mean, fuse_robust_z_mean
     from tracker.artifact_contract import ExperimentArtifact
 
-    MODEL_SPECS = {
+    args = _build_arg_parser().parse_args()
+
+    ALL_SPECS = {
         "xgb": {"fn": train_xgboost, "desc": "XGBoost regression"},
         "lgb": {"fn": train_lightgbm, "desc": "LightGBM regression"},
         "catboost": {"fn": train_catboost, "desc": "CatBoost regression"},
     }
+    # Filter MODEL_SPECS to the user's selection so we don't waste time
+    # training models we don't need. The xgb-only validation path cuts
+    # 24-split runtime from ~10h to ~2h (per cx 2026-06-05 P0-1 ROI #1).
+    MODEL_SPECS = {m: ALL_SPECS[m] for m in args.models}
     MODEL_NAMES = list(MODEL_SPECS.keys())
 
+    # Resolve hyperparams the runner passes into XGB. 0 means disable
+    # early stopping (caller said "revert to fixed-rounds").
+    xgb_early_stop = args.early_stopping_rounds if args.early_stopping_rounds > 0 else None
+
+    # Auto-tag the checkpoint dir so different (preset, models) combos
+    # don't collide with each other or with the historical 5-25
+    # 3-model checkpoints. cx 2026-06-05 P0-3: prior to this tag, an
+    # xgb-only rerun would reuse 5-25 xgb checkpoints (since the
+    # filename ``split{XX}_xgb.pkl`` is identical), silently shadowing
+    # the rerun's training. The tag fixes that.
+    if args.checkpoint_tag:
+        tag = args.checkpoint_tag.strip().strip("/")
+    else:
+        # default tag: preset + sorted-model-set, only when not default
+        # full 3-model 24split (which keeps the legacy dir name).
+        default_tag = (
+            args.preset == "24split"
+            and sorted(args.models) == ["catboost", "lgb", "xgb"]
+        )
+        tag = None if default_tag else (
+            f"{args.preset}_" + "_".join(sorted(args.models))
+        )
+
+    if tag is None:
+        checkpoint_dir = CHECKPOINT_DIR
+    else:
+        checkpoint_dir = CHECKPOINT_DIR.parent / f"phase4e_{tag}"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # Local helpers that route to the run-specific checkpoint dir.
+    def _ckpt_path(split_id: int, model_name: str) -> Path:
+        return checkpoint_dir / f"split{split_id:02d}_{model_name}.pkl"
+
+    def _save_ckpt(split_id: int, model_name: str, pred: pd.Series):
+        path = _ckpt_path(split_id, model_name)
+        with open(path, "wb") as f:
+            pickle.dump(pred, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def _load_ckpt(split_id: int, model_name: str) -> pd.Series | None:
+        path = _ckpt_path(split_id, model_name)
+        if not path.exists():
+            return None
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
+    def _split_done(split_id: int) -> bool:
+        return all(_ckpt_path(split_id, m).exists() for m in MODEL_NAMES)
+
     print("=" * 70)
-    print("Phase 4E: 24-Split Rolling Ensemble Training")
-    print(f"Models: {MODEL_NAMES}")
-    print(f"Checkpoint dir: {CHECKPOINT_DIR}")
+    print(f"Phase 4E: {args.preset} Rolling Ensemble Training")
+    print(f"Models: {MODEL_NAMES} (selected from {list(ALL_SPECS)})")
+    print(f"n_estimators={args.n_estimators}, early_stopping_rounds={xgb_early_stop}")
+    print(f"Checkpoint dir: {checkpoint_dir}")
+    if args.end_date:
+        print(f"End date: {args.end_date}")
     print("=" * 70)
 
     # ── 1. Load feature cache ───────────────────────────────────────────
@@ -262,9 +381,9 @@ def main():
     label_col = LABEL_COL if LABEL_COL in df.columns else label_cols[0]
     print(f"  Features: {len(feat_cols)}, Label: {label_col}")
 
-    # ── 2. Get 24-split config ──────────────────────────────────────────
-    print(f"\n[2/5] Generating 24-split configuration...")
-    splits = get_standard_splits("24split")
+    # ── 2. Get split config ─────────────────────────────────────────────
+    print(f"\n[2/5] Generating {args.preset} configuration...")
+    splits = get_standard_splits(args.preset, end_date=args.end_date)
     print(f"  {len(splits)} splits generated")
     print(f"  First: split_id={splits[0]['split_id']} "
           f"train={splits[0]['train_start']}~{splits[0]['train_end']} "
@@ -273,8 +392,8 @@ def main():
           f"train={splits[-1]['train_start']}~{splits[-1]['train_end']} "
           f"test={splits[-1]['test_start']}~{splits[-1]['test_end']}")
 
-    # Check resumability
-    completed = sum(1 for s in splits if is_split_complete(s["split_id"], MODEL_NAMES))
+    # Check resumability (against the run-specific tagged checkpoint dir)
+    completed = sum(1 for s in splits if _split_done(s["split_id"]))
     print(f"  Already completed: {completed}/{len(splits)} splits")
 
     # ── 3. Train all splits ─────────────────────────────────────────────
@@ -292,12 +411,12 @@ def main():
               f"test={split['test_start']}~{split['test_end']}")
 
         # Check if already done
-        if is_split_complete(sid, MODEL_NAMES):
+        if _split_done(sid):
             print(f"  [SKIP] All models already checkpointed")
             # Load cached metrics
             split_metrics[sid] = {}
             for mname in MODEL_NAMES:
-                pred = load_checkpoint(sid, mname)
+                pred = _load_ckpt(sid, mname)
                 if pred is not None:
                     dates_idx = df.index.get_level_values("datetime")
                     test_mask = (dates_idx >= split["test_start"]) & (dates_idx <= split["test_end"])
@@ -335,7 +454,7 @@ def main():
 
         for mname, spec in MODEL_SPECS.items():
             # Check per-model checkpoint
-            cached = load_checkpoint(sid, mname)
+            cached = _load_ckpt(sid, mname)
             if cached is not None:
                 print(f"  {mname}: [CACHED]")
                 m = compute_metrics(cached, y_test)
@@ -345,12 +464,23 @@ def main():
 
             t0 = time.time()
             try:
-                model, params = spec["fn"](X_train, y_train, X_valid, y_valid, feat_cols)
+                # XGB-only: route the runner's hyperparam overrides
+                # (n_estimators, early_stopping_rounds) through. Other
+                # trainers already have their own early stopping baked
+                # into their fit() callbacks.
+                if mname == "xgb":
+                    model, params = spec["fn"](
+                        X_train, y_train, X_valid, y_valid, feat_cols,
+                        n_estimators=args.n_estimators,
+                        early_stopping_rounds=xgb_early_stop,
+                    )
+                else:
+                    model, params = spec["fn"](X_train, y_train, X_valid, y_valid, feat_cols)
                 pred_vals = predict_model(model, X_test, mname, feat_cols)
                 pred = pd.Series(pred_vals, index=X_test.index, name="score")
 
                 # Save checkpoint
-                save_checkpoint(sid, mname, pred)
+                _save_ckpt(sid, mname, pred)
 
                 # Compute metrics
                 m = compute_metrics(pred, y_test)
@@ -386,7 +516,7 @@ def main():
         oof_labels.append(test_labels)
 
         for mname in MODEL_NAMES:
-            pred = load_checkpoint(sid, mname)
+            pred = _load_ckpt(sid, mname)
             if pred is not None:
                 oof_preds[mname].append(pred)
 
@@ -452,7 +582,7 @@ def main():
         # Compute ensemble metrics for this split
         split_preds = {}
         for mname in MODEL_NAMES:
-            p = load_checkpoint(sid, mname)
+            p = _load_ckpt(sid, mname)
             if p is not None:
                 split_preds[mname] = p
 
@@ -484,7 +614,7 @@ def main():
     for mname in MODEL_NAMES:
         if mname not in oof_series:
             continue
-        exp_id = f"{mname}_174_24split_{timestamp}"
+        exp_id = f"{mname}_174_{args.preset}_{timestamp}"
         art = ExperimentArtifact.create(
             experiment_id=exp_id,
             model_name=f"{mname}_174",
@@ -505,7 +635,7 @@ def main():
 
     # Save ensemble OOF pred
     for fn_name, ens_data in ensemble_methods.items():
-        exp_id = f"ensemble_{fn_name}_24split_{timestamp}"
+        exp_id = f"ensemble_{fn_name}_{args.preset}_{timestamp}"
         art = ExperimentArtifact.create(
             experiment_id=exp_id,
             model_name=f"ensemble_{fn_name}",
@@ -528,24 +658,28 @@ def main():
     # Summary JSON
     summary = {
         "timestamp": timestamp,
+        "preset": args.preset,
         "n_splits": len(splits),
         "n_features": len(feat_cols),
         "label_col": label_col,
         "models": MODEL_NAMES,
+        "xgb_n_estimators": args.n_estimators,
+        "xgb_early_stopping_rounds": xgb_early_stop,
+        "end_date": args.end_date,
         "full_oof_metrics": full_metrics,
         "per_split_metrics": {str(k): v for k, v in split_metrics.items()},
         "ensemble_wins": ensemble_wins,
         "n_comparable_splits": n_comparable,
         "total_time_sec": round(time.time() - total_t0, 1),
     }
-    summary_path = CHECKPOINT_DIR / "summary.json"
+    summary_path = checkpoint_dir / "summary.json"
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2, default=str)
     print(f"  Summary saved: {summary_path}")
 
     # ── Final comparison table ──────────────────────────────────────────
     print(f"\n{'=' * 70}")
-    print("FULL 24-SPLIT OOF COMPARISON")
+    print(f"FULL {args.preset.upper()} OOF COMPARISON")
     print(f"{'=' * 70}")
 
     rows = []
