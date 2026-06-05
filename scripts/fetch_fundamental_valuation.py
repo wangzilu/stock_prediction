@@ -74,6 +74,29 @@ def load_existing_codes(path: Path) -> set:
         return set()
 
 
+def existing_latest_date(path: Path) -> str | None:
+    """Return the most recent date already saved in the parquet, or None
+    if the file is missing / unreadable. Used to derive an incremental
+    fetch window that actually advances the dataset.
+
+    2026-06-05 fix: pre-fix ``--incremental`` only skipped codes that
+    appeared in the parquet AT ALL — never appended fresh dates for
+    those codes. The latest_date in the parquet sat at 2026-05-28 for a
+    week while the cron pretended to succeed, eventually tripping
+    ``lgb_after_close_smoke``'s freshness gate. The new flow keeps the
+    full code list AND lifts ``start_date`` to ``latest_date_in_parquet``,
+    so each run actually advances the parquet by the missing trading
+    days.
+    """
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_parquet(path, columns=["date"])
+        return str(df["date"].max())
+    except Exception:
+        return None
+
+
 def fetch_valuation(codes: list, start_date: str, end_date: str) -> pd.DataFrame:
     """Fetch PE/PB/PS for all codes from baostock."""
     import baostock as bs
@@ -150,18 +173,40 @@ def main():
 
     codes = get_all_stock_codes(top_n=args.top)
 
+    end_date = datetime.now().strftime("%Y-%m-%d")
+    default_start = (datetime.now() - timedelta(days=args.days)).strftime("%Y-%m-%d")
+    start_date = default_start
+
     if args.incremental:
-        existing = load_existing_codes(OUTPUT_PATH)
-        before = len(codes)
-        codes = [c for c in codes if c not in existing]
-        logger.info(f"Incremental: skipping {before - len(codes)}, {len(codes)} remaining")
+        # 2026-06-05 fix: DO NOT drop existing codes — the parquet's
+        # latest_date had been stuck at 2026-05-28 for a week because
+        # each cron run skipped every stock that had any row. New
+        # behaviour: keep ALL codes, lift start_date to the parquet's
+        # current latest_date so we only fetch the missing trading
+        # days. Re-fetched rows are deduped on (qlib_code, date) at
+        # save time.
+        latest = existing_latest_date(OUTPUT_PATH)
+        if latest is not None:
+            # Re-fetch from the existing latest date so we close any
+            # gap; dedupe at save merges the overlap. Compare strings
+            # in ISO-date form so we always choose the later boundary.
+            if latest > start_date:
+                start_date = latest
+            logger.info(
+                "Incremental: parquet latest=%s, fetch window %s ~ %s "
+                "(all %d codes)",
+                latest, start_date, end_date, len(codes),
+            )
+        else:
+            logger.info(
+                "Incremental requested but parquet missing; falling "
+                "back to full %s ~ %s window for %d codes",
+                start_date, end_date, len(codes),
+            )
 
     if not codes:
         logger.info("Nothing to fetch")
         return
-
-    end_date = datetime.now().strftime("%Y-%m-%d")
-    start_date = (datetime.now() - timedelta(days=args.days)).strftime("%Y-%m-%d")
 
     df = fetch_valuation(codes, start_date, end_date)
 
@@ -176,6 +221,33 @@ def main():
         logger.info(f"Saved to {OUTPUT_PATH}")
         logger.info(f"  Date range: {df['date'].min()} ~ {df['date'].max()}")
         logger.info(f"  Stocks: {df['qlib_code'].nunique()}")
+
+    # 2026-06-05 fix: write the data-health record so the
+    # ``lgb_after_close_smoke`` / feature_cache freshness gates can see
+    # the run's latest_date. Pre-fix this script never called
+    # write_health, so valuation_update was permanently invisible to
+    # the gate's recorded-latest-date check — the gate accepted it as
+    # "complete" via job_status (exit code 0) but always treated it as
+    # "stale" because no health record existed.
+    try:
+        from scheduler.data_health import write_health, HealthStatus
+        if df is not None and not df.empty:
+            latest = str(pd.read_parquet(OUTPUT_PATH, columns=["date"])["date"].max())
+            write_health("valuation_update", HealthStatus(
+                success=True,
+                n_items=int(len(df)),
+                latest_date=latest,
+                network_profile="domestic",
+            ))
+        else:
+            write_health("valuation_update", HealthStatus(
+                success=False,
+                n_items=0,
+                error_message="no valuation data fetched",
+                network_profile="domestic",
+            ))
+    except Exception as _heal_exc:
+        logger.warning("write_health(valuation_update) failed: %s", _heal_exc)
 
     logger.info("Done!")
 

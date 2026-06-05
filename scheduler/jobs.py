@@ -625,12 +625,17 @@ class DailyPipeline:
                 # so 短线 only contains stocks with a real short-term lift.
                 continue
             next_day = getattr(rec, "next_day_change_pct", None)
+            # 2026-06-05: ``next_day_change_pct`` was demoted from a
+            # dataclass field to a property/setter pair (cx round 11
+            # P1-1 rename). ``dataclasses.replace`` only knows about
+            # fields, so use the underlying field name. The property
+            # at read time still works for downstream code.
             groups["短线"].append(
                 replace(
                     rec,
                     horizon="短线",
                     horizon_score=short_score,
-                    next_day_change_pct=next_day,
+                    horizon_dailyized_return_pct=next_day,
                 )
             )
             selected.add(rec.code)

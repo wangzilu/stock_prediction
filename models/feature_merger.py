@@ -108,19 +108,25 @@ class FeatureMerger:
         custom = custom.swaplevel().sort_index()
         custom = custom.replace([np.inf, -np.inf], np.nan)
 
-        # Per-frame .loc-based assignment so each frame gets values
-        # aligned to ITS OWN index, not to a shared union.
+        # Per-frame reindex + single concat (2026-06-05 fix). The old
+        # per-column ``df.loc[attr_common, (...)] = ...`` loop ran
+        # 13 cols × 3 frames = 39 ops on a wide MultiIndex frame,
+        # which forces pandas BlockManager defragmentation. Same root
+        # cause as inject_supplementary_into_handler; see that
+        # function's comment for the wider context. This loop is
+        # currently a no-op for xgb_242 (zero custom factors) but
+        # xgb_174 needs the fast path too.
+        custom_cols = list(custom.columns)
         for attr in ("_data", "_learn", "_infer"):
             df = getattr(handler, attr, None)
             if df is None or len(df) == 0:
                 continue
-            attr_common = custom.index.intersection(df.index)
-            for col in custom.columns:
-                df[("feature", col)] = np.nan
-                if len(attr_common):
-                    df.loc[attr_common, ("feature", col)] = custom.loc[
-                        attr_common, col
-                    ].values
+            block = custom.reindex(df.index)
+            block.columns = pd.MultiIndex.from_tuples(
+                [("feature", c) for c in custom_cols]
+            )
+            new_df = pd.concat([df, block], axis=1)
+            setattr(handler, attr, new_df)
 
         logger.info(
             "inject_qlib_custom_factors: %d custom expression cols injected "
@@ -191,19 +197,31 @@ class FeatureMerger:
             )
 
         n_supp = supp.shape[1]
-        # Inject into every frame that exists on the handler so all
-        # data_keys (DK_R / DK_L / DK_I) see the same columns.
+        # 2026-06-05: replace per-column ``df[(...)] = ...`` +
+        # ``df.loc[idx, (...)] = ...`` loop with a single per-frame
+        # ``concat``. The old loop ran 84 cols × 3 frames = 252
+        # column-add operations against a wide MultiIndex DataFrame,
+        # which forces pandas' BlockManager to defragment / consolidate
+        # on nearly every iteration. Real-world cost on the production
+        # 5195-stock × 19-day inference frame was **~890s** (see
+        # ``scripts/probe_load_model_timing.py``), which was the root
+        # cause of the morning_recommendation / sell_check /
+        # brinson_attribution 25-min silent hangs. The single concat
+        # path stays in vectorised pandas and finishes in seconds.
+        supp_cols = list(supp.columns)
         for attr in ("_data", "_learn", "_infer"):
             df = getattr(handler, attr, None)
             if df is None or len(df) == 0:
                 continue
-            attr_common = supp.index.intersection(df.index)
-            for col in supp.columns:
-                df[("feature", col)] = np.nan
-                if len(attr_common):
-                    df.loc[attr_common, ("feature", col)] = supp.loc[
-                        attr_common, col
-                    ].values
+            # Reindex the supp frame to the handler frame's exact index
+            # so the per-frame .loc[attr_common, ...] semantics are
+            # preserved: rows the handler has but supp doesn't get NaN.
+            block = supp.reindex(df.index)
+            block.columns = pd.MultiIndex.from_tuples(
+                [("feature", c) for c in supp_cols]
+            )
+            new_df = pd.concat([df, block], axis=1)
+            setattr(handler, attr, new_df)
 
         logger.info(
             "inject_supplementary_into_handler: %d supp cols injected "
@@ -619,72 +637,98 @@ class FeatureMerger:
             )
         frames = []
 
+        # 2026-06-05: per-loader timing so we can see which loader
+        # dominates _load_supplementary's wall-clock cost. Pre-fix the
+        # 14.8-min hang in morning_recommendation was being chalked up
+        # to "supplementary injection is slow" without a way to point at
+        # which of the 11 loaders was actually heavy. Each loader gets a
+        # one-line ``[supp-timing] name=NNNs cols=NN`` log.
+        import time as _supp_time
+        _t0_supp = _supp_time.time()
+
+        def _run(name: str, fn):
+            t = _supp_time.time()
+            try:
+                df = fn(index)
+            except Exception:
+                logger.exception("[supp-timing] %s RAISED", name)
+                raise
+            dt = _supp_time.time() - t
+            ncols = 0 if df is None else int(df.shape[1])
+            logger.info("[supp-timing] %s=%.2fs cols=%d", name, dt, ncols)
+            return df
+
         # Fundamental features
         if allowed is None or "fundamental" in allowed:
-            fund = self._load_fundamental(index)
+            fund = _run("fundamental", self._load_fundamental)
             if fund is not None:
                 frames.append(fund)
 
         # Capital flow features
         if allowed is None or "capital_flow" in allowed:
-            flow = self._load_capital_flow(index)
+            flow = _run("capital_flow", self._load_capital_flow)
             if flow is not None:
                 frames.append(flow)
 
         # Macro features. Production uses the current zero-baseline contract;
         # real macro values require a separate PIT-safe re-enable.
         if allowed is None or "macro_zero_baseline" in allowed:
-            macro = self._load_macro(index)
+            macro = _run("macro", self._load_macro)
             if macro is not None:
                 frames.append(macro)
 
         # Shareholder features
         if allowed is None or "shareholder" in allowed:
-            holder = self._load_shareholder(index)
+            holder = _run("shareholder", self._load_shareholder)
             if holder is not None:
                 frames.append(holder)
 
         # Valuation features (PE/PB/PS)
         if allowed is None or "valuation" in allowed:
-            val = self._load_valuation(index)
+            val = _run("valuation", self._load_valuation)
             if val is not None:
                 frames.append(val)
 
         # Northbound holding features
         if allowed is None or "northbound" in allowed:
-            nb = self._load_northbound(index)
+            nb = _run("northbound", self._load_northbound)
             if nb is not None:
                 frames.append(nb)
 
         # Quality features (ROE/margins/growth)
         if allowed is None or "quality" in allowed:
-            quality = self._load_quality(index)
+            quality = _run("quality", self._load_quality)
             if quality is not None:
                 frames.append(quality)
 
         # ST_CLIENT daily_basic (PE/PB/PS/turnover/mv - PIT-safe daily)
         if allowed is None or "st_daily_basic" in allowed:
-            st_basic = self._load_st_daily_basic(index)
+            st_basic = _run("st_daily_basic", self._load_st_daily_basic)
             if st_basic is not None:
                 frames.append(st_basic)
 
         # ST_CLIENT moneyflow (资金流 - PIT-safe daily)
         if allowed is None or "st_moneyflow" in allowed:
-            st_mf = self._load_st_moneyflow(index)
+            st_mf = _run("st_moneyflow", self._load_st_moneyflow)
             if st_mf is not None:
                 frames.append(st_mf)
 
         # ST_CLIENT holder number (股东户数 - PIT-safe quarterly)
         if allowed is None or "st_holder_number" in allowed:
-            st_holder = self._load_st_holder_number(index)
+            st_holder = _run("st_holder_number", self._load_st_holder_number)
             if st_holder is not None:
                 frames.append(st_holder)
 
         # Cross-market regime signals (恒生/纳指 - broadcast to all stocks per date)
         if allowed is None or "cross_market_regime" in allowed:
-            cross_mkt = self._load_cross_market_regime(index)
+            cross_mkt = _run("cross_market_regime", self._load_cross_market_regime)
             if cross_mkt is not None:
                 frames.append(cross_mkt)
+
+        logger.info(
+            "[supp-timing] TOTAL _load_supplementary=%.2fs across %d frames",
+            _supp_time.time() - _t0_supp, len(frames),
+        )
 
         if not frames:
             return None
@@ -779,13 +823,27 @@ class FeatureMerger:
             return None
 
         df = df[needed].dropna()
-        df = df.sort_values(["qlib_code", "trade_date"])
+        df = df.sort_values(["qlib_code", "trade_date"]).reset_index(drop=True)
 
-        # Compute rolling features per stock per date (PIT-safe)
-        grouped = df.groupby("qlib_code")["net_mf_amount"]
-        df["flow_net_mf_latest"] = grouped.transform(lambda x: x)
-        df["flow_net_mf_5d"] = grouped.transform(lambda x: x.rolling(5, min_periods=1).sum())
-        df["flow_net_mf_20d_avg"] = grouped.transform(lambda x: x.rolling(20, min_periods=1).mean())
+        # 2026-06-05 fix: replace ``groupby.transform(lambda x: ...)``
+        # with vectorised ``groupby.rolling`` + the level-drop pattern.
+        # Pre-fix this method took ~9.2 min on the production 4-month
+        # 5195-stock fund_flow_history frame (probe_load_model_timing.py
+        # 2026-06-05); ``transform(lambda)`` forces a per-stock Python
+        # callback so the cost scales with stock-count × Python overhead
+        # instead of stock-count × numpy. The first ``lambda x: x`` was
+        # also literally a no-op — wasted entirely. Same column outputs,
+        # just computed via the C-level path.
+        df["flow_net_mf_latest"] = df["net_mf_amount"]
+        rolling_grp = df.groupby("qlib_code", sort=False)["net_mf_amount"]
+        df["flow_net_mf_5d"] = (
+            rolling_grp.rolling(5, min_periods=1).sum()
+            .reset_index(level=0, drop=True)
+        )
+        df["flow_net_mf_20d_avg"] = (
+            rolling_grp.rolling(20, min_periods=1).mean()
+            .reset_index(level=0, drop=True)
+        )
 
         factor_cols = ["flow_net_mf_latest", "flow_net_mf_5d", "flow_net_mf_20d_avg"]
         flow_daily = df[["qlib_code", "trade_date"] + factor_cols].copy()
@@ -1070,8 +1128,18 @@ class FeatureMerger:
         train_inst_arr = train_insts.values if hasattr(train_insts, 'values') else np.array(train_insts)
         train_date_arr = train_dates.values
 
-        # Group factor data by stock
-        stocks_in_ts = set(ts_df["qlib_code"].unique())
+        # 2026-06-05 fix: pre-build a {stock: (sorted_dates, values)}
+        # dict via ONE groupby pass. Pre-fix the inner loop did
+        # ``ts_df["qlib_code"] == stock`` for every stock — a full O(N)
+        # boolean scan over the whole timeseries frame per stock,
+        # i.e. O(stocks × ts_rows). On st_moneyflow's 4-month frame
+        # (18 cols × ~500K rows × 5197 stocks) that produced the 208s
+        # cost flagged by ``probe_load_model_timing.py`` 2026-06-05.
+        # One groupby + dict lookup turns it into O(stocks) + O(N).
+        ts_groups = {
+            stock: (g[date_col].values, g[factor_cols].values)
+            for stock, g in ts_df.groupby("qlib_code", sort=False)
+        }
 
         # Build stock→positions mapping (vectorized with pandas groupby)
         inst_series = pd.Series(np.arange(n), index=train_inst_arr)
@@ -1079,20 +1147,15 @@ class FeatureMerger:
 
         processed = 0
         for stock, pos_idx in inst_groups:
-            if stock not in stocks_in_ts:
+            stock_block = ts_groups.get(stock)
+            if stock_block is None:
+                continue
+            ts_dates, ts_values = stock_block
+            if len(ts_dates) == 0:
                 continue
 
             positions = pos_idx.values  # numpy array of row positions
             query_dates = train_date_arr[positions]
-
-            # Get this stock's factor data (sorted by date)
-            stock_mask = ts_df["qlib_code"] == stock
-            stock_data = ts_df.loc[stock_mask]
-            if stock_data.empty:
-                continue
-
-            ts_dates = stock_data[date_col].values  # sorted
-            ts_values = stock_data[factor_cols].values  # (n_ts, n_factors)
 
             # searchsorted: find insertion points (rightmost position where date <= query)
             insert_idx = np.searchsorted(ts_dates, query_dates, side="right") - 1
