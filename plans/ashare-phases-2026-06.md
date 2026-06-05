@@ -97,7 +97,124 @@ Same 205-cache (Alpha158 158 + holder + regime + ma overlay), same
 
 ---
 
-## Phase B — Ablation (after Phase A verdict)
+## Phase A.5 — Shadow Containment Hardfix (this week, before Phase B)
+
+**Goal:** stop half-baked shadow factors and explanatory LLM signals
+from leaking into the production buy/sell decision path. The four
+bugs below all share one shape — a feature labelled "shadow" or
+"radar" in comments / docs but actually used as a hard gate in the
+runtime code path.
+
+**Gate to exit Phase A.5:** all four hardfixes in production AND
+`docs/shadow_containment_audit_20260606.md` documents the verified
+old-vs-new behaviour per fix.
+
+These are correctness bugs, not optimisations. They block Phase B
+because any ablation result is meaningless while shadow factors can
+silently reject buy candidates or read future-dated files.
+
+### A5-1 (P0) — `chain_alpha` hard block is reading uncalibrated raw scores
+
+`factors/candidate_sanitizer.py:322-327` rejects a candidate when
+`global_chain_alpha < min_chain_alpha (default -2.0)`. But
+`global_chain_alpha` raw distribution is mean ≈ -14.5, min ≈ -47.8 —
+the threshold of `-2.0` essentially fires for any name caught in
+an industry-level negative broadcast. Companies in 有色 / 半导体 /
+战略材料 lose buy eligibility because of policy / commodity events
+that hit the whole industry.
+
+Fix:
+- Demote `chain_negative` from hard reject to a soft tag (rerank only).
+- Add `enable_chain_hard_block` param, default `False`.
+- Hard block only ever fires on `company_level_chain_alpha`;
+  industry / policy / commodity levels can rerank but not reject.
+- Industry-level alpha must be `zscore_by_date * shrink * clip([-3, 3])`
+  before any consumer touches it.
+- Threshold becomes a quantile or calibrated probability (e.g.
+  `chain_risk_z < -2.5`), never a raw score.
+
+### A5-2 (P0) — Chain fallback reads future rows on backfill / replay
+
+`scheduler/jobs.py:1226-1234` falls back to `dates.max()` when the
+target date is not in the parquet. For a historical replay the
+parquet's `max` IS the future relative to `target_date`, and the
+existing `age > 2` check fails silently when `age` is negative.
+Result: backfill silently consumes the latest chain factor row even
+when it post-dates the signal date — straight look-ahead bias.
+
+Fix:
+```python
+valid_dates = dates[dates <= dt]
+if len(valid_dates) == 0:
+    return None
+latest = valid_dates.max()
+age = trading_day_gap(latest, dt)   # CN calendar, not naive .days
+if age > 2:
+    return None
+```
+
+Plus a unit test that calls `_load_chain_alpha(target=<earlier date>,
+parquet_max=<later date>)` and asserts the function returns `None`
+without ever calling `df.xs(latest, ...)`.
+
+### A5-3 (P1) — `market_judge` weights LLM despite "radar only" comment
+
+`signals/market_judge.py:36-58` comment: "Verified: LLM direction
+accuracy = 33% (worse than random). Index price action is the only
+reliable short-term signal. Geo/LLM only used for report text, NOT
+for scoring." Code: `final_score = index*w_index + geo*w_geo + llm*w_llm`
+with `(w_index, w_geo, w_llm) = (0.60, 0.25, 0.15)` early session.
+The comment is a lie at runtime — 40% of the early-session market
+judgment IS geo + LLM.
+
+Fix (default):
+```python
+w_index, w_geo, w_llm = 1.0, 0.0, 0.0
+```
+
+Geo + LLM stay in the report text fields (`reason` / `key_events` /
+etc) but contribute zero to `final_score`. If a future backtest proves
+either deserves weight, raise it explicitly with the backtest commit
+linked in the comment.
+
+### A5-4 (P1) — Geo fallback grabs latest-by-filename `global_industry_news`
+
+`scheduler/jobs.py:2274-2280` falls back to
+`sorted(gn_dir.glob("*.jsonl"), reverse=True)[:3]` when the RSS
+collector returns empty. Replay / backfill reading a date earlier than
+the latest news file picks up FUTURE news. On top of that
+`global_industry_news` is supply-chain news, not macro / geo — using
+it as a macro fallback is also categorically wrong.
+
+Fix:
+- Filter `gn_dir.glob("*.jsonl")` by `file_date <= target_date`
+  before picking the top 3.
+- Freshness cap: skip files older than 1 trading day (CN calendar).
+  Beyond that, return `geo_factors = None` rather than silently
+  inserting zero.
+- Separate source paths: supply-chain news stays at
+  `data/storage/global_industry_news/`. Macro / geopolitical news
+  goes to the NEW `data/storage/macro_policy_news/<YYYY-MM-DD>.jsonl`
+  produced by Phase E.1 → E.4 collectors. The fallback only reads
+  the macro-policy directory.
+
+### A5-5 — Audit report `docs/shadow_containment_audit_20260606.md`
+
+Document for each of A5-1 … A5-4:
+- The exact pre-fix line range that leaked.
+- A replay screenshot or assertion showing the leak.
+- The post-fix replay with the same input showing the leak closed.
+- Whether any current production recommendation could have been
+  affected — and if so, how the recommendation log was retroactively
+  annotated.
+
+This is the file the project lead has to sign off on before Phase B
+can start; it prevents the same leakage class from being reintroduced
+when Phases C/D/E land new shadow factors.
+
+---
+
+## Phase B — Ablation (after Phase A + A.5 verdict)
 
 **Goal:** know which of the 11 PRODUCTION_SUPPLEMENTARY_GROUPS actually
 contribute. Two-stage to avoid the 11×24-split cost.
