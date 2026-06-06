@@ -54,8 +54,18 @@ import os
 # task #112 (retrain 174 + 24-split + cost-adjusted backtest →
 # challenge gate → maybe flip default).
 PRODUCTION_MODEL_PROFILE: str = os.environ.get(
-    "PRODUCTION_MODEL_PROFILE", "xgb_242",
+    "PRODUCTION_MODEL_PROFILE", "xgb_209",
 ).strip().lower()
+# 2026-06-06: default flipped xgb_242 → xgb_209 after Phase B.4
+# 24-split verdict (docs/phase_b4_verdict_20260606.md) showed
+# xgb_209 wins on every metric: RankIC +0.0072, ICIR +0.101 (+40%
+# stability), Spread20 +38 bps (more than 2x). Retrain on
+# end-date 2026-06-05 produced Sp20 81 bps. Phase B.5 confirmed
+# Bucket B groups are neutral (no further drops). Phase B.6 showed
+# the LLM event group hurts slightly (-0.0012 RankIC) so xgb_209_llm
+# stays shadow. Rollback path: set
+# ``PRODUCTION_MODEL_PROFILE=xgb_242`` in the cron env; the legacy
+# binary lgb_model_xgb_242.pkl + contract are still on disk.
 
 
 # Supplementary loader groups per profile. Adding a NEW loader to
