@@ -819,8 +819,24 @@ hang to **11:14 wall, 5 recommendations produced**
   - 13 tests in `tests/test_data_sla.py`.
   - Audit doc: `docs/sla_gate_audit_20260607.md`.
 - 🔄 Phase B — LOO ablation 6-split fast screen (running now,
-  baseline + 9 LOO ~80 min, ETA 2026-06-06 12:30).
-- ⏸ Phase C / D / E — gated behind Phase B verdict.
+  baseline + 9 LOO ~80 min, ETA 2026-06-06 13:00).
+- 🔄 Phase C (LLM event quality) — running in parallel with B:
+  - C.1 (L4) `factors/event_filter.py` +8 generic blacklist patterns + 41
+    tests.
+  - C.2 (L3) `factors/event_schema_validator.py` — earnings / dividend /
+    buyback / penalty keyword gate, wired into V2 extract_single,
+    24 tests.
+  - C.3 (L1, first pass) `scripts/build_llm_event_factors.py` emits
+    fact-count factors (`llm_positive_event_count_3d`, etc) alongside
+    the legacy synthesized-impact columns. 8 tests.
+  - C.4 (L2) EventStore PIT canonical — pending, will be the next
+    behaviour-changing commit after L1 lands in production.
+  - C.5 (L5) `scripts/llm_factor_quality_report.py` daily report
+    (`data/storage/llm_factor_quality/<date>.json`), 11 tests, new
+    cron at 18:00.
+  - C.6 (L6) 60-90 day backfill + ablation — deferred until C.4 lives
+    in production.
+- ⏸ Phase D / E — gated behind Phase B + C verdict.
 
 Read this doc — not the chat history — when you come back to A-share
 work. Update it as phases land.
