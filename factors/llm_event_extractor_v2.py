@@ -288,6 +288,23 @@ class LLMEventExtractorV2:
             prompt += f"\n内容: {content[:300]}"
         text, usage = self._call_llm(prompt)
         event = self._parse_response(text)
+        # 2026-06-06 Phase C.2 (L3): post-LLM keyword gate. The LLM
+        # cheerfully tags any "业绩" headline as earnings_*, any "回购"
+        # mention as share_buyback, etc. The validator downgrades to
+        # other / routine_announcement when the family's keyword
+        # gates fail, so downstream factor builders cannot accept the
+        # over-classified events at face value.
+        if event is not None and event.get("event_type"):
+            from factors.event_schema_validator import validate_event_type
+            final_type, reason = validate_event_type(
+                proposed_type=event["event_type"],
+                title=title,
+                content=content,
+            )
+            if final_type != event["event_type"]:
+                event["event_type_original"] = event["event_type"]
+                event["event_type_downgrade_reason"] = reason
+                event["event_type"] = final_type
         rate_limited = usage.get("rate_limited", False)
         self._record_stats(
             usage.get("http_ok", False),
