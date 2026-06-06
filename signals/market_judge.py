@@ -1,9 +1,7 @@
 """A-share market index judgment module.
 
-Combines index price action + LLM geopolitical analysis to judge market direction.
-Adjusts weights based on time of day:
-- Early session (before 11:00): rely more on LLM/news analysis (盘中数据不稳定)
-- Late session (after 13:00): rely more on actual price action (方向已明确)
+Market score uses index price action only. LLM / geopolitical analysis
+stays in report text as radar context and contributes zero to scoring.
 """
 import logging
 from datetime import datetime
@@ -38,19 +36,23 @@ class MarketJudge:
             )
             llm_direction = geo_factors.get("market_direction", 0)
 
-        # Weight allocation: LLM geo/direction demoted to radar role only.
-        # Verified: LLM direction accuracy = 33% (worse than random).
-        # Index price action is the only reliable short-term signal.
-        # Geo/LLM only used for report text, NOT for scoring.
-        hour = datetime.now().hour
-        if hour < 11:
-            # Early session: no reliable price yet, be neutral
-            w_index, w_geo, w_llm = 0.60, 0.25, 0.15
-        elif hour < 13:
-            w_index, w_geo, w_llm = 0.75, 0.15, 0.10
-        else:
-            # Afternoon: trust price action
-            w_index, w_geo, w_llm = 0.85, 0.10, 0.05
+        # 2026-06-06 Phase A.5 (fix A5-3): the previous block claimed
+        # "Geo/LLM only used for report text, NOT for scoring" but the
+        # code paths immediately below assigned w_geo + w_llm = 0.40
+        # at early session, 0.25 at mid-day, 0.15 in the afternoon.
+        # That was 40% of the early-session market judgment driven by
+        # an LLM the same comment described as "33% accuracy (worse than
+        # random)". The comment was a lie at runtime.
+        #
+        # Fix: index price is the only weight, period. Geo / LLM stay in
+        # the report text fields (``reason`` / ``key_events``) but
+        # contribute zero to ``final_score``. Either is allowed to come
+        # back with weight after a backtest commit (linked here) proves
+        # it deserves it — until then, the only inputs to position
+        # sizing are the price action of the index and the explicit
+        # MarketJudge override.
+        hour = datetime.now().hour  # still needed by _generate_reason below
+        w_index, w_geo, w_llm = 1.0, 0.0, 0.0
 
         final_score = (
             index_score * w_index
