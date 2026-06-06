@@ -785,14 +785,77 @@ hang to **11:14 wall, 5 recommendations produced**
 
 ---
 
-## Status As Of 2026-06-05 23:00
+## Status As Of 2026-06-06 01:30
 
 - ✅ Phase A.0 — same-exam infrastructure landed and pushed.
 - ✅ Phase A.1 — xgb_205 24-split landed (RankIC +0.0419).
-- 🔄 Phase A.2 — xgb_242 cache build in flight; 24-split next.
-- ⏸ Phase A.3 — xgb175 24-split next.
-- ⏸ Phase A.4 — three-way compare + sign-off.
-- ⏸ Phase B / C / D — gated behind Phase A.
+- ✅ Phase A.2 — xgb_242 cache build + 24-split landed (RankIC +0.0273).
+- ⏸ Phase A.3 — xgb175 standalone rerun; xgb_205 used as proxy for now.
+- ✅ Phase A.4 — three-way compare + verdict: production xgb_242 is the
+  weakest of the same-code runs (-0.0146 vs xgb_205, -0.0512 vs 5-26
+  stale baseline). Champion held pending A.5 / A.6 / SLA gate sweep.
+- ✅ Phase A.5 — shadow containment hardfix:
+  - A5-1 chain alpha soft-tag default, hard block gated.
+  - A5-2 chain alpha as-of `<= target_date`, future rows rejected.
+  - A5-3 market_judge weights → (1, 0, 0) (already shipped).
+  - A5-4 geo fallback only reads `macro_policy_news` whose
+    `file_date <= target_date`.
+  - Audit doc: `docs/shadow_containment_audit_20260606.md`.
+- ✅ Phase A.6 — data health truthfulness:
+  - A6-1 / A6-2 chain extract/build enforce_deps + red health + exit 1.
+  - A6-3 regime_daily_update sub-source health (already shipped).
+  - A6-4 qlib_data_update writes real health on no-op early exit.
+  - A6-5 fund_flow_update split from northbound_update.
+  - A6-6 PRODUCTION_GROUP_TO_HEALTH_SOURCE now maps each group to its
+    real collector; new `fetch_fundamental_features.py` backs
+    `fundamental_update`.
+  - A6-8 run_llm_event_pipeline writes its own health (partial /
+    timeout / 0-factor → partial=True or red).
+  - Audit doc: `docs/health_truthfulness_audit_20260606.md`.
+- 🔄 Phase A.7 — source-specific SLA gate (next, see below).
+- ⏸ Phase B / C / D / E — gated behind Phase A.7.
 
 Read this doc — not the chat history — when you come back to A-share
 work. Update it as phases land.
+
+---
+
+## Phase A.7 — Source-Specific SLA Gate (next, before Phase B)
+
+**Goal:** the freshness gate is currently a single daily threshold. The
+A.6 rewrite gave every production group its own health row, but
+production code still asks "is `latest_date == latest trading day`?"
+For weekly / quarterly sources (fundamental, quality, shareholder,
+st_holder_number) that question is wrong. The gate would reject
+forever between disclosure windows; the workaround would be to mark
+them non-critical and stop checking — back to the silent-stale problem
+A.6 just closed.
+
+**Gate to exit A.7:** every `PRODUCTION_GROUP_TO_HEALTH_SOURCE` entry
+carries a declared `frequency` (`daily | weekly | quarterly`) and a
+`max_age_trading_days` budget; `is_fresh` reads those instead of a
+single global threshold; training / prediction promotion gate uses
+them to declare each source `fresh | stale | exempt`; and a
+docs/sla_gate_audit_20260607.md is signed off.
+
+Implementation outline:
+- New `config/data_sla.py` with a dict like
+  ```
+  SLA_BY_SOURCE = {
+      "qlib_data_update":      ("daily",     1),
+      "fund_flow_update":      ("daily",     1),
+      "northbound_update":     ("daily",     1),
+      "regime_daily_update":   ("daily",     1),
+      "valuation_update":      ("daily",     1),
+      "fundamental_update":    ("weekly",    7),
+      "quality_update":        ("weekly",    7),
+      "shareholder_update":    ("quarterly", 65),
+      "st_holder_number_update": ("quarterly", 65),
+      ...
+  }
+  ```
+- `scheduler/data_health.is_fresh` accepts a source name and looks up
+  the SLA tuple rather than a single global age budget.
+- Training promotion gate / serving freshness gate report per-source
+  status as (`fresh | stale | exempt`).
+- Audit doc + per-source pre/post replay.
