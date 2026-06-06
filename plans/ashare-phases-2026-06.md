@@ -836,7 +836,14 @@ hang to **11:14 wall, 5 recommendations produced**
     cron at 18:00.
   - C.6 (L6) 60-90 day backfill + ablation — deferred until C.4 lives
     in production.
-- ⏸ Phase D / E — gated behind Phase B + C verdict.
+- 🔄 Phase D (supply-chain quality):
+  - D.1 (SC-A1) `scripts/build_global_chain_factors.py` splits
+    `global_chain_alpha` into `company_level_alpha` +
+    `industry_level_alpha` with industry-level zscore × 0.2 ×
+    clip[±3]. 6 tests. Companion `level` column tags rows so
+    downstream can pick. D.2 (SC-A2 LLM relation extraction) +
+    D.3 (SC-A3 edge YAML ABCD grading) remain pending.
+- ⏸ Phase E — gated behind Phase B + C verdict.
 
 Read this doc — not the chat history — when you come back to A-share
 work. Update it as phases land.
