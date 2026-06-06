@@ -106,24 +106,29 @@ def _load_events_via_eventstore(start_dt: datetime, end_dt: datetime) -> pd.Data
 
 
 def load_events(lookback_days: int = 30, as_of: str = None,
-                source: str = "jsonl", allow_fallback: bool = False) -> pd.DataFrame:
-    """Load LLM-extracted events from V2/V1 JSONL (default) or EventStore.
+                source: str = "eventstore", allow_fallback: bool = False) -> pd.DataFrame:
+    """Load LLM-extracted events from EventStore (default) or JSONL.
 
-    source: "jsonl" (default, current production behavior) or "eventstore".
+    2026-06-06: default flipped from "jsonl" to "eventstore" after the
+    project lead's data-pipeline architecture critique. JSONL groups
+    events by *file_date* (the day the extractor ran), so a re-extraction
+    inflates counts and shifts the time bucket; EventStore groups by
+    *signal_date* (the next business day after publish time = the first
+    actionable trading day), which is the PIT-safe semantic the rest
+    of the pipeline assumes.
+
+    source: "eventstore" (default — PIT-safe, signal_date semantics) or
+        "jsonl" (legacy, file_date semantics; kept for debug / backfill).
     allow_fallback: when source="eventstore" and the EventStore query is empty
         or fails, return jsonl results instead of raising. Default False so
         IC backtests can't be silently contaminated — if you ask for
         EventStore, you must get EventStore or a clear failure.
 
-    EventStore and JSONL paths use DIFFERENT time semantics for the lookback
-    window: JSONL groups by file_date (the day the extractor ran), while
-    EventStore groups by signal_date (the next business day after publish
-    time = first actionable trading day). On 2026-05-29 production data the
-    two paths produce wildly different factor distributions (sentiment_score
-    mean differs by 17000%, only ~24% stock overlap) because re-extractions
-    inflate JSONL counts while EventStore's BDay roll changes the time
-    bucket. Until backtest validates which path gives better IC, jsonl
-    remains the default so factor behavior stays unchanged.
+    Distribution caveat: on 2026-05-29 production data the two paths
+    produced wildly different factor distributions (sentiment_score
+    mean differed by 17000%, only ~24% stock overlap). After the flip,
+    a one-time IC backtest comparing the two profiles is required
+    before locking eventstore in for ablation runs.
 
     Args:
         lookback_days: number of past days to include
@@ -217,7 +222,7 @@ def parse_publish_date(publish_time_str: str) -> str | None:
 
 
 def build_factors(signal_date: str = None, lookback_days: int = 30,
-                  source: str = "jsonl", allow_fallback: bool = False) -> pd.DataFrame:
+                  source: str = "eventstore", allow_fallback: bool = False) -> pd.DataFrame:
     """Build LLM event factors for a given signal date.
 
     PIT-safe: only uses events with publish_time <= signal_date.
@@ -225,7 +230,7 @@ def build_factors(signal_date: str = None, lookback_days: int = 30,
     Args:
         signal_date: YYYY-MM-DD (default: today)
         lookback_days: days of history to consider
-        source: "jsonl" (default) or "eventstore"
+        source: "eventstore" (default, 2026-06-06 flip) or "jsonl" (legacy)
 
     Returns:
         DataFrame indexed by qlib_code with factor columns
@@ -377,7 +382,7 @@ _ALLOWED_FACTOR_SOURCES = ("jsonl", "eventstore")
 def resolve_llm_event_factor_source(
     explicit: str | None = None,
     *,
-    default: str = "jsonl",
+    default: str = "eventstore",
 ) -> str:
     """Single resolver for the LLM event factor source.
 
@@ -422,17 +427,20 @@ def build_factors_range(
     start_date: str = None,
     end_date: str = None,
     lookback_days: int = 30,
-    source: str = "jsonl",
+    source: str = "eventstore",
     allow_fallback: bool = False,
 ) -> pd.DataFrame:
-    # 2026-06-04 cx round 17 P1-3: REVERTED to ``jsonl`` default per
-    # cx feedback. cx round 16 P1-1 flipped this to ``eventstore``,
-    # but the CLI help block in main() still warned EventStore was
-    # "not for live production" and would change the factor
-    # distribution ~100x. Silently flipping the source is exactly the
-    # silent factor/model distribution change the contract gate
-    # exists to prevent. Switch only via explicit env var until a
-    # head-to-head IC + backtest is on file proving parity (or wins).
+    # 2026-06-06: flipped default back to "eventstore" after the project
+    # lead's data-pipeline architecture critique. JSONL groups by
+    # file_date which is mis-PIT relative to the rest of the pipeline;
+    # EventStore groups by signal_date (next business day after
+    # publish_time) which matches what every other overlay assumes.
+    # cx round 17 P1-3 reverted this on 2026-06-04 to "jsonl" because
+    # the parquet contract didn't yet declare the source, so a silent
+    # 100x distribution change could ship without ablation evidence.
+    # The contract gate now records source under "extra", so the flip
+    # is no longer silent — callers can still pass source="jsonl"
+    # explicitly for back-compat backfills.
     """Build factors for a date range and save to parquet.
 
     Args:

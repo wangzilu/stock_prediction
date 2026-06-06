@@ -206,19 +206,35 @@ def _is_recent_news(publish_time: str, *, max_age_days: int = _NEWS_RECENCY_DAYS
     return age <= max_age_days
 
 
-def collect_news_for_stock(code: str, name: str, max_items: int = 10) -> list[dict]:
+def collect_news_for_stock(code: str, name: str, max_items: int = 10,
+                            target_date: str | None = None) -> list[dict]:
     """Collect recent news for a single stock via AKShare.
 
     Args:
         code: 6-digit stock code, e.g. '600519'
         name: stock name for logging
         max_items: max news items to return
+        target_date: YYYY-MM-DD reference date for recency check.
+            Default None → uses datetime.now(), which is correct for
+            live cron runs but WRONG for historical backfills.
+            2026-06-06 fix: backfills (``--date 2026-05-10``) now pass
+            target_date so news within max_age_days of THAT date are
+            kept, not within max_age_days of today.
 
     Returns:
         List of news dicts with standardized fields. Items older than
         ``_NEWS_RECENCY_DAYS`` are dropped at this layer (cx round 4
         P0-2) so the LLM never sees 60%+ stale news fan-out.
     """
+    # 2026-06-06 P1 fix: thread the per-call reference date into the
+    # recency check so historical backfills are not contaminated by
+    # "today" - 7d cutoff.
+    _now_ref = None
+    if target_date:
+        try:
+            _now_ref = datetime.strptime(target_date, "%Y-%m-%d")
+        except ValueError:
+            _now_ref = None
     # Try ST_CLIENT news first (anns_d for announcements)
     try:
         from ST_CLIENT import StockToday
@@ -232,7 +248,7 @@ def collect_news_for_stock(code: str, name: str, max_items: int = 10) -> list[di
                 records = []
                 for item in result:
                     pub = str(item.get("ann_date", ""))
-                    if not _is_recent_news(pub):
+                    if not _is_recent_news(pub, now=_now_ref):
                         continue
                     records.append({
                         "stock_code": code,
@@ -287,7 +303,7 @@ def collect_news_for_stock(code: str, name: str, max_items: int = 10) -> list[di
         records = []
         for item in articles:
             pub = item.get("date", "")
-            if not _is_recent_news(pub):
+            if not _is_recent_news(pub, now=_now_ref):
                 continue
             title = item.get("title", "").replace("<em>", "").replace("</em>", "")
             content = item.get("content", "").replace("<em>", "").replace("</em>", "")
@@ -386,7 +402,10 @@ def collect_daily_news(
     results_lock = threading.Lock()
 
     def _fetch_one(stock):
-        items = collect_news_for_stock(stock["code"], stock["name"], max_items=3)
+        items = collect_news_for_stock(
+            stock["code"], stock["name"], max_items=3,
+            target_date=target_date,
+        )
         for item in items:
             item["qlib_code"] = stock["qlib_code"]
             item["collect_date"] = target_date
