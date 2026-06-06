@@ -224,6 +224,8 @@ def save_with_merge(new_df: pd.DataFrame, out: Path, dedup_cols: list[str], labe
 
 
 def main():
+    from scheduler.data_health import HealthStatus, write_health
+
     parser = argparse.ArgumentParser(description="Fetch daily factors via ST_CLIENT")
     parser.add_argument("--days", type=int, default=60, help="Number of recent trading days")
     parser.add_argument("--start", type=str, default="", help="Start date YYYYMMDD")
@@ -248,22 +250,64 @@ def main():
         trade_dates = trade_dates[-args.days:]
     logger.info(f"Trade dates: {len(trade_dates)}")
 
-    # Fetch daily_basic
-    logger.info("Fetching daily_basic...")
-    db = fetch_daily_basic(st, trade_dates)
-    if not db.empty:
-        out = DATA_DIR / "st_daily_basic.parquet"
-        save_with_merge(db, out, ["qlib_code", "date"], "daily_basic")
+    try:
+        # Fetch daily_basic
+        logger.info("Fetching daily_basic...")
+        db = fetch_daily_basic(st, trade_dates)
+        if not db.empty:
+            out = DATA_DIR / "st_daily_basic.parquet"
+            save_with_merge(db, out, ["qlib_code", "date"], "daily_basic")
+            write_health("st_daily_basic_update", HealthStatus(
+                success=True,
+                n_items=len(db),
+                latest_date=str(db["date"].max()) if "date" in db.columns else "",
+                network_profile="domestic",
+            ))
+        else:
+            write_health("st_daily_basic_update", HealthStatus(
+                success=False,
+                error_type="NoData",
+                error_message="daily_basic returned empty",
+                network_profile="domestic",
+            ))
 
-    # Fetch moneyflow
-    if not args.skip_moneyflow:
-        logger.info("Fetching moneyflow...")
-        mf = fetch_moneyflow(st, trade_dates)
-        if not mf.empty:
-            out = DATA_DIR / "st_moneyflow.parquet"
-            save_with_merge(mf, out, ["qlib_code", "date"], "moneyflow")
+        # Fetch moneyflow
+        if not args.skip_moneyflow:
+            logger.info("Fetching moneyflow...")
+            mf = fetch_moneyflow(st, trade_dates)
+            if not mf.empty:
+                out = DATA_DIR / "st_moneyflow.parquet"
+                save_with_merge(mf, out, ["qlib_code", "date"], "moneyflow")
+                write_health("st_moneyflow_update", HealthStatus(
+                    success=True,
+                    n_items=len(mf),
+                    latest_date=str(mf["date"].max()) if "date" in mf.columns else "",
+                    network_profile="domestic",
+                ))
+            else:
+                write_health("st_moneyflow_update", HealthStatus(
+                    success=False,
+                    error_type="NoData",
+                    error_message="moneyflow returned empty",
+                    network_profile="domestic",
+                ))
 
-    logger.info("Done!")
+        logger.info("Done!")
+    except Exception as e:
+        write_health("st_daily_basic_update", HealthStatus(
+            success=False,
+            error_type=type(e).__name__,
+            error_message=str(e)[:200],
+            network_profile="domestic",
+        ))
+        if not args.skip_moneyflow:
+            write_health("st_moneyflow_update", HealthStatus(
+                success=False,
+                error_type=type(e).__name__,
+                error_message=str(e)[:200],
+                network_profile="domestic",
+            ))
+        raise
 
 
 if __name__ == "__main__":

@@ -99,3 +99,36 @@ def test_shadow_pool_disjoint_from_production():
         f"SHADOW_SUPPLEMENTARY_GROUPS and PRODUCTION_SUPPLEMENTARY_GROUPS "
         f"overlap on {overlap}. Promote or demote — do not list in both."
     )
+
+
+def test_production_groups_have_real_health_sources():
+    """Every production group should map to its own collector health row.
+
+    A6-6 regression guard: piggybacking unrelated groups on
+    qlib_data_update (or valuation_update) makes freshness gates green
+    while the actual parquet can be stale.
+    """
+    from scheduler.data_health import PRODUCTION_GROUP_TO_HEALTH_SOURCE
+
+    expected = {
+        "fundamental": "fundamental_update",
+        "capital_flow": "fund_flow_update",
+        "macro_zero_baseline": "qlib_data_update",
+        "shareholder": "shareholder_update",
+        "valuation": "valuation_update",
+        "northbound": "northbound_update",
+        "quality": "quality_update",
+        "st_daily_basic": "st_daily_basic_update",
+        "st_moneyflow": "st_moneyflow_update",
+        "st_holder_number": "st_holder_number_update",
+        "cross_market_regime": "regime_daily_update",
+    }
+    active = {
+        group: PRODUCTION_GROUP_TO_HEALTH_SOURCE.get(group)
+        for group in PRODUCTION_SUPPLEMENTARY_GROUPS
+    }
+    assert active == {
+        group: source
+        for group, source in expected.items()
+        if group in PRODUCTION_SUPPLEMENTARY_GROUPS
+    }

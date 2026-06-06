@@ -1385,6 +1385,7 @@ def _main_inner(args: argparse.Namespace) -> int:
     )
     if not start_by_code:
         logger.info("No symbols need updating")
+        latest_date = current_calendar[-1] if current_calendar else args.end_date
         if not args.skip_health_check:
             if not validate_qlib_health(
                 args.qlib_dir,
@@ -1393,6 +1394,14 @@ def _main_inner(args: argparse.Namespace) -> int:
                 min_instruments=args.min_health_instruments,
                 lookback_days=args.health_lookback_days,
             ):
+                write_health("qlib_data_update", HealthStatus(
+                    success=False,
+                    error_type="HealthCheckFail",
+                    error_message=f"no-op validation failed for universe={args.universe}",
+                    n_items=0,
+                    latest_date=latest_date,
+                    network_profile="domestic",
+                ))
                 return 1
             if not validate_qlib_health(
                 args.qlib_dir,
@@ -1401,12 +1410,41 @@ def _main_inner(args: argparse.Namespace) -> int:
                 min_instruments=args.min_lgb_data_instruments,
                 lookback_days=args.health_lookback_days,
             ):
+                write_health("qlib_data_update", HealthStatus(
+                    success=False,
+                    error_type="HealthCheckFail",
+                    error_message=f"no-op validation failed for universe={args.lgb_health_universe}",
+                    n_items=0,
+                    latest_date=latest_date,
+                    network_profile="domestic",
+                ))
                 return 1
         if args.lgb_smoke_check and not validate_lgb_smoke(
             args.qlib_dir,
             min_predictions=LGB_MIN_PREDICTIONS,
         ):
+            write_health("qlib_data_update", HealthStatus(
+                success=False,
+                error_type="LGBSmokeFail",
+                error_message="no-op LGB smoke check failed",
+                n_items=0,
+                latest_date=latest_date,
+                network_profile="domestic",
+            ))
             return 1
+        write_health("qlib_data_update", HealthStatus(
+            success=True,
+            n_items=len(codes),
+            latest_date=latest_date,
+            network_profile="domestic",
+            extra={
+                "mode": mode,
+                "provider": args.provider,
+                "universe": args.universe,
+                "universe_source": universe_selection.source,
+                "noop": True,
+            },
+        ))
         return 0
     logger.info("Symbols needing data: %s/%s", len(start_by_code), len(codes))
 

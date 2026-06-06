@@ -22,6 +22,8 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -430,8 +432,30 @@ def main():
                         help="[DEPRECATED] Use V1 extractor (LLM-predicted impacts)")
     args = parser.parse_args()
 
-    success = run_pipeline(target_date=args.date, use_portfolio=args.portfolio,
+    target_date = args.date or datetime.now().strftime("%Y-%m-%d")
+    success = run_pipeline(target_date=target_date, use_portfolio=args.portfolio,
                            use_legacy_v1=args.legacy)
+    try:
+        from scheduler.data_health import HealthStatus, write_health
+        factors_path = PROJECT_ROOT / "data" / "storage" / "llm_event_factors.parquet"
+        n_items = 0
+        if factors_path.exists():
+            try:
+                df = pd.read_parquet(factors_path)
+                n_items = len(df)
+            except Exception:
+                n_items = 0
+        write_health("llm_event_pipeline", HealthStatus(
+            success=bool(success),
+            partial=not bool(success),
+            n_items=n_items,
+            latest_date=target_date if success else "",
+            error_type="" if success else "PipelineFailed",
+            error_message="" if success else "LLM event pipeline returned False",
+            network_profile="llm",
+        ))
+    except Exception as health_exc:
+        logger.warning("write_health(llm_event_pipeline) failed: %s", health_exc)
     sys.exit(0 if success else 1)
 
 

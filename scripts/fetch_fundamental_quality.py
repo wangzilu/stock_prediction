@@ -163,20 +163,47 @@ def fetch_quality(codes: list) -> pd.DataFrame:
 
 
 def main():
+    from scheduler.data_health import HealthStatus, write_health
+
     parser = argparse.ArgumentParser(description="Fetch fundamental quality factors")
     parser.add_argument("--top", type=int, default=None)
     args = parser.parse_args()
 
-    codes = get_all_stock_codes(top_n=args.top)
-    df = fetch_quality(codes)
+    try:
+        codes = get_all_stock_codes(top_n=args.top)
+        df = fetch_quality(codes)
 
-    if not df.empty:
-        OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(OUTPUT_PATH, index=False)
-        logger.info(f"Saved to {OUTPUT_PATH}")
-        logger.info(f"  Stocks: {df['qlib_code'].nunique()}")
+        if not df.empty:
+            OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            df.to_parquet(OUTPUT_PATH, index=False)
+            n_codes = int(df["qlib_code"].nunique()) if "qlib_code" in df.columns else 0
+            logger.info(f"Saved to {OUTPUT_PATH}")
+            logger.info(f"  Stocks: {n_codes}")
+            write_health("quality_update", HealthStatus(
+                success=True,
+                n_items=len(df),
+                latest_date=str(df["stat_date"].max()) if "stat_date" in df.columns else "",
+                coverage=n_codes / max(len(codes), 1),
+                network_profile="domestic",
+            ))
+        else:
+            write_health("quality_update", HealthStatus(
+                success=False,
+                error_type="NoData",
+                error_message="No quality data fetched",
+                network_profile="domestic",
+            ))
+            raise RuntimeError("No quality data fetched")
 
-    logger.info("Done!")
+        logger.info("Done!")
+    except Exception as exc:
+        write_health("quality_update", HealthStatus(
+            success=False,
+            error_type=type(exc).__name__,
+            error_message=str(exc)[:200],
+            network_profile="domestic",
+        ))
+        raise
 
 
 if __name__ == "__main__":

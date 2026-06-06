@@ -25,6 +25,28 @@ NEWS_DIR = DATA_DIR / "global_industry_news"
 EVENTS_DIR = DATA_DIR / "global_chain_events"
 
 
+def _write_extract_health(
+    *,
+    success: bool,
+    date: str,
+    n_items: int = 0,
+    error_type: str = "",
+    error_message: str = "",
+) -> None:
+    try:
+        from scheduler.data_health import HealthStatus, write_health
+        write_health("global_chain_extract", HealthStatus(
+            success=success,
+            n_items=n_items,
+            latest_date=date if success else "",
+            error_type=error_type,
+            error_message=error_message[:200],
+            network_profile="none",
+        ))
+    except Exception:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"))
@@ -34,7 +56,13 @@ def main():
     news_path = NEWS_DIR / f"{date}.jsonl"
     if not news_path.exists():
         logger.info(f"No global news for {date}, skipping")
-        return
+        _write_extract_health(
+            success=False,
+            date=date,
+            error_type="MissingInput",
+            error_message=f"No global news file: {news_path}",
+        )
+        sys.exit(1)
 
     # Load news
     news_items = []
@@ -47,12 +75,26 @@ def main():
     logger.info(f"Loaded {len(news_items)} news items for {date}")
 
     if not news_items:
-        return
+        _write_extract_health(
+            success=False,
+            date=date,
+            error_type="EmptyInput",
+            error_message=f"Global news file has zero items: {news_path}",
+        )
+        sys.exit(1)
 
     # Extract events
     from factors.global_supply_chain_extractor import batch_extract
     events = batch_extract(news_items)
     logger.info(f"Extracted {len(events)} structured events")
+    if not events:
+        _write_extract_health(
+            success=False,
+            date=date,
+            error_type="NoEvents",
+            error_message="No structured supply-chain events extracted",
+        )
+        sys.exit(1)
 
     # Save
     EVENTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -64,15 +106,7 @@ def main():
 
     logger.info(f"Saved to {out_path}")
 
-    # Write health
-    try:
-        from scheduler.data_health import write_health, HealthStatus
-        write_health("global_chain_extract", HealthStatus(
-            success=True, n_items=len(events), latest_date=date,
-            network_profile="none",
-        ))
-    except Exception:
-        pass
+    _write_extract_health(success=True, n_items=len(events), date=date)
 
 
 if __name__ == "__main__":

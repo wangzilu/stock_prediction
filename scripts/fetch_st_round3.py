@@ -35,6 +35,26 @@ URLS = ["http://111.229.164.2:8083/", "https://tushare.citydata.club/"]
 NO_PROXY = {"http": None, "https": None}
 
 
+def _write_health(source: str, *, success: bool, n_items: int = 0,
+                  latest_date: str = "", coverage: float = 0.0,
+                  error_type: str = "", error_message: str = "") -> None:
+    """Write data-health for endpoints that are production feature sources."""
+    try:
+        from scheduler.data_health import HealthStatus, write_health
+        write_health(source, HealthStatus(
+            success=success,
+            n_items=n_items,
+            latest_date=latest_date,
+            coverage=coverage,
+            error_type=error_type,
+            error_message=error_message[:200],
+            network_profile="domestic",
+            partial=not success,
+        ))
+    except Exception as exc:
+        logger.warning("write_health(%s) failed: %s", source, exc)
+
+
 def get_token():
     from config.settings import ST_TOKEN
     return ST_TOKEN
@@ -108,9 +128,10 @@ def save_parquet(df, path, dedup_cols):
     logger.info(f"  Saved: {path.name} ({len(df)} rows)")
 
 
-def fetch_by_stock(codes, endpoint, output_path, dedup_cols, label, checkpoint=200):
+def fetch_by_stock(codes, endpoint, output_path, dedup_cols, label,
+                   checkpoint=200, force=False):
     existing = set()
-    if output_path.exists():
+    if output_path.exists() and not force:
         try:
             old = pd.read_parquet(output_path, columns=["ts_code"])
             existing = set(old["ts_code"].unique())
@@ -120,7 +141,8 @@ def fetch_by_stock(codes, endpoint, output_path, dedup_cols, label, checkpoint=2
     todo = [c for c in codes if qlib_to_ts(c) not in existing]
     if not todo:
         logger.info(f"  {label}: all {len(codes)} stocks done, skipping")
-        return
+        final = pd.read_parquet(output_path) if output_path.exists() else pd.DataFrame()
+        return final, 0, 0
     logger.info(f"  {label}: {len(todo)} to fetch (skipped {len(codes)-len(todo)})")
 
     all_dfs = []
@@ -160,6 +182,8 @@ def fetch_by_stock(codes, endpoint, output_path, dedup_cols, label, checkpoint=2
     if output_path.exists():
         final = pd.read_parquet(output_path)
         logger.info(f"  {label} total: {len(final)} rows, {final['ts_code'].nunique()} stocks")
+        return final, ok, fail
+    return pd.DataFrame(), ok, fail
 
 
 def fetch_index_classify():
@@ -203,6 +227,8 @@ def main():
     parser.add_argument("--only", type=str, default="",
                         help="Comma-separated: stk_holdernumber,daily_basic,pledge_stat,index")
     parser.add_argument("--top", type=int, default=None)
+    parser.add_argument("--force", action="store_true",
+                        help="Refetch stocks even if they already exist in the parquet")
     args = parser.parse_args()
 
     selected = set(s.strip() for s in args.only.split(",")) if args.only else None
@@ -211,21 +237,54 @@ def main():
 
     if not selected or "stk_holdernumber" in selected:
         logger.info("=== stk_holdernumber (股东户数) ===")
-        fetch_by_stock(codes, "stk_holdernumber",
-                       DATA_DIR / "st_holder_number.parquet",
-                       ["ts_code", "end_date"], "stk_holdernumber")
+        try:
+            df, ok, fail = fetch_by_stock(
+                codes, "stk_holdernumber",
+                DATA_DIR / "st_holder_number.parquet",
+                ["ts_code", "end_date"], "stk_holdernumber",
+                force=args.force,
+            )
+            if df.empty:
+                _write_health(
+                    "st_holder_number_update",
+                    success=False,
+                    error_type="NoData",
+                    error_message="stk_holdernumber produced no rows",
+                )
+                raise RuntimeError("stk_holdernumber produced no rows")
+            latest_col = "ann_date" if "ann_date" in df.columns else "end_date"
+            n_codes = int(df["ts_code"].nunique()) if "ts_code" in df.columns else 0
+            _write_health(
+                "st_holder_number_update",
+                success=n_codes > 0,
+                n_items=len(df),
+                latest_date=str(df[latest_col].max()) if latest_col in df.columns else "",
+                coverage=n_codes / max(len(codes), 1),
+                error_type="" if n_codes > 0 else "NoCoverage",
+                error_message="" if n_codes > 0 else f"0/{len(codes)} stocks covered",
+            )
+        except Exception as exc:
+            _write_health(
+                "st_holder_number_update",
+                success=False,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
+            raise
 
     if not selected or "daily_basic" in selected:
         logger.info("=== daily_basic (PE/PB/PS/换手/市值) ===")
         fetch_by_stock(codes, "daily_basic",
                        DATA_DIR / "st_daily_basic.parquet",
-                       ["ts_code", "trade_date"], "daily_basic")
+                       ["ts_code", "trade_date"], "daily_basic",
+                       force=args.force)
 
     if not selected or "pledge_stat" in selected:
         logger.info("=== pledge_stat (股权质押) ===")
         fetch_by_stock(codes, "pledge_stat",
                        DATA_DIR / "st_pledge_stat.parquet",
-                       ["ts_code", "end_date"], "pledge_stat")
+                       ["ts_code", "end_date"], "pledge_stat",
+                       force=args.force)
 
     if not selected or "index" in selected:
         fetch_index_classify()

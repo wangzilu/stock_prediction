@@ -107,11 +107,13 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
     if (scripts / "extract_global_supply_chain_events.py").exists():
         jobs.append(CronJob("global_chain_extract", "50 16 * * 1-5",
                 [py, str(scripts / "extract_global_supply_chain_events.py")], "global_chain_extract.log",
-                network="none", timeout_sec=600))
+                network="none", timeout_sec=600,
+                enforce_deps=True, dep_wait_seconds=3600))
     if (scripts / "build_global_chain_factors.py").exists():
         jobs.append(CronJob("global_chain_factors", "10 17 * * 1-5",
                 [py, str(scripts / "build_global_chain_factors.py")], "global_chain_factors.log",
-                network="none", timeout_sec=600))
+                network="none", timeout_sec=600,
+                enforce_deps=True, dep_wait_seconds=3600))
     # Sentiment: xueqiu + 同花顺 + 东财股吧
     if (scripts / "collect_sentiment_daily.py").exists():
         jobs.append(CronJob("sentiment_daily", "40 16 * * 1-5",
@@ -159,10 +161,27 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                 [py, str(scripts / "fetch_fund_flow_history.py"), "--incremental", "--workers", "1"],
                 "fund_flow_update.log",
                 network="domestic", timeout_sec=1800),
+        CronJob("st_daily_factors_update", "58 17 * * 1-5",
+                [py, str(scripts / "fetch_st_daily_factors.py"), "--days", "60"],
+                "st_daily_factors_update.log",
+                network="domestic", timeout_sec=1800),
+        # st_holder_number is quarterly, but it is a production feature
+        # source distinct from shareholder_features.parquet. Refresh weekly
+        # with --force so new announcements are not skipped merely because
+        # an older ts_code row already exists.
+        CronJob("st_holder_number_update", "30 6 * * 6",
+                [py, str(scripts / "fetch_st_round3.py"),
+                 "--only", "stk_holdernumber", "--force"],
+                "st_holder_number_update.log",
+                network="domestic", timeout_sec=7200),
         CronJob("valuation_update", "0 18 * * 1-5",
                 [py, str(scripts / "fetch_fundamental_valuation.py"), "--days", "10", "--incremental"],
                 "valuation_update.log",
                 network="domestic", timeout_sec=1200),
+        CronJob("shareholder_update", "2 18 * * 1-5",
+                [py, str(scripts / "fetch_shareholder_data.py")],
+                "shareholder_update.log",
+                network="domestic", timeout_sec=3600),
         CronJob("regime_daily_update", "5 18 * * 1-5",
                 [py, str(scripts / "update_regime_daily.py")], "regime_daily.log",
                 network="domestic", timeout_sec=1200),
@@ -263,6 +282,14 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("weekly_mask_rebuild", "10 3 * * 6",
                 [py, str(scripts / "build_tradable_mask.py")], "mask_rebuild.log",
                 network="none", timeout_sec=600),
+        CronJob("fundamental_update", "0 5 * * 6",
+                [py, str(scripts / "fetch_fundamental_features.py")],
+                "fundamental_update.log",
+                network="domestic", timeout_sec=7200),
+        CronJob("quality_update", "30 5 * * 6",
+                [py, str(scripts / "fetch_fundamental_quality.py")],
+                "quality_update.log",
+                network="domestic", timeout_sec=7200),
         CronJob("weekly_regime_data", "20 3 * * 6",
                 [py, str(scripts / "fetch_fund_holdings.py"), "--macro", "--regime"], "regime_data.log",
                 network="domestic", timeout_sec=3600),

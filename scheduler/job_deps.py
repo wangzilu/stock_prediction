@@ -36,7 +36,12 @@ JOB_DEPS: dict[str, list[str]] = {
     "llm_retry_queue_drain": ["llm_event_pipeline"],
     # ---- Post-data-update processing -------------------------------------
     "fund_flow_update": ["qlib_data_update"],
+    "st_daily_factors_update": ["qlib_data_update"],
+    "st_holder_number_update": [],
+    "fundamental_update": [],
     "valuation_update": ["qlib_data_update"],
+    "quality_update": [],
+    "shareholder_update": ["qlib_data_update"],
     "regime_daily_update": ["qlib_data_update"],
     "global_chain_extract": ["global_industry_news"],
     "global_chain_factors": ["global_chain_extract"],
@@ -52,11 +57,10 @@ JOB_DEPS: dict[str, list[str]] = {
     "feature_cache_rebuild": [
         "qlib_data_update",
         "fund_flow_update",
+        "st_daily_factors_update",
         "valuation_update",
+        "shareholder_update",
         "regime_daily_update",
-        # fetch_shareholder_data + cross_market_regime should also
-        # be deps once those become cron-driven jobs writing health
-        # records. Add here when ready (placeholder TODO).
     ],
     # ---- Training and inference depend on fresh cache --------------------
     "midweek_train": ["feature_cache_rebuild"],

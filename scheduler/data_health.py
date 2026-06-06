@@ -398,16 +398,16 @@ CRITICAL_SOURCES = [
 # features without the gate noticing. ``validate_production_feature_coverage``
 # below cross-checks at startup.
 PRODUCTION_GROUP_TO_HEALTH_SOURCE: dict[str, str] = {
-    "fundamental": "qlib_data_update",       # piggybacks qlib daily update
+    "fundamental": "fundamental_update",
     "capital_flow": "fund_flow_update",
     "macro_zero_baseline": "qlib_data_update",  # zero-baseline, no fresh source needed
-    "shareholder": "qlib_data_update",        # TODO #91: separate fetch_shareholder_data job
+    "shareholder": "shareholder_update",
     "valuation": "valuation_update",
-    "northbound": "qlib_data_update",         # TODO: separate hk_hold fetch
-    "quality": "valuation_update",             # quality lives in valuation parquet
-    "st_daily_basic": "qlib_data_update",
-    "st_moneyflow": "qlib_data_update",
-    "st_holder_number": "qlib_data_update",
+    "northbound": "northbound_update",
+    "quality": "quality_update",
+    "st_daily_basic": "st_daily_basic_update",
+    "st_moneyflow": "st_moneyflow_update",
+    "st_holder_number": "st_holder_number_update",
     "cross_market_regime": "regime_daily_update",
 }
 

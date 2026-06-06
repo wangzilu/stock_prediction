@@ -131,19 +131,45 @@ def fetch_shareholder(codes: list) -> pd.DataFrame:
 
 
 def main():
+    from scheduler.data_health import HealthStatus, write_health
+
     parser = argparse.ArgumentParser(description="Fetch shareholder data")
     parser.add_argument("--top", type=int, default=None)
     args = parser.parse_args()
 
-    codes = get_all_stock_codes(top_n=args.top)
-    df = fetch_shareholder(codes)
+    try:
+        codes = get_all_stock_codes(top_n=args.top)
+        df = fetch_shareholder(codes)
 
-    if not df.empty:
-        OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(OUTPUT_PATH, index=False)
-        logger.info(f"Saved to {OUTPUT_PATH}")
+        if not df.empty:
+            OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            df.to_parquet(OUTPUT_PATH, index=False)
+            logger.info(f"Saved to {OUTPUT_PATH}")
+            write_health("shareholder_update", HealthStatus(
+                success=True,
+                n_items=len(df),
+                latest_date=str(df["stat_date"].max()) if "stat_date" in df.columns else "",
+                network_profile="domestic",
+                coverage=len(df) / max(len(codes), 1),
+            ))
+        else:
+            write_health("shareholder_update", HealthStatus(
+                success=False,
+                error_type="NoData",
+                error_message="No shareholder data fetched",
+                network_profile="domestic",
+            ))
+            raise RuntimeError("No shareholder data fetched")
 
-    logger.info("Done!")
+        logger.info("Done!")
+    except Exception as e:
+        write_health("shareholder_update", HealthStatus(
+            success=False,
+            error_type=type(e).__name__,
+            error_message=str(e)[:200],
+            network_profile="domestic",
+        ))
+        raise
 
 
 if __name__ == "__main__":

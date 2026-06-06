@@ -4,6 +4,7 @@ import os
 import logging
 import math
 import json
+import re
 from dataclasses import is_dataclass, replace
 from datetime import datetime, timedelta
 
@@ -50,6 +51,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 HORIZON_BUCKET_SIZE = 3
+_DATE_IN_FILENAME_RE = re.compile(r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})")
 
 
 def _finite_float(value, default=0.0):
@@ -73,6 +75,14 @@ def _sanitize_push_text(text: str) -> str:
     for source, target in replacements.items():
         cleaned = cleaned.replace(source, target)
     return cleaned
+
+
+def _date_from_filename(path) -> str | None:
+    """Extract YYYY-MM-DD from a filename, returning None when absent."""
+    match = _DATE_IN_FILENAME_RE.search(getattr(path, "stem", str(path)))
+    if not match:
+        return None
+    return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
 
 
 class DailyPipeline:
@@ -1228,11 +1238,20 @@ class DailyPipeline:
             if dt in dates:
                 snap = df.xs(dt, level="datetime")
             else:
-                latest = dates.max()
-                age = (dt - latest).days
-                if age > 2:
+                valid_dates = dates[dates <= dt]
+                if len(valid_dates) == 0:
                     logger.warning(
-                        "Chain factors stale (%s, %d days) — skipping chain block in sanitizer",
+                        "No chain factors available on or before %s — skipping chain block in sanitizer",
+                        today,
+                    )
+                    cache_map[today] = None
+                    return None
+                latest = valid_dates.max()
+                from scheduler.data_health import trading_day_age
+                age = trading_day_age(str(latest.date()), today)
+                if age is None or age > 2:
+                    logger.warning(
+                        "Chain factors stale (%s, %s trading days) — skipping chain block in sanitizer",
                         latest.date(), age,
                     )
                     cache_map[today] = None
@@ -2274,15 +2293,32 @@ class DailyPipeline:
         all_news = self.macro_collector.fetch_all(max_per_source=15)
         headlines = [item.get("title", "") for item in all_news if item.get("title")]
 
-        # MacroCollector returns [] in domestic profile (proxy unavailable). Fall back
-        # to the daily global_industry_news collection (cron 16:25, --network global).
+        # MacroCollector returns [] in domestic profile (proxy unavailable).
+        # Fall back only to as-of macro/policy news. Supply-chain news
+        # (global_industry_news) is not a macro/geo source and must not be
+        # used here.
         if not headlines:
             from pathlib import Path
             from config.settings import DATA_DIR
             import json as _json_gn
-            gn_dir = DATA_DIR / "global_industry_news"
+            target = getattr(self, "_pipeline_target_date", None) or datetime.now().strftime("%Y-%m-%d")
+            target_ts = pd.Timestamp(target)
+            gn_dir = DATA_DIR / "macro_policy_news"
             if gn_dir.exists():
-                candidates = sorted(gn_dir.glob("*.jsonl"), reverse=True)[:3]
+                candidates = []
+                for path in gn_dir.glob("*.jsonl"):
+                    file_date = _date_from_filename(path)
+                    if not file_date:
+                        continue
+                    file_ts = pd.Timestamp(file_date)
+                    if file_ts > target_ts:
+                        continue
+                    from scheduler.data_health import trading_day_age
+                    age = trading_day_age(file_date, target)
+                    if age is None or age > 1:
+                        continue
+                    candidates.append(path)
+                candidates = sorted(candidates, reverse=True)[:3]
                 for gn_path in candidates:
                     try:
                         items = []
@@ -2299,7 +2335,7 @@ class DailyPipeline:
                         if gn_headlines:
                             headlines = gn_headlines[:120]
                             logger.info(
-                                "MacroCollector returned 0; using cached global_industry_news %s (%d headlines)",
+                                "MacroCollector returned 0; using cached macro_policy_news %s (%d headlines)",
                                 gn_path.name, len(headlines),
                             )
                             break

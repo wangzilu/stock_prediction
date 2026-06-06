@@ -30,6 +30,8 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from scheduler.data_health import HealthStatus, write_health
+
 logger = logging.getLogger(__name__)
 
 EDGES_PATH = PROJECT_ROOT / "data" / "config" / "supply_chain_edges.yaml"
@@ -441,6 +443,26 @@ def build_factors(
     return df
 
 
+def _write_chain_factor_health(
+    *,
+    success: bool,
+    target_date: str,
+    n_items: int = 0,
+    error_type: str = "",
+    error_message: str = "",
+    partial: bool = False,
+) -> None:
+    write_health("global_chain_factors", HealthStatus(
+        success=success,
+        n_items=n_items,
+        latest_date=target_date if success else "",
+        error_type=error_type,
+        error_message=error_message[:200],
+        network_profile="none",
+        partial=partial,
+    ))
+
+
 def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -489,8 +511,26 @@ def main():
                       f"neg={row['global_chain_neg_score']:+.4f}")
         else:
             print("No factors produced.")
+            _write_chain_factor_health(
+                success=False,
+                target_date=target_date,
+                error_type="NoFactors",
+                error_message="No events/factors produced; refusing to keep stale global_chain_factors parquet green",
+            )
+            sys.exit(1)
+        _write_chain_factor_health(
+            success=True,
+            target_date=target_date,
+            n_items=len(df),
+        )
     except Exception as e:
         logger.error("Factor build failed: %s", e)
+        _write_chain_factor_health(
+            success=False,
+            target_date=target_date,
+            error_type=type(e).__name__,
+            error_message=str(e),
+        )
         import traceback
         traceback.print_exc()
         sys.exit(1)

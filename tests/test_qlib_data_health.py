@@ -4,7 +4,9 @@ from scripts.check_qlib_data_health import check_qlib_dir
 from scripts.update_qlib_data import (
     is_a_share_stock_code,
     numeric_to_bs_code,
+    parse_args,
     repair_legacy_bins,
+    _main_inner,
 )
 
 
@@ -88,3 +90,43 @@ def test_is_a_share_stock_code_filters_indices_and_b_shares():
     assert not is_a_share_stock_code("sh.000001")
     assert not is_a_share_stock_code("sz.399001")
     assert not is_a_share_stock_code("sh.900901")
+
+
+def test_update_qlib_noop_writes_health(monkeypatch, tmp_path):
+    qlib_dir, feature_dir = _make_minimal_qlib_dir(tmp_path)
+    for field in ["open", "high", "low", "close", "volume", "amount"]:
+        np.array([0.0, 1.0, 2.0, 3.0], dtype="<f4").tofile(
+            feature_dir / f"{field}.day.bin"
+        )
+
+    wrote = {}
+
+    def fake_write_health(source, status, date=None):
+        wrote["source"] = source
+        wrote["status"] = status
+
+    monkeypatch.setattr("scripts.update_qlib_data.write_health", fake_write_health)
+    monkeypatch.setattr("scripts.update_qlib_data.load_manifest", lambda path: {})
+    monkeypatch.setattr(
+        "scripts.update_qlib_data.get_update_universe",
+        lambda **kwargs: type("Universe", (), {
+            "codes": {"sh600000"},
+            "groups": {},
+            "source": "instruments",
+        })(),
+    )
+    monkeypatch.setattr("scripts.update_qlib_data.build_start_dates", lambda **kwargs: {})
+    monkeypatch.setattr("scripts.update_qlib_data.validate_qlib_health", lambda *a, **k: True)
+
+    args = parse_args([
+        "--qlib-dir", str(qlib_dir),
+        "--manifest", str(tmp_path / "manifest.json"),
+        "--skip-health-check",
+        "--end-date", "2026-05-05",
+    ])
+
+    assert _main_inner(args) == 0
+    assert wrote["source"] == "qlib_data_update"
+    assert wrote["status"].success is True
+    assert wrote["status"].latest_date == "2026-05-05"
+    assert wrote["status"].extra["noop"] is True

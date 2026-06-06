@@ -89,6 +89,7 @@ class CandidateSanitizer:
         crash_threshold: float = 0.65,
         chain_alpha: dict | None = None,
         min_chain_alpha: float = -2.0,
+        enable_chain_hard_block: bool = False,
         cooldown_set: set | None = None,
         actionable_required: bool = False,
     ):
@@ -114,12 +115,14 @@ class CandidateSanitizer:
         # 0.65 matches OMS RiskGuard's "cannot_buy" tier.
         self.crash_probs = {k.upper(): float(v) for k, v in (crash_probs or {}).items()}
         self.crash_threshold = float(crash_threshold)
-        # Supply-chain alpha negative-event filter (matches RiskGuard's
-        # _check_supply_chain_risk): alpha < -2.0 = pending_exit reason.
-        # For recommendation: never start a position in a "supply chain
-        # negative" stock even before any open position triggers force-sell.
+        # Supply-chain alpha is a shadow/rerank signal by default.
+        # 2026-06-06 Phase A.5: global_chain_alpha includes broad
+        # industry/policy/commodity broadcasts with an uncalibrated raw
+        # distribution. It must not reject buy candidates unless an
+        # explicitly calibrated company-level hard block is enabled.
         self.chain_alpha = {k.upper(): float(v) for k, v in (chain_alpha or {}).items()}
         self.min_chain_alpha = float(min_chain_alpha)
+        self.enable_chain_hard_block = bool(enable_chain_hard_block)
         # Codes currently in RiskGuard cooldown (from risk_guard_state.json).
         # Cooldown rules: stop-loss=10 calendar days, event=30, ST=until clear.
         # The set is precomputed for today's date by the caller so the
@@ -132,6 +135,8 @@ class CandidateSanitizer:
         self._first_dates_load_attempted = False
         self._stats = Counter()
         self._lock = threading.Lock()
+        self.last_soft_tags: set[str] = set()
+        self.last_chain_alpha: float | None = None
 
     # -- ST list loading ------------------------------------------------------
 
@@ -289,6 +294,9 @@ class CandidateSanitizer:
             return self._check_locked(code, name, quote, prediction_date)
 
     def _check_locked(self, code, name, quote, prediction_date):
+        self.last_soft_tags = set()
+        self.last_chain_alpha = None
+
         # 1. ST / 退市
         if name and self._is_st_by_name(name):
             self._stats["st_by_name"] += 1
@@ -320,12 +328,17 @@ class CandidateSanitizer:
                 self._stats["high_crash_prob"] += 1
                 return False, "high_crash_prob"
 
-        # 2.7. Supply-chain alpha hard block (negative event = don't open)
+        # 2.7. Supply-chain alpha soft tag (shadow / rerank only by default)
         if self.chain_alpha:
             ca = self.chain_alpha.get(code.upper())
-            if ca is not None and ca < self.min_chain_alpha:
-                self._stats["chain_negative"] += 1
-                return False, "chain_negative"
+            if ca is not None:
+                self.last_chain_alpha = ca
+                if ca < self.min_chain_alpha:
+                    self._stats["chain_negative_soft"] += 1
+                    self.last_soft_tags.add("chain_negative")
+                    if self.enable_chain_hard_block:
+                        self._stats["chain_negative"] += 1
+                        return False, "chain_negative"
 
         # 2.8. RiskGuard cooldown (stop-loss / event / ST cooldown still active)
         if self.cooldown_set and code.upper() in self.cooldown_set:

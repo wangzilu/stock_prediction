@@ -3,7 +3,7 @@ import json
 import pytest
 
 from scheduler.job_status import run_with_status
-from scripts.install_crontab import BEGIN_MARKER, END_MARKER, merge_crontab
+from scripts.install_crontab import BEGIN_MARKER, END_MARKER, merge_crontab, render_block
 
 
 def test_run_with_status_records_success(tmp_path):
@@ -57,3 +57,29 @@ def test_merge_crontab_replaces_legacy_project_lines():
     assert "--min-lgb-data-instruments 4500" in merged
     assert "lgb_after_close_train" in merged
     assert "/tmp/python" in merged
+
+
+def test_phase_a6_cron_renders_truthful_health_jobs():
+    block = render_block(python_bin="/tmp/python")
+
+    chain_extract = next(line for line in block.splitlines() if "global_chain_extract" in line)
+    chain_factors = next(line for line in block.splitlines() if "global_chain_factors" in line)
+    assert "--enforce-deps" in chain_extract
+    assert "--dep-wait-seconds 3600" in chain_extract
+    assert "--enforce-deps" in chain_factors
+    assert "--dep-wait-seconds 3600" in chain_factors
+
+    assert "fetch_st_daily_factors.py --days 60" in block
+    assert "fetch_shareholder_data.py" in block
+    assert "fetch_st_round3.py --only stk_holdernumber --force" in block
+    assert "fetch_fundamental_features.py" in block
+    assert "fetch_fundamental_quality.py" in block
+
+
+def test_weekly_sources_do_not_block_daily_feature_cache_same_day():
+    from scheduler.job_deps import JOB_DEPS
+
+    deps = set(JOB_DEPS["feature_cache_rebuild"])
+    assert "st_holder_number_update" not in deps
+    assert "fundamental_update" not in deps
+    assert "quality_update" not in deps

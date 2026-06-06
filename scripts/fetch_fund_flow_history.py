@@ -677,8 +677,49 @@ def main():
                         help="Number of trading days for batch mode (default: 60)")
     args = parser.parse_args()
 
-    n_items = 0
-    latest_date = ""
+    flow_n_items = 0
+    flow_latest_date = ""
+    flow_success = args.nb_only
+    nb_n_items = 0
+    nb_latest_date = ""
+    nb_success = args.flow_only
+
+    def _write_dual_health(success: bool = True, error: Exception | None = None) -> None:
+        error_type = type(error).__name__ if error else ""
+        error_message = str(error)[:200] if error else ""
+        if not args.nb_only:
+            write_health("fund_flow_update", HealthStatus(
+                success=success and flow_success,
+                n_items=flow_n_items,
+                latest_date=flow_latest_date if flow_success else "",
+                error_type="" if flow_success else (error_type or "NoFundFlowData"),
+                error_message="" if flow_success else (error_message or "fund flow returned empty or failed"),
+                network_profile="domestic",
+                partial=(not flow_success),
+                extra={
+                    "flow_latest_date": flow_latest_date,
+                    "flow_n_items": flow_n_items,
+                    "northbound_latest_date": nb_latest_date,
+                    "northbound_n_items": nb_n_items,
+                },
+            ))
+        if not args.flow_only:
+            write_health("northbound_update", HealthStatus(
+                success=success and nb_success,
+                n_items=nb_n_items,
+                latest_date=nb_latest_date if nb_success else "",
+                error_type="" if nb_success else (error_type or "NoNorthboundData"),
+                error_message="" if nb_success else (error_message or "northbound returned empty or failed"),
+                network_profile="domestic",
+                partial=(not nb_success),
+                extra={
+                    "flow_latest_date": flow_latest_date,
+                    "flow_n_items": flow_n_items,
+                    "northbound_latest_date": nb_latest_date,
+                    "northbound_n_items": nb_n_items,
+                },
+            ))
+
     try:
         # ===== Batch-by-date mode (default, ~100x fewer requests) =====
         if args.source == "st" and not args.per_stock:
@@ -688,23 +729,22 @@ def main():
                 flow_df = fetch_fund_flow_batch(days=args.days)
                 _save_with_merge(flow_df, FLOW_PATH,
                                  dedup_cols=["qlib_code", "trade_date"], label="fund flow")
-                n_items += len(flow_df)
+                flow_n_items = len(flow_df)
                 if not flow_df.empty and "trade_date" in flow_df.columns:
-                    latest_date = str(flow_df["trade_date"].max())
+                    flow_latest_date = str(flow_df["trade_date"].max())
+                    flow_success = True
 
             if not args.flow_only:
                 nb_df = fetch_northbound_batch(days=args.days)
                 _save_with_merge(nb_df, NB_PATH,
                                  dedup_cols=["qlib_code", "trade_date"], label="northbound")
-                n_items += len(nb_df)
+                nb_n_items = len(nb_df)
+                if not nb_df.empty and "trade_date" in nb_df.columns:
+                    nb_latest_date = str(nb_df["trade_date"].max())
+                    nb_success = True
 
             logger.info("Done!")
-            write_health("fund_flow_update", HealthStatus(
-                success=True,
-                n_items=n_items,
-                latest_date=latest_date,
-                network_profile="domestic",
-            ))
+            _write_dual_health(success=True)
             return
 
         # ===== Per-stock mode (old, slow) =====
@@ -717,9 +757,10 @@ def main():
                                       existing_codes=existing, source=args.source)
             _save_with_merge(flow_df, FLOW_PATH,
                              dedup_cols=["qlib_code", "trade_date"], label="fund flow")
-            n_items += len(flow_df)
+            flow_n_items = len(flow_df)
             if not flow_df.empty and "trade_date" in flow_df.columns:
-                latest_date = str(flow_df["trade_date"].max())
+                flow_latest_date = str(flow_df["trade_date"].max())
+                flow_success = True
 
         if not args.flow_only:
             existing = load_existing_codes(NB_PATH) if args.incremental else set()
@@ -727,21 +768,15 @@ def main():
                                      existing_codes=existing, source=args.source)
             _save_with_merge(nb_df, NB_PATH,
                              dedup_cols=["qlib_code", "trade_date"], label="northbound")
-            n_items += len(nb_df)
+            nb_n_items = len(nb_df)
+            if not nb_df.empty and "trade_date" in nb_df.columns:
+                nb_latest_date = str(nb_df["trade_date"].max())
+                nb_success = True
 
         logger.info("Done!")
-        write_health("fund_flow_update", HealthStatus(
-            success=True,
-            n_items=n_items,
-            latest_date=latest_date,
-            network_profile="domestic",
-        ))
+        _write_dual_health(success=True)
     except Exception as e:
-        write_health("fund_flow_update", HealthStatus(
-            success=False,
-            error_type=type(e).__name__,
-            error_message=str(e)[:200],
-        ))
+        _write_dual_health(success=False, error=e)
         raise
 
 
