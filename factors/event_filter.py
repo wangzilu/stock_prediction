@@ -143,6 +143,27 @@ DROP_PATTERNS: list[tuple[re.Pattern, str]] = [
      "generic_limit_template"),
     (re.compile(r"(强势股|龙头股|风险股|妖股).*(池|名单|榜|一览)"),
      "generic_pool_template"),
+    # 2026-06-06 Phase C.1 (L4): additional generic templates flagged
+    # in the project lead's LLM critique. These were leaking into L1
+    # despite the earlier batch, padding event_type_distribution with
+    # routine_announcement / dividend_increase noise and burning RPM.
+    (re.compile(r"资金流向(日报|榜单|播报|监测)|主力资金净流(入|出).*(这些股|个股|名单|排名)"),
+     "generic_capital_flow_template"),
+    (re.compile(r"(概念|题材)(上涨|下跌|涨幅榜|跌幅榜|集体|大涨|大跌|拉升|跳水).*(这些股|个股|名单|池|榜)?"),
+     "generic_concept_move_template"),
+    (re.compile(r"(即将|马上|本周|本月)?(分红|派息|送转|除权).*(榜|名单|一览|个股|池)|"
+                 r"(\d{1,3}股|\d{1,3}只)+.{0,8}(实施|宣布|进行)?(分红|派息|送转)"),
+     "generic_dividend_calendar_template"),
+    (re.compile(r"(抢权|填权|除权除息).{0,8}(行情|机会|名单|个股|这些股)"),
+     "generic_rights_template"),
+    (re.compile(r"(股东户数|户均持股).{0,10}(降幅|增幅|变化|榜|减少|增加|连降|连增).*(榜|名单|个股|这些股)?"),
+     "generic_holder_template"),
+    (re.compile(r"(\d+股|\d+只).{0,10}(突破|创新高|创新低)(均线|年线|月线|季线|周线)?"),
+     "generic_multi_breakout_template"),
+    (re.compile(r"(融资客|两融|融资融券).{0,10}(榜|名单|一览|大幅|连续|偏好|抢筹|加仓|减仓|净买|净卖)"),
+     "generic_margin_list_template"),
+    (re.compile(r"(机构|主力).{0,8}调研.{0,10}(名单|榜|这些股|个股|频次|TOP\d+|前\d+|新进)"),
+     "generic_institution_research_template"),
 ]
 
 # L2 hint: items likely needing reasoning model (multi-entity / supply chain / long impact chain).
