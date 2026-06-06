@@ -812,8 +812,15 @@ hang to **11:14 wall, 5 recommendations produced**
   - A6-8 run_llm_event_pipeline writes its own health (partial /
     timeout / 0-factor → partial=True or red).
   - Audit doc: `docs/health_truthfulness_audit_20260606.md`.
-- 🔄 Phase A.7 — source-specific SLA gate (next, see below).
-- ⏸ Phase B / C / D / E — gated behind Phase A.7.
+- ✅ Phase A.7 — source-specific SLA gate landed:
+  - `config/data_sla.py` declares per-source frequency + budget.
+  - `scheduler/data_health.is_fresh_sla` / `sla_verdict` apply per-source
+    budgets instead of `latest_date == today`.
+  - 13 tests in `tests/test_data_sla.py`.
+  - Audit doc: `docs/sla_gate_audit_20260607.md`.
+- 🔄 Phase B — LOO ablation 6-split fast screen (running now,
+  baseline + 9 LOO ~80 min, ETA 2026-06-06 12:30).
+- ⏸ Phase C / D / E — gated behind Phase B verdict.
 
 Read this doc — not the chat history — when you come back to A-share
 work. Update it as phases land.
