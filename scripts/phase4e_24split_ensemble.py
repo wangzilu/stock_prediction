@@ -304,7 +304,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Phase B LOO ablation: drop ALL columns from this group "
              "(matched against data/storage/supp_col_manifest.json) "
              "before training. Use e.g. ``--drop-group capital_flow`` to "
-             "ablate. Manifest is built by "
+             "ablate. Accepts comma-separated list for joint-drop runs "
+             "(Phase B.3 xgb_209 etc.), e.g. "
+             "``--drop-group cross_market_regime,capital_flow,shareholder``. "
+             "Manifest is built by "
              "``scripts/introspect_supp_col_groups.py``.",
     )
     p.add_argument(
@@ -408,7 +411,7 @@ def main():
     # produced by scripts/introspect_supp_col_groups.py). Output is
     # logged + recorded in the ledger row's ``dropped_groups`` so the
     # three-way comparator can tell ablation runs apart.
-    dropped_group: str | None = None
+    dropped_groups: list[str] = []
     dropped_cols: list[str] = []
     if args.drop_group:
         manifest_path = Path(args.manifest_path or DATA_DIR / "supp_col_manifest.json")
@@ -420,21 +423,27 @@ def main():
             )
         manifest = json.loads(manifest_path.read_text())
         group_map = manifest.get("groups", {})
-        if args.drop_group not in group_map:
+        # 2026-06-06 Phase B.3: accept comma-separated list so xgb_209
+        # (= xgb_242 minus Bucket-A trio) can be trained in one run.
+        requested_groups = [g.strip() for g in args.drop_group.split(",") if g.strip()]
+        unknown = [g for g in requested_groups if g not in group_map]
+        if unknown:
             raise SystemExit(
-                f"--drop-group {args.drop_group} not in manifest. "
+                f"--drop-group has unknown group(s): {unknown}. "
                 f"Available: {sorted(group_map)}"
             )
-        candidate_cols = set(group_map[args.drop_group])
+        candidate_cols: set[str] = set()
+        for g in requested_groups:
+            candidate_cols.update(group_map[g])
         dropped_cols = [c for c in feat_cols if c in candidate_cols]
         if not dropped_cols:
-            print(f"  [warn] --drop-group {args.drop_group} matched 0 of "
+            print(f"  [warn] --drop-group {requested_groups} matched 0 of "
                   f"{len(candidate_cols)} expected cols in the cache. "
                   f"Check that the cache was built for this profile.")
         else:
             feat_cols = [c for c in feat_cols if c not in candidate_cols]
-            dropped_group = args.drop_group
-            print(f"  LOO ablation: dropped group={args.drop_group} "
+            dropped_groups = requested_groups
+            print(f"  Ablation: dropped groups={requested_groups} "
                   f"({len(dropped_cols)} cols), features now {len(feat_cols)}")
             print(f"  dropped cols (first 8): {dropped_cols[:8]}")
 
@@ -745,7 +754,15 @@ def main():
             metrics_for_ledger = full_metrics.get(mname, {})
             if "error" in metrics_for_ledger:
                 continue
-            ablation_tag = f"_loo_{dropped_group}" if dropped_group else ""
+            # 2026-06-06 Phase B.3: ablation_tag is "_loo_<g>" for a
+            # single-group LOO and "_drop_<g1>+<g2>+<g3>" for a
+            # joint-drop. Keeps existing LOO rows naming-compatible.
+            if not dropped_groups:
+                ablation_tag = ""
+            elif len(dropped_groups) == 1:
+                ablation_tag = f"_loo_{dropped_groups[0]}"
+            else:
+                ablation_tag = "_drop_" + "+".join(dropped_groups)
             exp_id_for_ledger = f"{mname}_{args.preset}{ablation_tag}_{timestamp}"
             record_run(
                 experiment_id=exp_id_for_ledger,
@@ -755,7 +772,7 @@ def main():
                 split_config=args.preset,
                 cache_path=str(feature_cache_path),
                 feature_groups=[],
-                dropped_groups=[dropped_group] if dropped_group else [],
+                dropped_groups=list(dropped_groups),
                 metrics={
                     "rank_ic_mean": metrics_for_ledger.get("rank_ic_mean"),
                     "rank_icir": metrics_for_ledger.get("rank_icir"),
