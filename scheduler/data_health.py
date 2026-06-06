@@ -255,6 +255,176 @@ def is_fresh(
     return recorded >= expected
 
 
+def is_fresh_sla(
+    source: str,
+    date: str | None = None,
+    *,
+    if_unregistered: str = "fail_closed",
+) -> bool:
+    """SLA-aware freshness check — Phase A.7 entry point.
+
+    Reads ``config.data_sla.SLA_BY_SOURCE`` for ``source`` and applies
+    the per-source ``max_age_trading_days`` budget against the recorded
+    ``latest_date``. The point of A.7 is to stop modelling
+    weekly / quarterly disclosure data with a strict-daily rule (which
+    would either keep them permanently red or force the gate to ignore
+    them entirely).
+
+    Parameters
+    ----------
+    source:
+        Health source name (e.g. ``fundamental_update``).
+    date:
+        Reference date for the freshness check (default: today).
+    if_unregistered:
+        Policy for sources NOT in ``SLA_BY_SOURCE``.
+        - ``"fail_closed"`` (default): return ``False`` so an
+          unregistered source is treated as stale and surfaces in audit.
+        - ``"exempt"``: return ``True`` so legacy paths can opt in
+          gradually without breaking.
+
+    Returns ``True`` when:
+    - health row exists for ``date``,
+    - ``success`` is True and ``partial`` is False,
+    - the SLA budget for ``source`` is satisfied: the recorded
+      ``latest_date`` is no more than ``max_age_trading_days``
+      CN-calendar trading days behind ``date``.
+    """
+    from config.data_sla import get_sla
+
+    sla = get_sla(source)
+    if sla is None:
+        if if_unregistered == "exempt":
+            logger.warning(
+                "is_fresh_sla(%s): source unregistered in SLA_BY_SOURCE, "
+                "returning True per if_unregistered=exempt. Add it to "
+                "config.data_sla before relying on this gate.",
+                source,
+            )
+            return True
+        logger.warning(
+            "is_fresh_sla(%s): source unregistered in SLA_BY_SOURCE, "
+            "returning False per if_unregistered=fail_closed. Register "
+            "the source in config.data_sla so this gate has an honest "
+            "answer.",
+            source,
+        )
+        return False
+
+    h = read_health(source, date)
+    if not h:
+        return False
+    if not h.get("success", False):
+        return False
+    if h.get("partial", False):
+        return False
+
+    recorded = _normalize_iso_date(h.get("latest_date"))
+    if not recorded:
+        logger.warning(
+            "is_fresh_sla(%s): success=True but latest_date empty / "
+            "unparseable — treating as stale (SLA frequency=%s budget=%d).",
+            source, sla.frequency, sla.max_age_trading_days,
+        )
+        return False
+
+    ref_date = date or datetime.now().strftime("%Y-%m-%d")
+    age = trading_day_age(recorded, ref_date)
+    if age is None:
+        logger.warning(
+            "is_fresh_sla(%s): could not compute trading_day_age "
+            "(recorded=%s, ref=%s) — treating as stale.",
+            source, recorded, ref_date,
+        )
+        return False
+    return age <= sla.max_age_trading_days
+
+
+def sla_verdict(
+    sources: list[str],
+    date: str | None = None,
+) -> dict:
+    """SLA-aware multi-source verdict — Phase A.7 entry point.
+
+    For each source, return one of:
+      - ``"fresh"``: registered AND within its SLA budget.
+      - ``"stale"``: registered AND outside its SLA budget (or
+        success=False / partial=True / latest_date empty).
+      - ``"exempt"``: NOT registered in ``SLA_BY_SOURCE``. The caller
+        decides whether to block on these or warn.
+
+    Returns::
+
+        {
+          "all_fresh": bool,                      # ignores 'exempt'
+          "fresh":   ["src1", ...],
+          "stale":   ["src2", ...],
+          "exempt":  ["src3", ...],
+          "details": {"src1": {"age": 0, "budget": 1, "frequency": "daily"}, ...},
+        }
+    """
+    from config.data_sla import get_sla
+
+    ref_date = date or datetime.now().strftime("%Y-%m-%d")
+    fresh: list[str] = []
+    stale: list[str] = []
+    exempt: list[str] = []
+    details: dict[str, dict] = {}
+    for source in sources:
+        sla = get_sla(source)
+        if sla is None:
+            exempt.append(source)
+            details[source] = {"status": "exempt", "reason": "unregistered"}
+            continue
+        h = read_health(source, date)
+        if not h or not h.get("success", False) or h.get("partial", False):
+            stale.append(source)
+            details[source] = {
+                "status": "stale",
+                "reason": "missing_or_failed_health",
+                "frequency": sla.frequency,
+                "budget": sla.max_age_trading_days,
+            }
+            continue
+        recorded = _normalize_iso_date(h.get("latest_date"))
+        if not recorded:
+            stale.append(source)
+            details[source] = {
+                "status": "stale",
+                "reason": "empty_latest_date",
+                "frequency": sla.frequency,
+                "budget": sla.max_age_trading_days,
+            }
+            continue
+        age = trading_day_age(recorded, ref_date)
+        if age is None or age > sla.max_age_trading_days:
+            stale.append(source)
+            details[source] = {
+                "status": "stale",
+                "reason": "exceeds_budget",
+                "age_trading_days": age,
+                "budget": sla.max_age_trading_days,
+                "frequency": sla.frequency,
+                "latest_date": recorded,
+            }
+            continue
+        fresh.append(source)
+        details[source] = {
+            "status": "fresh",
+            "age_trading_days": age,
+            "budget": sla.max_age_trading_days,
+            "frequency": sla.frequency,
+            "latest_date": recorded,
+        }
+    return {
+        "all_fresh": len(stale) == 0,
+        "fresh": fresh,
+        "stale": stale,
+        "exempt": exempt,
+        "details": details,
+    }
+
+
 def check_freshness(
     required_sources: list[str],
     date: str = None,
