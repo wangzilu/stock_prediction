@@ -51,14 +51,107 @@ EVENT_LOOKBACK_DAYS = 10
 # Edge table
 # ---------------------------------------------------------------------------
 
-def load_edges() -> list[dict]:
-    """Load supply chain edges from YAML."""
+# Phase D / SC-A3: tier classification per edge.
+# Each edge in the YAML carries a ``source`` string; we infer an
+# evidence tier from it so production overlays can opt into A/B only
+# while shadow / research consumers can read C/D too.
+#
+#   A — official confirmations (年报 / 公告 / 政策 / regulatory disclosure).
+#   B — public company-interaction signals (订单 / 合作 / 认证 /
+#       公司互动 / 供应链公开信息 contracts).
+#   C — research-report inferences (研报 / 行业研报 / 调研 / 卖方).
+#   D — pure theme mapping (行业逻辑 / 行业常识 / 主题 / industry
+#       narrative without per-edge evidence).
+#
+# When in doubt the inference falls back to ``"D"`` so production
+# overlays do not accidentally consume an unclassified edge.
+EDGE_TIER_RULES = (
+    # (tier, ordered list of regex hints on the source string)
+    ("A", ("公告", "年报", "政策", "公告/年报", "regulatory")),
+    ("B", ("订单", "合作", "认证", "公司互动", "供应链公开信息",
+           "合资", "合同")),
+    ("C", ("研报", "行业研报", "调研", "卖方", "机构调研")),
+    ("D", ("行业逻辑", "行业常识", "主题", "narrative", "公开信息")),
+)
+
+
+def classify_edge_tier(source: str) -> str:
+    """Infer the evidence tier (``"A"`` / ``"B"`` / ``"C"`` / ``"D"``)
+    from an edge's ``source`` field. Defaults to ``"D"`` when the
+    source string is empty / unmatched so production overlays cannot
+    silently consume an unclassified edge.
+    """
+    s = (source or "").strip()
+    if not s:
+        return "D"
+    s_lower = s.lower()
+    for tier, hints in EDGE_TIER_RULES:
+        if any(h in s or h.lower() in s_lower for h in hints):
+            return tier
+    return "D"
+
+
+# Tier inclusivity for the production overlay. The current default
+# accepts A and B only; C / D are research / shadow-only. Phase D.3
+# audit can flip this once the YAML is fully retagged.
+PRODUCTION_EDGE_TIERS = frozenset({"A", "B"})
+
+
+def load_edges(
+    min_tier: str = "B",
+    *,
+    annotate: bool = True,
+    explicit_tiers: frozenset[str] | None = None,
+) -> list[dict]:
+    """Load supply chain edges from YAML, tagged with an evidence tier.
+
+    Parameters
+    ----------
+    min_tier:
+        Minimum tier to include. ``"B"`` means production-grade
+        (A + B); ``"D"`` means everything. Convenience wrapper around
+        ``explicit_tiers`` so callers can write ``load_edges("B")``
+        for the production set or ``load_edges("D")`` for research.
+    annotate:
+        When True (default), the returned edges carry an added
+        ``tier`` key. Set False only if a caller depends on the
+        original YAML key set.
+    explicit_tiers:
+        Override ``min_tier`` with an exact set, e.g.
+        ``frozenset({"A"})`` to read official-only.
+
+    Returns
+    -------
+    List of edge dicts. Filtered by tier when callers care.
+    """
     with open(EDGES_PATH, "r", encoding="utf-8") as f:
-        edges = yaml.safe_load(f)
-    if edges is None:
-        edges = []
-    logger.info("Loaded %d supply chain edges", len(edges))
-    return edges
+        raw = yaml.safe_load(f) or []
+
+    # Resolve which tiers we keep.
+    if explicit_tiers is not None:
+        keep = frozenset(explicit_tiers)
+    else:
+        TIER_ORDER = {"A": 0, "B": 1, "C": 2, "D": 3}
+        threshold = TIER_ORDER.get(min_tier.upper(), 1)
+        keep = frozenset(
+            t for t, idx in TIER_ORDER.items() if idx <= threshold
+        )
+
+    kept: list[dict] = []
+    counts = {"A": 0, "B": 0, "C": 0, "D": 0}
+    for edge in raw:
+        tier = classify_edge_tier(edge.get("source", ""))
+        counts[tier] += 1
+        if tier not in keep:
+            continue
+        if annotate:
+            edge = {**edge, "tier": tier}
+        kept.append(edge)
+    logger.info(
+        "Loaded %d edges (tiers kept=%s, raw counts %s)",
+        len(kept), sorted(keep), counts,
+    )
+    return kept
 
 
 def _build_entity_edge_map(edges: list[dict]) -> dict[str, list[dict]]:
@@ -411,25 +504,52 @@ def build_factors(
             # zscore-by-date + shrunk + clipped before consumers see it.
             # Raw scores have mean ~ -14 and span [-47, +15] which is
             # not usable as either a feature or an overlay weight.
+            #
+            # 2026-06-06 cx review:
+            #   1. Z-score must be computed AFTER filtering out the
+            #      company-level stocks (those rows never reach the
+            #      industry frame, so they would skew μ/σ — see review
+            #      P2). Filter first, then compute moments.
+            #   2. When the resulting σ is below the float threshold we
+            #      set the WHOLE column to 0, not score * 0.2. Zero
+            #      variance means "no information"; preserving the raw
+            #      magnitude was what reintroduced the unscaled value
+            #      flagged in P1.
             import numpy as _np
-            raw_scores = _np.array(
-                [s for s in industry_scores.values()], dtype=float
-            )
-            if len(raw_scores) > 0 and raw_scores.std() > 1e-9:
-                mu = float(raw_scores.mean())
-                sigma = float(raw_scores.std())
-            else:
-                mu, sigma = 0.0, 1.0
             SHRINK = 0.2
             CLIP = 3.0  # post-clip range [-3, 3], well within model input scale
 
+            # Step A: build the (stock, score) list that will actually
+            # become industry rows, dropping company-level overlap.
+            industry_only_pairs = [
+                (stock.lower(), score)
+                for stock, score in industry_scores.items()
+                if stock.lower() not in company_stocks
+            ]
+
+            if industry_only_pairs:
+                pool_scores = _np.array(
+                    [s for _, s in industry_only_pairs], dtype=float
+                )
+                if pool_scores.std() > 1e-9:
+                    mu = float(pool_scores.mean())
+                    sigma = float(pool_scores.std())
+                    zero_variance = False
+                else:
+                    mu, sigma = 0.0, 1.0
+                    zero_variance = True
+            else:
+                mu, sigma, zero_variance = 0.0, 1.0, True
+
             industry_rows = []
-            for stock, score in industry_scores.items():
-                stock = stock.lower()
-                if stock in company_stocks:
-                    continue  # company-level already covered
-                z = (score - mu) / sigma
-                shrunk = max(-CLIP, min(CLIP, z * SHRINK))
+            for stock, score in industry_only_pairs:
+                if zero_variance:
+                    # No spread → no signal. Hard zero so the column
+                    # never re-injects raw magnitude.
+                    shrunk = 0.0
+                else:
+                    z = (score - mu) / sigma
+                    shrunk = max(-CLIP, min(CLIP, z * SHRINK))
                 industry_rows.append({
                     "datetime": dt,
                     "instrument": stock,
