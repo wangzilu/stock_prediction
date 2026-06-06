@@ -299,6 +299,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "data/storage/feature_cache_242_production.parquet "
              "(built by scripts/build_feature_cache_242.py).",
     )
+    p.add_argument(
+        "--drop-group", default=None,
+        help="Phase B LOO ablation: drop ALL columns from this group "
+             "(matched against data/storage/supp_col_manifest.json) "
+             "before training. Use e.g. ``--drop-group capital_flow`` to "
+             "ablate. Manifest is built by "
+             "``scripts/introspect_supp_col_groups.py``.",
+    )
+    p.add_argument(
+        "--manifest-path", default=None,
+        help="Override the supp manifest path "
+             "(default: data/storage/supp_col_manifest.json).",
+    )
     return p
 
 
@@ -389,6 +402,41 @@ def main():
     label_cols = [c for c in df.columns if c.startswith("__label")]
     label_col = LABEL_COL if LABEL_COL in df.columns else label_cols[0]
     print(f"  Features: {len(feat_cols)}, Label: {label_col}")
+
+    # 2026-06-06 Phase B LOO ablation: optionally drop every column
+    # belonging to a single supplementary group (read from manifest
+    # produced by scripts/introspect_supp_col_groups.py). Output is
+    # logged + recorded in the ledger row's ``dropped_groups`` so the
+    # three-way comparator can tell ablation runs apart.
+    dropped_group: str | None = None
+    dropped_cols: list[str] = []
+    if args.drop_group:
+        manifest_path = Path(args.manifest_path or DATA_DIR / "supp_col_manifest.json")
+        if not manifest_path.exists():
+            raise SystemExit(
+                f"--drop-group {args.drop_group} requested but manifest "
+                f"missing at {manifest_path}. Run "
+                f"scripts/introspect_supp_col_groups.py first."
+            )
+        manifest = json.loads(manifest_path.read_text())
+        group_map = manifest.get("groups", {})
+        if args.drop_group not in group_map:
+            raise SystemExit(
+                f"--drop-group {args.drop_group} not in manifest. "
+                f"Available: {sorted(group_map)}"
+            )
+        candidate_cols = set(group_map[args.drop_group])
+        dropped_cols = [c for c in feat_cols if c in candidate_cols]
+        if not dropped_cols:
+            print(f"  [warn] --drop-group {args.drop_group} matched 0 of "
+                  f"{len(candidate_cols)} expected cols in the cache. "
+                  f"Check that the cache was built for this profile.")
+        else:
+            feat_cols = [c for c in feat_cols if c not in candidate_cols]
+            dropped_group = args.drop_group
+            print(f"  LOO ablation: dropped group={args.drop_group} "
+                  f"({len(dropped_cols)} cols), features now {len(feat_cols)}")
+            print(f"  dropped cols (first 8): {dropped_cols[:8]}")
 
     # ── 2. Get split config ─────────────────────────────────────────────
     print(f"\n[2/5] Generating {args.preset} configuration...")
@@ -697,16 +745,17 @@ def main():
             metrics_for_ledger = full_metrics.get(mname, {})
             if "error" in metrics_for_ledger:
                 continue
-            exp_id_for_ledger = f"{mname}_174_{args.preset}_{timestamp}"
+            ablation_tag = f"_loo_{dropped_group}" if dropped_group else ""
+            exp_id_for_ledger = f"{mname}_{args.preset}{ablation_tag}_{timestamp}"
             record_run(
                 experiment_id=exp_id_for_ledger,
-                model_profile=f"{mname}_174",
+                model_profile=f"{mname}_{args.preset}{ablation_tag}",
                 feature_count=len(feat_cols),
                 data_end=str(args.end_date or datetime.now().date().isoformat()),
                 split_config=args.preset,
                 cache_path=str(feature_cache_path),
                 feature_groups=[],
-                dropped_groups=[],
+                dropped_groups=[dropped_group] if dropped_group else [],
                 metrics={
                     "rank_ic_mean": metrics_for_ledger.get("rank_ic_mean"),
                     "rank_icir": metrics_for_ledger.get("rank_icir"),

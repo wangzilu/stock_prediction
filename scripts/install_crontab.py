@@ -273,9 +273,14 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                 [py, str(scripts / "daily_health_check.py")], "health_check.log",
                 network="none", timeout_sec=300),
         # --- Weekly (Saturday) ---
+        # 2026-06-06: bumped 14400→28800 (4h→8h). Last run died at 08:00
+        # after 4h with qlib instruments sync still running (5208 stocks
+        # took 2h 25min on its own; train never started). Without this
+        # the slow data-prep phase eats the entire budget and the actual
+        # retrain step is never reached.
         CronJob("weekly_full_retrain", "0 4 * * 6",
                 [py, str(scripts / "nightly_train.py")], "weekly_retrain.log",
-                network="none", timeout_sec=14400),
+                network="none", timeout_sec=28800),
         CronJob("weekly_st_refresh", "0 3 * * 6",
                 [py, str(scripts / "fetch_st_list.py")], "st_refresh.log",
                 network="domestic", timeout_sec=600),

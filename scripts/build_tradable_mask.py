@@ -99,10 +99,23 @@ def build_mask(stats_only: bool = False) -> pd.Series:
         try:
             hist_st = pd.read_parquet(_historical_st_path)
             # hist_st is expected to have a MultiIndex (datetime,
-            # instrument) and a boolean ``is_st`` column. Reindex to
-            # the current frame's index, default False (not ST) when
-            # missing.
-            aligned = hist_st["is_st"].reindex(index, fill_value=False)
+            # instrument) and a boolean column. 2026-06-06 fix: accept
+            # BOTH ``is_st`` (newer schema) and the historical
+            # ``not_st`` column (which our current backfill writes).
+            # Reindex to the current frame's index, default False
+            # (not ST) when missing.
+            if "is_st" in hist_st.columns:
+                is_st_series = hist_st["is_st"]
+            elif "not_st" in hist_st.columns:
+                # not_st is the inverse signal — True means the row was
+                # NOT marked ST that day. Flip to is_st semantics.
+                is_st_series = ~hist_st["not_st"]
+            else:
+                raise KeyError(
+                    f"st_historical_mask.parquet has neither 'is_st' nor "
+                    f"'not_st' column; got {list(hist_st.columns)}"
+                )
+            aligned = is_st_series.reindex(index, fill_value=False)
             n_st = int(aligned.sum())
             mask &= ~aligned.values
             filter_stats["st"] = n_st
