@@ -184,7 +184,29 @@ def main():
             }
             continue
         merged = factors_df.merge(fwd, on=["signal_date", "qlib_code"], how="inner")
+        logger.info("source=%s  factors=%d  fwd=%d  merged=%d",
+                    source, len(factors_df), len(fwd), len(merged))
+        if merged.empty:
+            logger.warning(
+                "source=%s produced 0 merged rows — key format mismatch "
+                "between factor frame and forward-return table.",
+                source,
+            )
+            summary["by_source"][source] = {
+                "factor_rows": int(len(factors_df)),
+                "merged_rows": 0,
+                "error": "empty_merge",
+            }
+            continue
         ic = compute_rank_ic(merged, args.factor)
+        if ic.empty or "rank_ic" not in ic.columns:
+            logger.warning("source=%s compute_rank_ic empty", source)
+            summary["by_source"][source] = {
+                "factor_rows": int(len(factors_df)),
+                "merged_rows": int(len(merged)),
+                "error": "no_ic_computed",
+            }
+            continue
         ic["source"] = source
         rows.append(ic)
 
