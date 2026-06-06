@@ -34,6 +34,12 @@ JOB_DEPS: dict[str, list[str]] = {
     # (deleted partial jsonl, re-extracted under same throttling). See commit
     # 8beeab2. llm_retry_queue_drain at 22:30 is the correct compensation.
     "llm_retry_queue_drain": ["llm_event_pipeline"],
+    # cx review 2026-06-06 (P1): llm_factor_quality MUST gate on the
+    # pipeline. Without this dep an 18:00 quality cron could fire while
+    # the 16:30 pipeline was still running, write a "0 events: success"
+    # row, and make every downstream freshness gate believe the
+    # pipeline was fine.
+    "llm_factor_quality": ["llm_event_pipeline"],
     # ---- Post-data-update processing -------------------------------------
     "fund_flow_update": ["qlib_data_update"],
     "st_daily_factors_update": ["qlib_data_update"],

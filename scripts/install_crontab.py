@@ -123,14 +123,18 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("llm_event_pipeline", "30 16 * * 1-5",
                 [py, str(scripts / "run_llm_event_pipeline.py")], "llm_event_pipeline.log",
                 network="llm", timeout_sec=7200),
-        # Phase C.5 (L5): daily LLM factor quality report — runs right
-        # after the main pipeline + the v2 extractor's L3 downgrades
-        # have written today's jsonl. Output:
-        # data/storage/llm_factor_quality/<YYYY-MM-DD>.json
-        CronJob("llm_factor_quality", "00 18 * * 1-5",
+        # Phase C.5 (L5): daily LLM factor quality report.
+        # cx review 2026-06-06 (P1): originally scheduled at 18:00 but
+        # the llm_event_pipeline cron at 16:30 has timeout 7200s so it
+        # can still be running at 18:30. Moved to 18:35 AND wired up
+        # enforce_deps so a missing/incomplete pipeline run no longer
+        # produces a "success: 0 events" report.
+        # Output: data/storage/llm_factor_quality/<YYYY-MM-DD>.json
+        CronJob("llm_factor_quality", "35 18 * * 1-5",
                 [py, str(scripts / "llm_factor_quality_report.py")],
                 "llm_factor_quality.log",
-                network="none", timeout_sec=300),
+                network="none", timeout_sec=300,
+                enforce_deps=True),
         CronJob("guba_popularity", "35 16 * * 1-5",
                 [py, str(scripts / "collect_guba_sentiment.py")], "guba_popularity.log",
                 network="domestic", timeout_sec=600),

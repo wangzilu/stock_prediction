@@ -827,8 +827,13 @@ hang to **11:14 wall, 5 recommendations produced**
     buyback / penalty keyword gate, wired into V2 extract_single,
     24 tests.
   - C.3 (L1, first pass) `scripts/build_llm_event_factors.py` emits
-    fact-count factors (`llm_positive_event_count_3d`, etc) alongside
-    the legacy synthesized-impact columns. 8 tests.
+    fact-count factors (`llm_positive_event_count_3d`, etc) **alongside**
+    the legacy ``direction * 0.05`` synthesized-impact columns (which
+    stay for one release; the impact synthesis is NOT deleted yet —
+    cx review 2026-06-06 P2 docs-vs-code alignment). The new columns
+    are written to ``llm_event_factors.parquet`` but
+    ``PRODUCTION_SUPPLEMENTARY_GROUPS`` does NOT yet load them. Status:
+    "data published, awaiting promotion-act + ablation". 8 tests.
   - C.4 (L2) EventStore PIT canonical — pending, will be the next
     behaviour-changing commit after L1 lands in production.
   - C.5 (L5) `scripts/llm_factor_quality_report.py` daily report

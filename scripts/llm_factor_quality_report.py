@@ -180,14 +180,34 @@ def main():
         Path(args.events_path) if args.events_path
         else DATA_DIR / "llm_events_v2" / f"{args.date}.jsonl"
     )
+    # 2026-06-06 cx review (P1): the previous code logged a warning and
+    # wrote a "0 events" report on success when the file was absent.
+    # That painted the gate green while the upstream pipeline had
+    # produced nothing. Fail loud now so the cron wrapper surfaces it.
     if not events_path.exists():
-        logger.warning("Events file missing: %s — writing empty report.",
-                       events_path)
+        logger.error(
+            "Events file missing: %s. Refusing to write a 0-events "
+            "report — that would look like a clean run while the "
+            "llm_event_pipeline upstream is still in flight or has "
+            "failed silently. cx review 2026-06-06 (P1).",
+            events_path,
+        )
+        sys.exit(1)
 
     events = _load_events_jsonl(events_path)
     prefilter_stats = _read_prefilter_stats(args.date)
     report = build_report(events, args.date, prefilter_stats=prefilter_stats)
     write_report(report, args.date)
+    # Also fail when the file exists but is empty — same blast radius
+    # as a missing file: the cron wrapper must mark the day red.
+    if report["events_count"] == 0:
+        logger.error(
+            "Events file %s exists but contains 0 events. Reporting "
+            "this as failure so the gate does not paint a green flag "
+            "over an empty pipeline.",
+            events_path,
+        )
+        sys.exit(1)
 
     if args.print_summary:
         print(json.dumps({

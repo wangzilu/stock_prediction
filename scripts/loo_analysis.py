@@ -20,6 +20,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -146,6 +147,35 @@ def main():
         print(f"No LOO rows yet. Baseline at exp_id="
               f"{baseline.get('experiment_id', '?')}.")
         sys.exit(0)
+
+    # cx review 2026-06-06 (P1): refuse to print a "complete" report
+    # when the LOO row set is shorter than the ablation wrapper's group
+    # list. A half-finished sweep can ship a wrong "drop this group"
+    # conclusion. Use the SC-A3 production tier set as the canonical
+    # expected group list. Override via env var when the operator
+    # genuinely runs a narrower sweep.
+    expected_groups_env = os.environ.get("LOO_EXPECTED_GROUPS", "").strip()
+    if expected_groups_env:
+        expected_groups = set(g.strip() for g in expected_groups_env.split(",") if g.strip())
+    else:
+        # Match the wrapper's LOO_GROUPS list. Hardcoded here to avoid
+        # importing a bash array.
+        expected_groups = {
+            "capital_flow", "macro_zero_baseline", "shareholder",
+            "valuation", "quality", "st_daily_basic", "st_moneyflow",
+            "st_holder_number", "cross_market_regime",
+        }
+    seen_groups = {r["dropped_groups"][0] for r in loo if r.get("dropped_groups")}
+    missing = sorted(expected_groups - seen_groups)
+    if missing:
+        print(
+            f"PARTIAL SWEEP — {len(seen_groups)}/{len(expected_groups)} LOO "
+            f"rows found. Missing groups: {missing}. The report cannot rank "
+            f"net-negative loaders honestly until the sweep completes. "
+            f"Set LOO_EXPECTED_GROUPS=<csv> to override if this is a "
+            f"deliberate narrow sweep."
+        )
+        sys.exit(2)
 
     md = _table_md(baseline, loo)
     print(md)

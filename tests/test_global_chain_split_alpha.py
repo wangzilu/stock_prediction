@@ -136,6 +136,9 @@ def test_zero_variance_industry_alpha_is_exactly_zero(monkeypatch):
     monkeypatch.setattr(mod, "generate_demo_events", lambda *_a, **_kw: [])
 
     class _ConstantMapper:
+        def __init__(self, *args, **kwargs):
+            pass
+
         def get_all_affected_stocks(self, events):
             # 4 stocks, all with the same raw alpha so std == 0.
             return {
@@ -177,6 +180,9 @@ def test_company_stocks_excluded_from_industry_zscore(monkeypatch):
     monkeypatch.setattr(mod, "load_edges", lambda *_a, **_kw: [])
 
     class _SkewMapper:
+        def __init__(self, *args, **kwargs):
+            pass
+
         def get_all_affected_stocks(self, events):
             return {
                 # the company-level overlap stock — gets dropped

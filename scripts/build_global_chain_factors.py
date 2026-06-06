@@ -482,10 +482,16 @@ def build_factors(
     # Company-level propagation (high confidence)
     df = propagate_scores(events, edges, target_date)
 
-    # Industry-level propagation (wider coverage, lower weight)
+    # Industry-level propagation (wider coverage, lower weight).
+    # cx review 2026-06-06: explicitly pin the mapper to the production
+    # A/B tier set so it cannot silently bypass the SC-A3 edge filter
+    # the top-level load_edges call honours. Default would already be
+    # ``min_tier="B"`` but stating it here keeps the contract local.
     try:
         from factors.supply_chain_mapper import SupplyChainMapper
-        mapper = SupplyChainMapper()
+        mapper = SupplyChainMapper(
+            explicit_tiers=PRODUCTION_EDGE_TIERS,
+        )
         industry_scores = mapper.get_all_affected_stocks(events)
 
         if industry_scores:

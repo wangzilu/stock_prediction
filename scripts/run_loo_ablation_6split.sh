@@ -21,6 +21,13 @@ mkdir -p "$LOG_DIR"
 CACHE="data/storage/feature_cache_242_production.parquet"
 END_DATE="2026-05-19"
 
+# 2026-06-06 cx review (P1): track failed LOO runs so the wrapper
+# does NOT print "ALL DONE" when one of them crashed. loo_analysis.py
+# already requires a baseline; the wrapper must fail loudly when the
+# group set is incomplete so the post-mortem cannot mistake a
+# half-finished sweep for a full sweep.
+FAILED=()
+
 # Groups with > 0 columns in the current cache. fundamental + northbound
 # return 0 cols today (parquets absent in this build) so dropping them
 # is a no-op; skipped to save 14 minutes.
@@ -51,6 +58,9 @@ run_one() {
         > "$log" 2>&1
     local rc=$?
     echo "[loo] $(date '+%F %T') END   $label rc=$rc"
+    if [ "$rc" -ne 0 ]; then
+        FAILED+=("$label(rc=$rc)")
+    fi
 }
 
 # 1. Baseline (no drop) — comparison anchor. Skip when its checkpoint
@@ -67,4 +77,10 @@ for g in "${LOO_GROUPS[@]}"; do
     run_one "drop_${g}" "--drop-group $g"
 done
 
-echo "[loo] $(date '+%F %T') ALL DONE"
+if [ "${#FAILED[@]}" -ne 0 ]; then
+    echo "[loo] $(date '+%F %T') PARTIAL — ${#FAILED[@]} LOO runs failed: ${FAILED[*]}"
+    echo "[loo] Refusing to print ALL DONE so the post-mortem (loo_analysis.py)"
+    echo "[loo] does not mistake a half-finished sweep for a clean result."
+    exit 1
+fi
+echo "[loo] $(date '+%F %T') ALL DONE (no failed LOOs)"

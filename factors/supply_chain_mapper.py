@@ -85,18 +85,76 @@ TOPIC_TO_INDUSTRY = {
 
 
 class SupplyChainMapper:
-    """Maps global events to A-share stocks via company + industry level."""
+    """Maps global events to A-share stocks via company + industry level.
 
-    def __init__(self):
+    2026-06-06 (cx review): the mapper used to read the YAML directly
+    without respecting the SC-A3 tier filter, so a production caller
+    that asked for A/B-only edges via ``load_edges("B")`` would still
+    leak C/D edges into ``get_all_affected_stocks`` via the mapper.
+    The constructor now accepts ``min_tier`` and ``explicit_tiers`` so
+    the mapper honours the same contract as the top-level loader.
+    Default ``min_tier="B"`` matches the production contract.
+    """
+
+    def __init__(
+        self,
+        *,
+        min_tier: str = "B",
+        explicit_tiers: frozenset[str] | None = None,
+    ):
+        self._min_tier = min_tier
+        self._explicit_tiers = explicit_tiers
         self._company_edges = self._load_company_edges()
         self._industry_stocks = self._load_industry_stocks()
 
     def _load_company_edges(self) -> list[dict]:
-        """Load company-level edges from YAML."""
+        """Load tier-filtered company-level edges from YAML.
+
+        Uses ``scripts.build_global_chain_factors.classify_edge_tier`` so
+        the filter logic lives in exactly one place. Falls back to the
+        unfiltered YAML when the classifier import fails — but in that
+        case logs a loud warning so the contract violation is visible.
+        """
         if not EDGES_PATH.exists():
             return []
         with open(EDGES_PATH) as f:
-            return yaml.safe_load(f) or []
+            raw = yaml.safe_load(f) or []
+
+        try:
+            from scripts.build_global_chain_factors import (
+                classify_edge_tier,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # The classifier is the one source of truth. If we can't
+            # import it, the safest behaviour is to drop EVERY edge so
+            # we never silently leak unclassified rows into production.
+            import logging
+            logging.getLogger(__name__).error(
+                "supply_chain_mapper: cannot import classify_edge_tier "
+                "(%s); refusing to load edges to avoid a tier-filter "
+                "bypass. Production overlay will see 0 edges this run.",
+                exc,
+            )
+            return []
+
+        if self._explicit_tiers is not None:
+            keep = frozenset(self._explicit_tiers)
+        else:
+            TIER_ORDER = {"A": 0, "B": 1, "C": 2, "D": 3}
+            threshold = TIER_ORDER.get(self._min_tier.upper(), 1)
+            keep = frozenset(
+                t for t, idx in TIER_ORDER.items() if idx <= threshold
+            )
+
+        kept = [e for e in raw if classify_edge_tier(e.get("source", "")) in keep]
+        if len(kept) != len(raw):
+            import logging
+            logging.getLogger(__name__).info(
+                "supply_chain_mapper: kept %d/%d edges (min_tier=%s, "
+                "explicit_tiers=%s)",
+                len(kept), len(raw), self._min_tier, self._explicit_tiers,
+            )
+        return kept
 
     def _load_industry_stocks(self) -> dict[str, list[str]]:
         """Load industry → stock mapping. Returns {industry_name: [qlib_codes]}.
