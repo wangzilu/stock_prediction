@@ -302,6 +302,11 @@ def build_factors(signal_date: str = None, lookback_days: int = 30,
 
     # Aggregate per stock
     recent = df[df["age_days"] <= 5]
+    # Phase C.3 (L1) fact-count window — project lead's instruction is
+    # to count facts over a short window (3 days) instead of a longer
+    # ranked-impact window. The 5-day count is kept for back-compat;
+    # the 3-day counts are the new canonical inputs.
+    very_recent = df[df["age_days"] <= 3]
 
     agg_all = df.groupby("qlib_code").agg(
         llm_impact_1d_decayed=("weighted_impact_1d", "sum"),
@@ -314,9 +319,47 @@ def build_factors(signal_date: str = None, lookback_days: int = 30,
         llm_avg_confidence=("confidence", "mean"),
     )
 
-    result = agg_all.join(agg_recent, how="left")
+    # Phase C.3 (L1): replace the ``direction * 0.05`` impact synthesis
+    # with fact counts the project lead's 2026-06-06 LLM critique asked
+    # for. These are emitted alongside (not instead of) the legacy
+    # weighted_impact_* columns, so downstream factor consumers can
+    # adopt the new columns at their own pace. The synthesized impact
+    # path stays in place for one release as a deprecation window.
+    fact_recent = very_recent.copy()
+    fact_recent["_pos"] = (fact_recent["direction"] > 0).astype(int)
+    fact_recent["_neg"] = (fact_recent["direction"] < 0).astype(int)
+    fact_recent["_price_sens"] = fact_recent.get("is_price_sensitive", False).astype(int)
+    fact_recent["_official"] = fact_recent.get("is_official_disclosure", False).astype(int)
+    fact_recent["_repeated"] = fact_recent.get("is_repeated_news", False).astype(int)
+    agg_facts = fact_recent.groupby("qlib_code").agg(
+        llm_positive_event_count_3d=("_pos", "sum"),
+        llm_negative_event_count_3d=("_neg", "sum"),
+        llm_price_sensitive_count_3d=("_price_sens", "sum"),
+        llm_official_event_count_3d=("_official", "sum"),
+        llm_event_count_3d=("event_type", "count"),
+        _repeated_sum=("_repeated", "sum"),
+    )
+    n3 = agg_facts["llm_event_count_3d"]
+    agg_facts["llm_repeated_ratio_3d"] = (
+        agg_facts["_repeated_sum"] / n3.where(n3 > 0, 1)
+    ).fillna(0.0)
+    agg_facts["llm_event_intensity"] = (n3 / 3.0).fillna(0.0)
+    agg_facts = agg_facts.drop(columns=["_repeated_sum"])
+
+    result = agg_all.join(agg_recent, how="left").join(agg_facts, how="left")
     result["llm_event_count_5d"] = result["llm_event_count_5d"].fillna(0).astype(int)
     result["llm_avg_confidence"] = result["llm_avg_confidence"].fillna(0.0)
+    # L1 columns default to 0 (= no recent events) when a stock has
+    # 5-day events but no 3-day events. The join above leaves NaN for
+    # codes outside very_recent; cast cleanly.
+    for col in (
+        "llm_positive_event_count_3d", "llm_negative_event_count_3d",
+        "llm_price_sensitive_count_3d", "llm_official_event_count_3d",
+        "llm_event_count_3d",
+    ):
+        result[col] = result[col].fillna(0).astype(int)
+    for col in ("llm_repeated_ratio_3d", "llm_event_intensity"):
+        result[col] = result[col].fillna(0.0)
 
     result["signal_date"] = signal_date
     result = result.reset_index()
