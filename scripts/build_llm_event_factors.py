@@ -333,9 +333,18 @@ def build_factors(signal_date: str = None, lookback_days: int = 30,
     fact_recent = very_recent.copy()
     fact_recent["_pos"] = (fact_recent["direction"] > 0).astype(int)
     fact_recent["_neg"] = (fact_recent["direction"] < 0).astype(int)
-    fact_recent["_price_sens"] = fact_recent.get("is_price_sensitive", False).astype(int)
-    fact_recent["_official"] = fact_recent.get("is_official_disclosure", False).astype(int)
-    fact_recent["_repeated"] = fact_recent.get("is_repeated_news", False).astype(int)
+    # 2026-06-06 fix: pandas DataFrame.get(col, default) returns the raw
+    # default (here a bool) when the column is missing, NOT a Series.
+    # ``False.astype(int)`` then raises AttributeError. The eventstore
+    # path doesn't populate these L1 fact-count flags yet, so we
+    # default to a zero Series of the right length.
+    def _flag_col(name: str) -> pd.Series:
+        if name in fact_recent.columns:
+            return fact_recent[name].fillna(False).astype(int)
+        return pd.Series(0, index=fact_recent.index, dtype=int)
+    fact_recent["_price_sens"] = _flag_col("is_price_sensitive")
+    fact_recent["_official"] = _flag_col("is_official_disclosure")
+    fact_recent["_repeated"] = _flag_col("is_repeated_news")
     agg_facts = fact_recent.groupby("qlib_code").agg(
         llm_positive_event_count_3d=("_pos", "sum"),
         llm_negative_event_count_3d=("_neg", "sum"),

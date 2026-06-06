@@ -140,8 +140,11 @@ def main():
     ap.add_argument("--lookback", type=int, default=30,
                     help="Event lookback window (default 30)")
     ap.add_argument(
-        "--factor", default="sentiment_score",
-        help="Factor column to compare IC on (default: sentiment_score)",
+        "--factor", default="llm_sentiment_score",
+        help="Factor column to compare IC on. Default llm_sentiment_score "
+             "matches the schema build_llm_event_factors actually emits "
+             "(2026-06-06 fix: previous default 'sentiment_score' was the "
+             "wrong column name, so jsonl reported factor_column_missing).",
     )
     args = ap.parse_args()
 
