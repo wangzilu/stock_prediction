@@ -40,6 +40,12 @@ class HealthStatus:
     network_profile: str = ""
     coverage: float = 0.0          # fraction of expected items received
     partial: bool = False          # True if only partial data collected
+    # 2026-06-06 Phase A.6 (A6-3): per-sub-source freshness / ok / n_rows
+    # so an aggregate collector (e.g. regime_daily_update with its 5
+    # sub-sources) can publish a single row whose sub-source state is
+    # still inspectable by the gate without forcing every consumer to
+    # crawl 5 separate health files.
+    extra: dict = field(default_factory=dict)
 
 
 def _normalize_iso_date(value) -> str:
