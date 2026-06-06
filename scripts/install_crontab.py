@@ -123,6 +123,14 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("llm_event_pipeline", "30 16 * * 1-5",
                 [py, str(scripts / "run_llm_event_pipeline.py")], "llm_event_pipeline.log",
                 network="llm", timeout_sec=7200),
+        # Phase C.5 (L5): daily LLM factor quality report — runs right
+        # after the main pipeline + the v2 extractor's L3 downgrades
+        # have written today's jsonl. Output:
+        # data/storage/llm_factor_quality/<YYYY-MM-DD>.json
+        CronJob("llm_factor_quality", "00 18 * * 1-5",
+                [py, str(scripts / "llm_factor_quality_report.py")],
+                "llm_factor_quality.log",
+                network="none", timeout_sec=300),
         CronJob("guba_popularity", "35 16 * * 1-5",
                 [py, str(scripts / "collect_guba_sentiment.py")], "guba_popularity.log",
                 network="domestic", timeout_sec=600),
