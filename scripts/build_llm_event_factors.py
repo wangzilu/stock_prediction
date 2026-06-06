@@ -503,7 +503,7 @@ def main():
     parser.add_argument("--end", type=str, default=None, help="Range end date")
     parser.add_argument("--lookback", type=int, default=30, help="Event lookback days (default: 30)")
     parser.add_argument(
-        "--source", choices=["jsonl", "eventstore"], default="jsonl",
+        "--source", choices=["jsonl", "eventstore"], default="eventstore",
         help="Event source: 'jsonl' (default, current production) groups by file_date; "
              "'eventstore' groups by signal_date and changes factor distributions by ~100x. "
              "Use eventstore only for IC backtests, not live production.",

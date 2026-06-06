@@ -75,6 +75,40 @@ SUPPLEMENTARY_GROUPS_BY_PROFILE: dict[str, tuple[str, ...]] = {
         "st_holder_number",
         "cross_market_regime",
     ),
+    # xgb_209 — xgb_242 minus the Phase B Bucket A net-negative trio
+    # (cross_market_regime, capital_flow, shareholder). Promoted by
+    # docs/phase_b4_verdict_20260606.md after 24-split RankIC +0.0345
+    # vs xgb_242's +0.0273 and Spread20 73 bps vs 35 bps; retrain on
+    # end-date 2026-06-05 produced Spread20 81 bps. 8 supp groups,
+    # 51 supp cols, 158 alpha158 → 209 total.
+    "xgb_209": (
+        "fundamental",
+        "macro_zero_baseline",
+        "valuation",
+        "northbound",
+        "quality",
+        "st_daily_basic",
+        "st_moneyflow",
+        "st_holder_number",
+    ),
+    # xgb_209_llm — CANDIDATE profile, NOT YET PRODUCTION.
+    # xgb_209 plus the LLM event factor group (5 cols today, will be
+    # 5+7 once L1 fact-count factors rebuild). Created so the Phase B
+    # LOO machinery can ablate xgb_209 vs xgb_209+llm and produce
+    # promotion evidence. cx-style discipline: a new loader doesn't
+    # join any production profile until LOO + 24-split shows it
+    # actually helps IC. Until then, keep xgb_209 as the default.
+    "xgb_209_llm": (
+        "fundamental",
+        "macro_zero_baseline",
+        "valuation",
+        "northbound",
+        "quality",
+        "st_daily_basic",
+        "st_moneyflow",
+        "st_holder_number",
+        "llm_event",
+    ),
     # xgb_174 — Alpha158 (158) + capital_flow (3) + qlib-custom (13) =
     # 174 features. Both injection paths (FeatureMerger supplementary
     # for capital_flow + FeatureMerger.inject_qlib_custom_factors_into_handler
@@ -166,6 +200,24 @@ PROFILE_EXPECTED_COUNTS: dict[str, dict[str, int]] = {
         "supplementary": 84,
         "qlib_custom": 0,
         "total": 242,
+    },
+    # xgb_209 — Phase B drop set: cross_market_regime (27) +
+    # capital_flow (3) + shareholder (3) = 33 cols dropped from 242.
+    "xgb_209": {
+        "alpha158": 158,
+        "supplementary": 51,
+        "qlib_custom": 0,
+        "total": 209,
+    },
+    # xgb_209_llm — xgb_209 + 5 LLM event factor columns from the
+    # current llm_event_factors.parquet schema (legacy 5-col). When
+    # the L1 fact-count rebuild lands this will move to 12 LLM cols
+    # (5 legacy + 7 fact-count) — update the supplementary count then.
+    "xgb_209_llm": {
+        "alpha158": 158,
+        "supplementary": 56,    # 51 base + 5 LLM
+        "qlib_custom": 0,
+        "total": 214,
     },
     "xgb_174": {
         "alpha158": 158,

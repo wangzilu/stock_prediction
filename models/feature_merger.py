@@ -719,6 +719,12 @@ class FeatureMerger:
             if st_holder is not None:
                 frames.append(st_holder)
 
+        # LLM event factors (shadow path before promotion via ablation)
+        if allowed is None or "llm_event" in allowed:
+            llm = _run("llm_event", self._load_llm_event_factors)
+            if llm is not None:
+                frames.append(llm)
+
         # Cross-market regime signals (恒生/纳指 - broadcast to all stocks per date)
         if allowed is None or "cross_market_regime" in allowed:
             cross_mkt = _run("cross_market_regime", self._load_cross_market_regime)
@@ -1386,6 +1392,68 @@ class FeatureMerger:
             return result
         except Exception as e:
             logger.warning(f"ST holder_number load failed: {e}")
+            return None
+
+    def _load_llm_event_factors(self, index: pd.MultiIndex) -> pd.DataFrame | None:
+        """Load LLM event factors from ``llm_event_factors.parquet``.
+
+        2026-06-06 — added to close the loop the project lead flagged:
+        scripts/build_llm_event_factors.py was writing the parquet but
+        no FeatureMerger loader existed, so the LLM factors stayed as
+        shadow signal that never reached the production model. This
+        loader is the wiring; whether the group is included in a given
+        profile is decided in ``config.production_features``
+        (``xgb_209_llm`` profile, not the default ``xgb_209``).
+
+        The current schema is the 5-column legacy:
+            llm_impact_1d_decayed, llm_impact_5d_decayed,
+            llm_sentiment_score, llm_event_count_5d, llm_avg_confidence
+        After the L1 fact-count factors land in a fresh rebuild
+        (llm_positive_event_count_3d / llm_negative_event_count_3d /
+        llm_price_sensitive_count_3d / llm_official_event_count_3d /
+        llm_event_count_3d / llm_repeated_ratio_3d /
+        llm_event_intensity), those will be picked up automatically
+        because this loader takes every non-key float column.
+        """
+        path = self.data_dir / "llm_event_factors.parquet"
+        if not path.exists():
+            logger.warning("LLM event factors parquet not found: %s", path)
+            return None
+        try:
+            df = pd.read_parquet(path)
+            if df.empty or "qlib_code" not in df.columns \
+                    or "signal_date" not in df.columns:
+                logger.warning("LLM event factors empty or missing keys")
+                return None
+
+            df["signal_date"] = pd.to_datetime(df["signal_date"])
+            # Take every numeric factor column, drop keys
+            factor_cols = [
+                c for c in df.columns
+                if c not in ("qlib_code", "signal_date")
+                and pd.api.types.is_numeric_dtype(df[c])
+            ]
+            if not factor_cols:
+                logger.warning("LLM event factors: no numeric factor columns")
+                return None
+
+            df = df.rename(columns={
+                "qlib_code": "instrument",
+                "signal_date": "datetime",
+            })
+            df = df.set_index(["datetime", "instrument"])
+            df = df[factor_cols]
+            # Reindex to caller's MultiIndex; rows that don't match get NaN.
+            # The model's NaN-handling layer downstream zeros them out.
+            result = df.reindex(index)
+            non_null = result.notna().any(axis=1).sum()
+            logger.info(
+                "LLM event factors: %d cols, %d rows non-null",
+                len(factor_cols), non_null,
+            )
+            return result
+        except Exception as e:
+            logger.warning(f"LLM event factors load failed: {e}")
             return None
 
     def _load_cross_market_regime(self, index: pd.MultiIndex) -> pd.DataFrame | None:
