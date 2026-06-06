@@ -333,6 +333,15 @@ def propagate_scores(
             "global_chain_event_count": scores["event_count"],
             "global_chain_pos_score": round(scores["pos_score"], 6),
             "global_chain_neg_score": round(scores["neg_score"], 6),
+            # Phase D / SC-A1: separate company-level alpha for the
+            # consumer that wants the higher-confidence half of the
+            # signal. Equal to global_chain_alpha at this stage because
+            # the rows produced here ARE the company-level path; the
+            # industry-level rows added later inject their own column
+            # values.
+            "company_level_alpha": round(scores["alpha_sum"], 6),
+            "industry_level_alpha": 0.0,
+            "level": "company",
         })
 
     df = pd.DataFrame(records)
@@ -398,25 +407,53 @@ def build_factors(
             if not df.empty:
                 company_stocks = set(df.index.get_level_values("instrument"))
 
+            # Phase D / SC-A1: industry-level alpha must be
+            # zscore-by-date + shrunk + clipped before consumers see it.
+            # Raw scores have mean ~ -14 and span [-47, +15] which is
+            # not usable as either a feature or an overlay weight.
+            import numpy as _np
+            raw_scores = _np.array(
+                [s for s in industry_scores.values()], dtype=float
+            )
+            if len(raw_scores) > 0 and raw_scores.std() > 1e-9:
+                mu = float(raw_scores.mean())
+                sigma = float(raw_scores.std())
+            else:
+                mu, sigma = 0.0, 1.0
+            SHRINK = 0.2
+            CLIP = 3.0  # post-clip range [-3, 3], well within model input scale
+
             industry_rows = []
             for stock, score in industry_scores.items():
                 stock = stock.lower()
                 if stock in company_stocks:
                     continue  # company-level already covered
+                z = (score - mu) / sigma
+                shrunk = max(-CLIP, min(CLIP, z * SHRINK))
                 industry_rows.append({
                     "datetime": dt,
                     "instrument": stock,
-                    "global_chain_alpha": round(score, 4),
+                    # global_chain_alpha keeps the SHRUNK number for
+                    # backward compat — consumers that were reading
+                    # the raw value were the source of the production
+                    # leak A.5-1 closed; they should NOT keep seeing
+                    # the raw distribution.
+                    "global_chain_alpha": round(shrunk, 4),
                     "global_chain_event_count": 1,
-                    "global_chain_pos_score": round(max(0, score), 4),
-                    "global_chain_neg_score": round(min(0, score), 4),
+                    "global_chain_pos_score": round(max(0.0, shrunk), 4),
+                    "global_chain_neg_score": round(min(0.0, shrunk), 4),
+                    "company_level_alpha": 0.0,
+                    "industry_level_alpha": round(shrunk, 4),
+                    "level": "industry",
                 })
 
             if industry_rows:
                 ind_df = pd.DataFrame(industry_rows).set_index(["datetime", "instrument"])
                 df = pd.concat([df, ind_df])
                 logger.info(f"Industry-level: +{len(industry_rows)} stocks "
-                            f"(total {len(df)} stocks)")
+                            f"(zscore × {SHRINK} × clip[±{CLIP}], "
+                            f"raw mean={mu:.1f} std={sigma:.1f}). "
+                            f"Total {len(df)} stocks.")
     except ImportError:
         logger.warning("supply_chain_mapper not available — company-level only")
 
