@@ -371,7 +371,13 @@ def propagate_scores(
     for event in events:
         event_dir = event.get("direction", 0)
         event_conf = event.get("confidence", 0.5)
-        event_date = event.get("date", target_date)
+        # 2026-06-06 PIT fix (P1 #5): prefer published_at (real PIT
+        # timestamp from GDELT / Google RSS) over the legacy ``date``
+        # field which the pre-fix collector clobbered to target_date.
+        # Strip to first 10 chars (YYYY-MM-DD) since _compute_decay
+        # parses with strptime "%Y-%m-%d".
+        pub = (event.get("published_at") or "").strip()
+        event_date = pub[:10] if pub else event.get("date", target_date)
         decay = _compute_decay(event_date, target_date)
 
         matched_edges = _match_event_to_edges(event, entity_edge_map)

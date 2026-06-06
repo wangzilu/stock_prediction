@@ -221,8 +221,15 @@ def batch_extract(news_items: list[dict]) -> list[dict]:
             logger.debug("No keyword match for: %s", title[:60])
             continue
 
-        # Merge metadata from news item
+        # Merge metadata from news item.
+        # 2026-06-06 PIT fix (P1 #5): the upstream collector now keeps
+        # the real ``published_at`` (was clobbered with target_date
+        # before). Persist it on the event so _compute_decay can use
+        # the real publish date and weekend / after-hours / previous-
+        # day news doesn't get squashed into the cron-run date bucket.
         event["date"] = item.get("date", "")
+        event["published_at"] = item.get("published_at", "")
+        event["collect_date"] = item.get("collect_date", "")
         event["title_hash"] = h
         event["source_quality"] = item.get("source_quality", 0.5)
         event["domain"] = item.get("domain", "")

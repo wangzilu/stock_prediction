@@ -260,6 +260,15 @@ def collect_global_industry_news(
             time.sleep(INTER_REQUEST_DELAY)
 
         # Deduplicate within topic by title hash
+        # 2026-06-06 PIT fix (P1 #5): the previous code clobbered the
+        # real publication time the upstream fetcher recorded in
+        # ``published_at`` by writing ``item["date"] = target_date``
+        # (= the cron run date). The downstream decay logic then
+        # treated weekend news, after-hours overseas news and previous-
+        # day RSS posts as if they all happened today, blunting the
+        # decay signal. Now keep both: ``published_at`` is the real
+        # PIT timestamp, ``collect_date`` is the audit field, ``date``
+        # falls back to the publish date (first 10 chars).
         dedup_items = []
         for item in topic_items:
             h = _hash_title(item["title"])
@@ -267,7 +276,13 @@ def collect_global_industry_news(
                 seen_hashes.add(h)
                 item["dedup_hash"] = h
                 item["id"] = h
-                item["date"] = target_date
+                item["collect_date"] = target_date
+                # ``published_at`` is set by both GDELT and Google RSS
+                # fetchers above. Use the first 10 chars (YYYY-MM-DD)
+                # as the canonical event date when present; fall back
+                # to target_date only when upstream gave nothing.
+                pub = (item.get("published_at") or "").strip()
+                item["date"] = pub[:10] if pub else target_date
                 dedup_items.append(item)
 
         all_items.extend(dedup_items)
