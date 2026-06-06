@@ -193,9 +193,16 @@ def main():
                 "factor_column_missing": True,
             }
             continue
-        merged = factors_df.merge(fwd, on=["signal_date", "qlib_code"], how="inner")
+        # 2026-06-06 P1 #2 follow-up: normalise qlib_code casing on
+        # both sides. EventStore returns uppercase (BJ810011) while
+        # JSONL returns lowercase (bj110085); the production forward
+        # returns table uses qlib's lowercase convention. Without the
+        # normalisation the EventStore merge produces 0 rows.
+        factors_df = factors_df.assign(qlib_code=factors_df["qlib_code"].str.lower())
+        fwd_local = fwd.assign(qlib_code=fwd["qlib_code"].str.lower())
+        merged = factors_df.merge(fwd_local, on=["signal_date", "qlib_code"], how="inner")
         logger.info("source=%s  factors=%d  fwd=%d  merged=%d",
-                    source, len(factors_df), len(fwd), len(merged))
+                    source, len(factors_df), len(fwd_local), len(merged))
         if merged.empty:
             logger.warning(
                 "source=%s produced 0 merged rows — key format mismatch "

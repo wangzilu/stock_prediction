@@ -99,9 +99,18 @@ def main():
     # Save
     EVENTS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = EVENTS_DIR / f"{date}.jsonl"
+    # 2026-06-06 PIT fix follow-up (cx review P1 #2): the previous
+    # ``e["date"] = date`` line clobbered the real publication date
+    # ``batch_extract`` had just preserved (from published_at /
+    # collect_date). Now keep what the extractor put on the event:
+    # ``date`` is the canonical publish date when known, with
+    # ``published_at`` and ``collect_date`` recorded alongside. Only
+    # backfill ``date`` from the cron-run date when the event has no
+    # publish info AT ALL (= upstream gave nothing parseable).
     with open(out_path, "w") as f:
         for e in events:
-            e["date"] = date
+            if not e.get("date"):
+                e["date"] = date  # fallback for truly unknown publish dates
             f.write(json.dumps(e, ensure_ascii=False) + "\n")
 
     logger.info(f"Saved to {out_path}")

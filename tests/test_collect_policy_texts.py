@@ -183,24 +183,29 @@ def test_idempotent_rerun_does_not_duplicate_rows(tmp_path: Path):
     }
     fake = _make_http_get(url_map)
 
+    # 2026-06-06 cx review (P2 #4 fix): the previous version of this
+    # test read the JSONL twice AFTER both s1 and s2 had run, so
+    # lines1 and lines2 were always identical by construction. A
+    # regression that doubled the file in s2 (e.g. append instead of
+    # atomic replace) would not be caught. Now we snapshot the file
+    # BETWEEN the two runs so the comparison actually tests
+    # idempotency.
     s1 = ctp.collect_pbc(
         start="2026-06-05", end="2026-06-05",
         policy_types=("omo", "lpr"), bonus_types=(),
         http_get_fn=fake, output_dir=tmp_path,
     )
-    s2 = ctp.collect_pbc(
-        start="2026-06-05", end="2026-06-05",
-        policy_types=("omo", "lpr"), bonus_types=(),
-        http_get_fn=fake, output_dir=tmp_path,
-    )
-
     out = tmp_path / "2026-06-05.jsonl"
     assert out.exists()
     lines1 = [
         json.loads(ln) for ln in out.read_text(encoding="utf-8").splitlines()
         if ln.strip()
     ]
-    # Now run a second time and read again — content must be IDENTICAL.
+    s2 = ctp.collect_pbc(
+        start="2026-06-05", end="2026-06-05",
+        policy_types=("omo", "lpr"), bonus_types=(),
+        http_get_fn=fake, output_dir=tmp_path,
+    )
     lines2 = [
         json.loads(ln) for ln in out.read_text(encoding="utf-8").splitlines()
         if ln.strip()

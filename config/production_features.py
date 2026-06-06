@@ -236,15 +236,20 @@ PROFILE_EXPECTED_COUNTS: dict[str, dict[str, int]] = {
         "qlib_custom": 0,
         "total": 209,
     },
-    # xgb_209_llm — xgb_209 + 5 LLM event factor columns from the
-    # current llm_event_factors.parquet schema (legacy 5-col). When
-    # the L1 fact-count rebuild lands this will move to 12 LLM cols
-    # (5 legacy + 7 fact-count) — update the supplementary count then.
+    # xgb_209_llm — xgb_209 + 12 LLM event factor cols. The L1
+    # fact-count rebuild on 2026-06-06 21:25 grew the parquet from
+    # 5 legacy cols (impact_1d/5d_decayed + sentiment + count_5d +
+    # confidence) to 12 (the 5 legacy + 7 fact-count: positive_3d,
+    # negative_3d, price_sensitive_3d, official_3d, count_3d,
+    # repeated_ratio_3d, event_intensity). The candidate profile
+    # tracks this schema; bump the count if a future schema change
+    # adds more cols (the build_feature_cache_209_llm contract gate
+    # will hard-fail unless this count matches).
     "xgb_209_llm": {
         "alpha158": 158,
-        "supplementary": 56,    # 51 base + 5 LLM
+        "supplementary": 63,    # 51 base + 12 LLM
         "qlib_custom": 0,
-        "total": 214,
+        "total": 221,
     },
     "xgb_174": {
         "alpha158": 158,

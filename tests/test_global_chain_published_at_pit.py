@@ -88,53 +88,60 @@ def test_compute_decay_prefers_published_at_over_date():
     )
 
 
-def test_collector_uses_published_at_for_date_field():
-    """Collector dedup loop must set ``date`` = first 10 chars of
-    ``published_at`` and keep ``collect_date`` as the cron-run date.
-    This is the central fix that breaks the chain.
-
-    We don't run the live HTTP path; we exercise the dedup transform
-    directly with a tiny synthetic input.
+def test_canonicalise_publish_date_handles_real_upstream_formats():
+    """2026-06-06 cx review (P2 #3 fix): the previous version of this
+    test re-implemented the collector's dedup loop instead of calling
+    it, so a regression that broke the collector but not the test's
+    local copy would have shipped silently. The real published_at
+    formats from GDELT (YYYYMMDDHHMMSS) and Google RSS (RFC 822) also
+    weren't covered. This test exercises the real
+    ``_canonicalise_publish_date`` helper against both upstream
+    formats, plus YYYY-MM-DD and empty.
     """
-    # Replicate the collector's dedup loop logic in-test to lock the
-    # contract. The real code is at scripts/collect_global_industry_news
-    # around line 270 — kept here as a self-contained behavioural test.
-    target_date = "2026-06-06"
-    items = [
-        {
-            "title": "Apple unveils new iPhone for AI tasks",
-            "published_at": "2026-06-04T18:45:00Z",
-            "domain": "reuters.com",
-            "source_quality": 0.9,
-        },
-        {
-            # Item with no upstream timestamp should fall back to target_date
-            "title": "Generic market news",
-            "published_at": "",
-            "domain": "yahoo.com",
-            "source_quality": 0.6,
-        },
-    ]
-    # Mirror the patched dedup loop body
-    seen_hashes = set()
-    out = []
-    for item in items:
-        # Use a trivial hash so the test is deterministic
-        h = hash(item["title"])
-        if h in seen_hashes:
-            continue
-        seen_hashes.add(h)
-        item["id"] = h
-        item["collect_date"] = target_date
-        pub = (item.get("published_at") or "").strip()
-        item["date"] = pub[:10] if pub else target_date
-        out.append(item)
+    from scripts.collect_global_industry_news import _canonicalise_publish_date
 
-    assert out[0]["date"] == "2026-06-04", (
-        f"Apple item date must be from published_at, got {out[0]['date']!r}"
+    # GDELT seendate: YYYYMMDDHHMMSS (14 digits, no separators)
+    assert _canonicalise_publish_date("20260604153045") == "2026-06-04", (
+        "GDELT seendate must be canonicalised to YYYY-MM-DD; "
+        "pre-fix [:10] would return '2026060415' which strptime "
+        "%Y-%m-%d cannot parse → age_days=0 → fresh-news leak"
     )
-    assert out[0]["collect_date"] == target_date
-    assert out[1]["date"] == target_date, (
-        f"Empty published_at item must fall back to target_date, "
-        f"got {out[1]['date']!r}"
+    # Google News RSS pubDate: RFC 822
+    rfc822 = "Sat, 06 Jun 2026 14:30:00 GMT"
+    assert _canonicalise_publish_date(rfc822) == "2026-06-06"
+    rfc822_zone = "Sat, 06 Jun 2026 14:30:00 +0000"
+    assert _canonicalise_publish_date(rfc822_zone) == "2026-06-06"
+    # ISO 8601 (some collectors normalise to this)
+    assert _canonicalise_publish_date("2026-06-04T18:45:00Z") == "2026-06-04"
+    # Bare date
+    assert _canonicalise_publish_date("2026-06-04") == "2026-06-04"
+    # Empty / None / garbage → None
+    assert _canonicalise_publish_date("") is None
+    assert _canonicalise_publish_date(None) is None
+    assert _canonicalise_publish_date("not a date") is None
+
+
+def test_canonicalise_publish_date_pre_fix_bug_does_not_regress():
+    """Ensure the actual bug surface from the cx review is closed:
+    the bare [:10] slice on a GDELT seendate returns '2026060415',
+    which cannot be parsed by ``%Y-%m-%d`` → builder falls back to
+    ``age_days=0`` → every old news is treated as fresh. Verify the
+    real helper does NOT have this property."""
+    from scripts.collect_global_industry_news import _canonicalise_publish_date
+    from scripts.build_global_chain_factors import _compute_decay
+
+    # The bug surface: pre-fix code would have produced this string
+    pre_fix_output = "20260604153045"[:10]   # "2026060415" — broken
+    fixed = _canonicalise_publish_date("20260604153045")
+    assert pre_fix_output != fixed, "the fix changes the behaviour"
+    assert fixed == "2026-06-04"
+    # And the decay computation against today must show non-zero age
+    decay = _compute_decay(fixed, "2026-06-06")
+    decay_zero = _compute_decay(pre_fix_output, "2026-06-06")
+    # The broken string fails strptime → age_days=0 → full weight
+    # The fixed string gives age=2d → decay < 1
+    assert decay < decay_zero, (
+        f"fixed canonical date must give lower decay weight than the "
+        f"pre-fix broken string (which collapses to age=0). "
+        f"fixed_decay={decay}, broken_decay={decay_zero}"
     )

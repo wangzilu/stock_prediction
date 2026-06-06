@@ -44,6 +44,61 @@ REQUEST_TIMEOUT = 15  # seconds per request
 INTER_REQUEST_DELAY = 0.5  # be polite to APIs
 
 
+def _canonicalise_publish_date(raw: str | None) -> str | None:
+    """Best-effort parse of upstream publication timestamps.
+
+    GDELT 2.0 ``seendate`` is ``YYYYMMDDHHMMSS`` (14 digits, no separators).
+    Google News RSS ``pubDate`` is RFC 822 such as
+    ``Sat, 06 Jun 2026 14:30:00 GMT``. The pre-2026-06-06 code did
+    ``raw[:10]`` which turns these into ``2026060614`` and
+    ``Sat, 06 J`` respectively — both fail the downstream
+    ``%Y-%m-%d`` strptime in ``_compute_decay``, which then quietly
+    sets ``age_days=0`` and treats every old article as fresh.
+    This helper canonicalises both formats (and the YYYY-MM-DD case)
+    to ``YYYY-MM-DD``. Returns ``None`` when the input is empty or
+    unparseable; callers fall back to ``target_date`` in that case.
+    """
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    # YYYYMMDDHHMMSS (GDELT seendate)
+    if len(s) >= 8 and s[:8].isdigit():
+        try:
+            dt = datetime.strptime(s[:8], "%Y%m%d")
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    # YYYY-MM-DD or YYYY-MM-DDTHH...
+    try:
+        dt = datetime.strptime(s[:10], "%Y-%m-%d")
+        return dt.strftime("%Y-%m-%d")
+    except ValueError:
+        pass
+    # RFC 822 / RFC 1123 (Google News RSS pubDate)
+    for fmt in (
+        "%a, %d %b %Y %H:%M:%S %Z",
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%a, %d %b %Y %H:%M:%S GMT",
+    ):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    # Last resort: email.utils.parsedate_to_datetime handles many edge
+    # cases of RFC 2822 (including obs-zone, +0000, two-digit years).
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(s)
+        if dt is not None:
+            return dt.strftime("%Y-%m-%d")
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
 def _hash_title(title: str) -> str:
     """Create a stable dedup hash from title text."""
     normalized = title.strip().lower()
@@ -260,15 +315,15 @@ def collect_global_industry_news(
             time.sleep(INTER_REQUEST_DELAY)
 
         # Deduplicate within topic by title hash
-        # 2026-06-06 PIT fix (P1 #5): the previous code clobbered the
-        # real publication time the upstream fetcher recorded in
-        # ``published_at`` by writing ``item["date"] = target_date``
-        # (= the cron run date). The downstream decay logic then
-        # treated weekend news, after-hours overseas news and previous-
-        # day RSS posts as if they all happened today, blunting the
-        # decay signal. Now keep both: ``published_at`` is the real
-        # PIT timestamp, ``collect_date`` is the audit field, ``date``
-        # falls back to the publish date (first 10 chars).
+        # 2026-06-06 PIT fix (P1 #5 + cx review): canonical-date the
+        # real publication time the upstream fetcher recorded. The
+        # naive [:10] slice broke because:
+        #   - GDELT seendate is YYYYMMDDHHMMSS (no dashes)
+        #   - Google RSS pubDate is RFC 822 ("Sat, 06 Jun 2026 14:30:00 GMT")
+        # Both would silently parse to ``age_days=0`` in
+        # build_global_chain_factors._compute_decay, exactly the bug we
+        # were trying to fix. Now route every upstream timestamp through
+        # ``_canonicalise_publish_date`` which understands both formats.
         dedup_items = []
         for item in topic_items:
             h = _hash_title(item["title"])
@@ -277,12 +332,8 @@ def collect_global_industry_news(
                 item["dedup_hash"] = h
                 item["id"] = h
                 item["collect_date"] = target_date
-                # ``published_at`` is set by both GDELT and Google RSS
-                # fetchers above. Use the first 10 chars (YYYY-MM-DD)
-                # as the canonical event date when present; fall back
-                # to target_date only when upstream gave nothing.
-                pub = (item.get("published_at") or "").strip()
-                item["date"] = pub[:10] if pub else target_date
+                canon = _canonicalise_publish_date(item.get("published_at"))
+                item["date"] = canon if canon else target_date
                 dedup_items.append(item)
 
         all_items.extend(dedup_items)
@@ -355,6 +406,15 @@ def main():
         "--retry", action="store_true",
         help="Re-collect even if output already exists",
     )
+    parser.add_argument(
+        "--fail-on-empty", action="store_true",
+        help=(
+            "2026-06-06 P3 #6 cron-hardening: exit 1 when 0 items "
+            "land. Without this, cron sees a green collector while "
+            "the downstream extract step fails-loud on the empty "
+            "input — operators waste time bisecting up the chain."
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -363,6 +423,15 @@ def main():
             retry=args.retry,
         )
         logger.info("Done: %s", output)
+        # 2026-06-06 P3 #6 fix: surface empty collection as non-zero
+        # exit when the cron explicitly asks for it. write_health
+        # already records the empty state correctly; this just makes
+        # the cron wrapper visible.
+        if args.fail_on_empty and (output is None or
+                                     (isinstance(output, dict) and
+                                      output.get("n_total", 0) == 0)):
+            logger.error("fail-on-empty: 0 items collected. Exiting 1.")
+            sys.exit(1)
     except Exception as e:
         logger.error("Collection failed: %s", e)
         import traceback
