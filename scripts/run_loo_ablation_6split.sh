@@ -24,7 +24,7 @@ END_DATE="2026-05-19"
 # Groups with > 0 columns in the current cache. fundamental + northbound
 # return 0 cols today (parquets absent in this build) so dropping them
 # is a no-op; skipped to save 14 minutes.
-GROUPS=(
+LOO_GROUPS=(
     "capital_flow"
     "macro_zero_baseline"
     "shareholder"
@@ -53,11 +53,17 @@ run_one() {
     echo "[loo] $(date '+%F %T') END   $label rc=$rc"
 }
 
-# 1. Baseline (no drop) — comparison anchor.
-run_one "baseline_full242" ""
+# 1. Baseline (no drop) — comparison anchor. Skip when its checkpoint
+# dir already exists; the resumable runner would re-emit the same
+# numbers and write a duplicate ledger row anyway.
+if [ -f "$PROJECT_ROOT/data/storage/phase4e_loo_baseline_full242_6split/summary.json" ]; then
+    echo "[loo] $(date '+%F %T') SKIP  baseline_full242 (already has summary.json)"
+else
+    run_one "baseline_full242" ""
+fi
 
 # 2. One LOO per group.
-for g in "${GROUPS[@]}"; do
+for g in "${LOO_GROUPS[@]}"; do
     run_one "drop_${g}" "--drop-group $g"
 done
 
