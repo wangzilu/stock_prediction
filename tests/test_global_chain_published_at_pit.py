@@ -45,10 +45,11 @@ def test_extractor_persists_published_at_and_collect_date():
     from factors.global_supply_chain_extractor import batch_extract
 
     news_items = [{
-        # This title is known to match an extractor keyword rule
-        # (TSMC + chip production). Don't change the title without
-        # also updating the rules.
-        "title": "TSMC chip production rises 30 percent year on year",
+        # This title is known to match the extractor's "record high"
+        # keyword rule → price_extreme. Don't change the title without
+        # also updating the rules in
+        # factors/global_supply_chain_extractor._KEYWORD_RULES.
+        "title": "Apple iPhone sales hit record high",
         "topic": "AI",
         "published_at": "2026-06-04T22:30:00Z",
         "collect_date": "2026-06-05",
@@ -57,8 +58,8 @@ def test_extractor_persists_published_at_and_collect_date():
         "domain": "reuters.com",
     }]
     events = batch_extract(news_items)
-    # At least one event extracted from the TSMC keyword rule.
-    assert events, "batch_extract returned no events for TSMC title"
+    # At least one event extracted from the record-high keyword rule.
+    assert events, "batch_extract returned no events"
     e = events[0]
     assert e.get("published_at") == "2026-06-04T22:30:00Z", (
         f"published_at not preserved: {e.get('published_at')!r}"
