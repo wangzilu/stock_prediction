@@ -725,6 +725,12 @@ class FeatureMerger:
             if llm is not None:
                 frames.append(llm)
 
+        # Guba popularity factors (shadow path before promotion via ablation)
+        if allowed is None or "guba" in allowed:
+            guba = _run("guba", self._load_guba)
+            if guba is not None:
+                frames.append(guba)
+
         # Cross-market regime signals (恒生/纳指 - broadcast to all stocks per date)
         if allowed is None or "cross_market_regime" in allowed:
             cross_mkt = _run("cross_market_regime", self._load_cross_market_regime)
@@ -1392,6 +1398,49 @@ class FeatureMerger:
             return result
         except Exception as e:
             logger.warning(f"ST holder_number load failed: {e}")
+            return None
+
+    def _load_guba(self, index: pd.MultiIndex) -> pd.DataFrame | None:
+        """Load Eastmoney Guba popularity factors.
+
+        2026-06-06 (P1 #4): collect_guba_sentiment.py produces a clean
+        (datetime, instrument) parquet with 3 cols
+        (popularity_rank / rank_change / popularity_score) but no
+        FeatureMerger loader existed, so the data sat on disk and never
+        reached production. This loader wires it. Inclusion in any
+        profile is gated by ``config.production_features`` — the
+        candidate profile xgb_209_guba uses it; the default xgb_209
+        does NOT, pending ablation evidence.
+        """
+        path = self.data_dir / "guba_factors.parquet"
+        if not path.exists():
+            logger.warning("Guba factors parquet not found: %s", path)
+            return None
+        try:
+            df = pd.read_parquet(path)
+            if df.empty:
+                logger.warning("Guba factors empty")
+                return None
+            # Source already has the right MultiIndex. Reindex onto the
+            # caller's index; missing rows get NaN (downstream NaN
+            # handler zeros them out).
+            if not isinstance(df.index, pd.MultiIndex):
+                logger.warning("Guba parquet has unexpected index: %s",
+                               df.index.names)
+                return None
+            factor_cols = [
+                c for c in df.columns
+                if pd.api.types.is_numeric_dtype(df[c])
+            ]
+            if not factor_cols:
+                return None
+            result = df[factor_cols].reindex(index)
+            non_null = result.notna().any(axis=1).sum()
+            logger.info("Guba factors: %d cols, %d rows non-null",
+                        len(factor_cols), non_null)
+            return result
+        except Exception as e:
+            logger.warning(f"Guba factors load failed: {e}")
             return None
 
     def _load_llm_event_factors(self, index: pd.MultiIndex) -> pd.DataFrame | None:

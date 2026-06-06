@@ -437,9 +437,19 @@ def main():
             candidate_cols.update(group_map[g])
         dropped_cols = [c for c in feat_cols if c in candidate_cols]
         if not dropped_cols:
-            print(f"  [warn] --drop-group {requested_groups} matched 0 of "
-                  f"{len(candidate_cols)} expected cols in the cache. "
-                  f"Check that the cache was built for this profile.")
+            # 2026-06-06 P2 #4 fix: a zero-match drop was previously a
+            # warning but the run continued. That meant a manifest /
+            # cache drift could silently produce a "drop X" ledger row
+            # whose feature set was identical to the baseline, and the
+            # B-style verdict would treat a non-ablation as evidence.
+            # Hard-fail now so the wrapper's FAILED[] catches it.
+            raise SystemExit(
+                f"--drop-group {requested_groups} matched 0 of "
+                f"{len(candidate_cols)} expected cols in the cache. "
+                f"Likely manifest/cache drift. Refusing to write a "
+                f"non-ablation row into the ledger. Cache columns "
+                f"start: {sorted(feat_cols)[:8]}..."
+            )
         else:
             feat_cols = [c for c in feat_cols if c not in candidate_cols]
             dropped_groups = requested_groups

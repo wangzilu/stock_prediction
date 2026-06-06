@@ -4,7 +4,17 @@
 production default flip (jsonl → eventstore) as needing IC evidence
 before we can lock the new default in for ablation runs. This script
 runs build_factors for both sources over the same date range and
-computes rank-IC against forward 1-day return at signal_date+1.
+computes rank-IC against the production label (see semantics below).
+
+**Label semantics (P1 #2 honest correction)**: load_forward_returns
+falls back to the production 242/209 feature cache when the dedicated
+market_calendar_daily.parquet is absent, and reads ``__label_5d``
+keyed on the same-day (datetime, instrument) pair. The output is
+therefore "same-day key × production 5-day label proxy", not the
+"forward 1-day return at signal_date+1" the script header originally
+implied. 5-day label IS the production model's target so it stays
+informative for ablation, but treat the output as a 5d-target IC and
+not a strict 1d forward IC.
 
 The build_llm_event_factors docstring documented that on 2026-05-29
 the two paths produced a 17000% sentiment_score mean difference and

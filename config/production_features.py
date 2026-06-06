@@ -101,6 +101,23 @@ SUPPLEMENTARY_GROUPS_BY_PROFILE: dict[str, tuple[str, ...]] = {
         "st_moneyflow",
         "st_holder_number",
     ),
+    # xgb_209_guba — CANDIDATE profile, NOT YET PRODUCTION.
+    # xgb_209 + 3 Eastmoney Guba popularity cols
+    # (popularity_rank / rank_change / popularity_score). Same shadow
+    # contract as xgb_209_llm: the loader is wired in feature_merger.py
+    # so a Phase B-style LOO can ablate it, but production stays on
+    # xgb_209 until ablation evidence shows ΔRankIC ≥ +0.005.
+    "xgb_209_guba": (
+        "fundamental",
+        "macro_zero_baseline",
+        "valuation",
+        "northbound",
+        "quality",
+        "st_daily_basic",
+        "st_moneyflow",
+        "st_holder_number",
+        "guba",
+    ),
     # xgb_209_llm — CANDIDATE profile, NOT YET PRODUCTION.
     # xgb_209 plus the LLM event factor group (5 cols today, will be
     # 5+7 once L1 fact-count factors rebuild). Created so the Phase B

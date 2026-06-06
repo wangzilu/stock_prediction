@@ -594,6 +594,17 @@ def main(argv: list[str] | None = None) -> int:
             "blocking the run."
         ),
     )
+    parser.add_argument(
+        "--fail-on-empty", action="store_true",
+        help=(
+            "2026-06-06 P3 #6 cron-hardening: exit 1 when no rows were "
+            "written for any requested date. Without this flag the "
+            "script always exits 0 and write_health flags success=False / "
+            "no_rows, which a cron that only looks at exit code or file "
+            "existence will miss. Enable for production cron, disable "
+            "for local exploration."
+        ),
+    )
     args = parser.parse_args(argv)
 
     today = datetime.now().strftime("%Y-%m-%d")
@@ -646,6 +657,16 @@ def main(argv: list[str] | None = None) -> int:
     # obvious what was written.
     for p in summary["files_written"]:
         logger.info("  -> %s (%d rows)", p, summary["rows_by_date"][p.stem])
+    # 2026-06-06 P3 #6 fix: surface a non-zero exit when the user
+    # asked for fail-loud and not a single row landed. write_health
+    # already records this correctly; this is for cron wrappers that
+    # only watch the exit code.
+    if args.fail_on_empty and summary["n_total"] == 0:
+        logger.error(
+            "fail-on-empty: 0 rows written across [%s..%s]. Exiting 1.",
+            start, end,
+        )
+        return 1
     return 0
 
 

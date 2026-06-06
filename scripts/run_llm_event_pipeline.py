@@ -385,11 +385,14 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
         return False
 
     # Step 3: Build factors
-    # 2026-06-04 cx round 17 P1-3 + round 19 P1-1: production
-    # default is ``jsonl`` to match the builder default and the
-    # CLI help block ("EventStore changes factor distribution ~100x,
-    # not for live"). Flipping the production source is now an
-    # opt-in via env LLM_EVENT_FACTOR_SOURCE=eventstore only.
+    # 2026-06-06 (P1 #1 critique + P1 #3 cx review): production default
+    # is now ``eventstore`` after resolve_llm_event_factor_source +
+    # build_factors_range defaults were flipped (commit 0c3d6b8 + 48243dd
+    # fixed the eventstore bool.astype crash). JSONL groups by file_date
+    # which is mis-PIT relative to the rest of the overlay; eventstore
+    # groups by signal_date (next business day after publish_time) which
+    # matches every downstream factor's assumption. Override via env
+    # LLM_EVENT_FACTOR_SOURCE=jsonl only for back-compat backfills.
     logger.info("[Step 3/3] Building quantitative factors...")
     try:
         from scripts.build_llm_event_factors import (

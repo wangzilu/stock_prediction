@@ -513,9 +513,12 @@ def main():
     parser.add_argument("--lookback", type=int, default=30, help="Event lookback days (default: 30)")
     parser.add_argument(
         "--source", choices=["jsonl", "eventstore"], default="eventstore",
-        help="Event source: 'jsonl' (default, current production) groups by file_date; "
-             "'eventstore' groups by signal_date and changes factor distributions by ~100x. "
-             "Use eventstore only for IC backtests, not live production.",
+        help="Event source: 'eventstore' (default, PIT-safe signal_date "
+             "semantics, 2026-06-06 default flip) or 'jsonl' (legacy "
+             "file_date semantics, kept for backfills). Distribution shifts "
+             "between the two paths can be ~100x on a single day; flip the "
+             "default only when the IC backtest evidence file at "
+             "data/storage/llm_factor_ic_compare/ shows parity or a win.",
     )
     parser.add_argument(
         "--allow-fallback", action="store_true",

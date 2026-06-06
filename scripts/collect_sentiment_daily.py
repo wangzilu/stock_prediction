@@ -1,6 +1,18 @@
 """Daily batch sentiment collection from Xueqiu + Eastmoney Guba + 同花顺.
 
-Collects hot stock discussions and saves to EventStore.
+Collects hot-stock lists / trending discussions / concept rankings
+from three retail-investor surfaces and writes them as raw JSONL.
+
+Output:
+  - data/storage/sentiment/<YYYY-MM-DD>.jsonl — one line per item
+    with fields: stock_code, stock_name, source, heat, rank, date.
+    Sources: xueqiu_hot, ths_hot, ths_concept, guba_hot.
+
+2026-06-06 doc fix (P1 #4): the original header claimed
+"saves to EventStore". That was untrue — this script only writes
+JSONL. EventStore wiring + a derived sentiment_factors.parquet are
+filed as task #164 follow-ups; until they ship, the sentiment chain
+is collection-only and the factors are NOT in the production model.
 
 Usage:
     python scripts/collect_sentiment_daily.py [--date YYYY-MM-DD] [--top-n 100]

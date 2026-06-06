@@ -43,6 +43,12 @@ def main():
     ap.add_argument("--base", default=str(DEFAULT_BASE))
     ap.add_argument("--llm", default=str(DEFAULT_LLM))
     ap.add_argument("--out", default=str(DEFAULT_OUT))
+    ap.add_argument(
+        "--allow-schema-drift", action="store_true",
+        help="Override the LLM-col-count contract gate (P1 #1 fix). "
+             "Use only when you've updated PROFILE_EXPECTED_COUNTS to "
+             "match the new LLM schema in the same change.",
+    )
     args = ap.parse_args()
 
     base_path = Path(args.base)
@@ -66,6 +72,37 @@ def main():
     llm_cols = [c for c in llm.columns if c not in ("qlib_code", "signal_date")]
     if not llm_cols:
         raise SystemExit("LLM parquet has no factor columns")
+
+    # 2026-06-06 P1 #1 contract gate: the candidate profile
+    # xgb_209_llm in config/production_features.py asserts a specific
+    # supplementary count. If the LLM parquet schema drifted (e.g.
+    # L1 fact-count rebuild added 7 cols), the cache will silently
+    # carry 12 LLM cols while the profile expects 5 — and a B-style
+    # LOO would compare the wrong dimensions. Hard-fail unless the
+    # ``--expected-llm-cols`` flag matches OR the user explicitly
+    # opts into schema drift with ``--allow-schema-drift``.
+    try:
+        from config.production_features import PROFILE_EXPECTED_COUNTS
+        contract = PROFILE_EXPECTED_COUNTS.get("xgb_209_llm", {})
+        if contract:
+            expected_supp = contract.get("supplementary", 0)
+            base_supp = PROFILE_EXPECTED_COUNTS.get("xgb_209", {}).get("supplementary", 0)
+            expected_llm = expected_supp - base_supp  # supp diff = LLM col count
+            if expected_llm > 0 and len(llm_cols) != expected_llm:
+                if not args.allow_schema_drift:
+                    raise SystemExit(
+                        f"LLM schema drift detected: parquet has "
+                        f"{len(llm_cols)} cols ({llm_cols}), but "
+                        f"xgb_209_llm profile expects {expected_llm} "
+                        f"(supp={expected_supp} - base={base_supp}). "
+                        f"Either update PROFILE_EXPECTED_COUNTS or "
+                        f"re-run with --allow-schema-drift."
+                    )
+                else:
+                    print(f"[209_llm] WARN: schema drift accepted "
+                          f"({len(llm_cols)} vs expected {expected_llm})")
+    except ImportError:
+        pass
 
     # Align LLM frame to the (datetime, instrument) MultiIndex.
     llm["signal_date"] = pd.to_datetime(llm["signal_date"])
