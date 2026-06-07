@@ -299,14 +299,20 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                  "--check-today"],
                 "data_update.log",
                 network="domestic", timeout_sec=3600, critical=True),
+        # cx batch G P1 #3 (2026-06-07): enforce_deps wired up. Both
+        # gate on qlib_data_update per scheduler/job_deps.py.
+        # dep_wait_seconds=3600 covers qlib's worst-case 3600s timeout
+        # so a slow qlib doesn't make these false-fail-quick.
         CronJob("fund_flow_update", "55 17 * * 1-5",
                 [py, str(scripts / "fetch_fund_flow_history.py"), "--incremental", "--workers", "1"],
                 "fund_flow_update.log",
-                network="domestic", timeout_sec=1800),
+                network="domestic", timeout_sec=1800,
+                enforce_deps=True, dep_wait_seconds=3600),
         CronJob("st_daily_factors_update", "58 17 * * 1-5",
                 [py, str(scripts / "fetch_st_daily_factors.py"), "--days", "60"],
                 "st_daily_factors_update.log",
-                network="domestic", timeout_sec=1800),
+                network="domestic", timeout_sec=1800,
+                enforce_deps=True, dep_wait_seconds=3600),
         # st_holder_number is quarterly, but it is a production feature
         # source distinct from shareholder_features.parquet. Refresh weekly
         # with --force so new announcements are not skipped merely because
@@ -316,21 +322,33 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                  "--only", "stk_holdernumber", "--force"],
                 "st_holder_number_update.log",
                 network="domestic", timeout_sec=7200),
+        # cx batch G P1 #3 (2026-06-07): enforce_deps wired up — these
+        # all gate on qlib_data_update per scheduler/job_deps.py and
+        # feed into feature_cache_rebuild downstream.
         CronJob("valuation_update", "0 18 * * 1-5",
                 [py, str(scripts / "fetch_fundamental_valuation.py"), "--days", "10", "--incremental"],
                 "valuation_update.log",
-                network="domestic", timeout_sec=1200),
+                network="domestic", timeout_sec=1200,
+                enforce_deps=True, dep_wait_seconds=3600),
         CronJob("shareholder_update", "2 18 * * 1-5",
                 [py, str(scripts / "fetch_shareholder_data.py")],
                 "shareholder_update.log",
-                network="domestic", timeout_sec=3600),
+                network="domestic", timeout_sec=3600,
+                enforce_deps=True, dep_wait_seconds=3600),
         CronJob("regime_daily_update", "5 18 * * 1-5",
                 [py, str(scripts / "update_regime_daily.py")], "regime_daily.log",
-                network="domestic", timeout_sec=1200),
+                network="domestic", timeout_sec=1200,
+                enforce_deps=True, dep_wait_seconds=3600),
         # --- Training (none) ---
+        # cx batch G P1 #3 (2026-06-07): enforce_deps wired up — gates
+        # on feature_cache_rebuild which itself fires at 18:25, before
+        # this 18:15 schedule on Wednesdays. The wait budget covers
+        # the worst-case feature_cache_rebuild → 30 min poll + own
+        # 30 min build → 19:25; 7200s gives multiple-hour headroom.
         CronJob("midweek_train", "15 18 * * 3",
                 [py, str(scripts / "train_lgb.py")], "lgb_after_close_train.log",
-                network="none", timeout_sec=7200),
+                network="none", timeout_sec=7200,
+                enforce_deps=True, dep_wait_seconds=7200),
         # --- Feature cache rebuild (depends on qlib_data_update + fund_flow_update) ---
         # qlib_data_update 17:45 + fund_flow_update 17:55 (timeout 1800s).
         # In the worst case fund_flow runs until ~18:25, so the cache rebuild
@@ -420,9 +438,14 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                 network="none", timeout_sec=120,
                 enforce_deps=True, dep_wait_seconds=3600),
         # --- Monitoring (none) ---
+        # cx batch G P1 #3 (2026-06-07): enforce_deps wired up — these
+        # both gate on lgb_after_close_smoke per scheduler/job_deps.py
+        # and would silently regress to yesterday's monitoring output
+        # if the 18:35 smoke step had failed.
         CronJob("factor_decay_monitor", "49 18 * * 1-5",
                 [py, str(scripts / "monitor_factor_decay.py")], "factor_decay.log",
-                network="none", timeout_sec=600),
+                network="none", timeout_sec=600,
+                enforce_deps=True, dep_wait_seconds=3600),
         # brinson_attribution: timeout bumped 600 → 1200 (Task #76).
         # The window itself is a fixed 29 days (run_brinson_attribution.py
         # line 53), but Alpha158 dataset preparation has grown past 600s on
@@ -431,7 +454,8 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         # finishes long before the 22:00 evening_outlook gate.
         CronJob("brinson_attribution", "50 18 * * 1-5",
                 [py, str(scripts / "run_brinson_attribution.py")], "brinson_attribution.log",
-                network="none", timeout_sec=1200),
+                network="none", timeout_sec=1200,
+                enforce_deps=True, dep_wait_seconds=3600),
         # --- LLM 429 retry queue drain (after main pipeline + evening) ---
         # Deliberately NOT enforce_deps. This is a recovery job — gating it
         # on the main pipeline's success would defeat its purpose when the
@@ -442,18 +466,32 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("llm_retry_queue_drain", "30 22 * * 1-5",
                 [py, str(scripts / "drain_llm_retry_queue.py")], "llm_retry_drain.log",
                 network="llm", timeout_sec=3600),
+        # cx batch G P1 #3 (2026-06-07): enforce_deps wired up — gates
+        # on qlib_data_update per scheduler/job_deps.py so a failed
+        # 17:45 qlib update produces a deferred-but-known block at
+        # 18:55 rather than a "healthy" report against stale data.
         CronJob("daily_health_check", "55 18 * * 1-5",
                 [py, str(scripts / "daily_health_check.py")], "health_check.log",
-                network="none", timeout_sec=300),
+                network="none", timeout_sec=300,
+                enforce_deps=True, dep_wait_seconds=3600),
         # --- Weekly (Saturday) ---
         # 2026-06-06: bumped 14400→28800 (4h→8h). Last run died at 08:00
         # after 4h with qlib instruments sync still running (5208 stocks
         # took 2h 25min on its own; train never started). Without this
         # the slow data-prep phase eats the entire budget and the actual
         # retrain step is never reached.
+        # cx batch G P1 #3 (2026-06-07): enforce_deps wired up — gates
+        # on feature_cache_rebuild per scheduler/job_deps.py. Saturday
+        # 04:00 runs hours after Friday 18:25 cache build, so the
+        # check passes immediately on the happy path; on a failed
+        # Friday cache it correctly refuses rather than training on
+        # Thursday's snapshot. dep_wait_seconds is short here because
+        # by 04:00 Saturday the Friday build is either done or never
+        # finishing — no point polling.
         CronJob("weekly_full_retrain", "0 4 * * 6",
                 [py, str(scripts / "nightly_train.py")], "weekly_retrain.log",
-                network="none", timeout_sec=28800),
+                network="none", timeout_sec=28800,
+                enforce_deps=True, dep_wait_seconds=300),
         CronJob("weekly_st_refresh", "0 3 * * 6",
                 [py, str(scripts / "fetch_st_list.py")], "st_refresh.log",
                 network="domestic", timeout_sec=600),

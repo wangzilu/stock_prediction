@@ -133,8 +133,16 @@ JOB_DEPS: dict[str, list[str]] = {
     # cache for its head-only crash model. They will migrate when the
     # 174 vs 209 retrain decision (#112) lands.
     "midweek_train": ["feature_cache_rebuild"],
+    # cx batch D P1 #4 (commit 24a0122): smoke now gates on
+    # champion_cache_rebuild — the 209-family caches that smoke + paper
+    # actually consume. Legacy feature_cache_rebuild is research-only.
     "lgb_after_close_smoke": ["champion_cache_rebuild"],
-    "weekly_full_retrain": ["feature_cache_rebuild"],
+    # cx batch G P1 #3: weekly_full_retrain runs Sat 04:00 against
+    # Friday's 18:25 cache — the gate lives in JOB_DEPS_PREV_BDAY so
+    # check_upstream_full walks the previous business day's status
+    # file. Same-day deps stay empty so daily_status etc still report
+    # the job correctly.
+    "weekly_full_retrain": [],
     "predict_crash_daily": ["feature_cache_rebuild"],
     # ---- Shadow optimizer + paper trading depend on smoke test -----------
     "shadow_optimizer": ["lgb_after_close_smoke", "predict_crash_daily"],
@@ -179,6 +187,9 @@ JOB_DEPS_PREV_BDAY: dict[str, list[str]] = {
     "sell_check": [
         "lgb_after_close_smoke",
     ],
+    # Saturday 04:00 weekly_full_retrain wants Friday's 18:25 cache —
+    # not Saturday's, which never ran.
+    "weekly_full_retrain": ["feature_cache_rebuild"],
 }
 
 
