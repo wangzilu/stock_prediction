@@ -6,9 +6,23 @@ event store with a unified schema, PIT-safe dating, and deduplication.
 5 explicit time fields (added 2026-05-24):
     event_time      — when the event actually happened
     publish_time    — when it was published / disclosed
-    available_time  — when the system first ingested it (optional)
+    available_time  — when the data became consumable (publish + parser lag)
     signal_date     — which trading day it can enter signals
     execution_date  — which trading day it can be traded (T+1 open)
+
+PE-5 (task #144, 2026-06-07) — strict PIT 4-time contract:
+    Every event row, on write, MUST have all four of
+        publish_time / available_time / signal_date / execution_date
+    populated and internally consistent. Writes that violate the contract
+    raise ``PITContractError`` (suppressed only when ``strict_pit=False``
+    is passed to the EventStore constructor, used by the migration
+    helper and a handful of legacy tests).
+
+    Derivation rules (used when a writer omits the derived fields):
+      - available_time = publish_time + parser_lag (default: same as publish_time)
+      - signal_date    = next business day AFTER available_time (pandas BDay)
+      - execution_date = signal_date + 1 BDay  if available_time >= 15:00
+                       = signal_date          otherwise
 
 Usage:
     from factors.event_store import EventStore, migrate_legacy_events
@@ -229,6 +243,172 @@ def _compute_signal_date(publish_time_str: str, fallback_date: str) -> str:
     return ts.normalize().strftime("%Y-%m-%d")
 
 
+# ---------------------------------------------------------------------------
+# PE-5 (task #144) — strict PIT 4-time contract
+# ---------------------------------------------------------------------------
+
+class PITContractError(ValueError):
+    """Raised when a write violates the PIT 4-time contract.
+
+    See module docstring for the contract. Suppressed only when an
+    EventStore was constructed with ``strict_pit=False``.
+    """
+
+
+# Market close in 24h local time. Anything published / available at or
+# after this hour is treated as post-close for execution_date purposes.
+MARKET_CLOSE_HOUR = 15
+
+
+def _parse_dt(value: str) -> datetime | None:
+    """Lenient datetime parser used by the PIT helpers.
+
+    Accepts ``YYYY-MM-DD``, ``YYYY-MM-DD HH:MM:SS``, ``YYYY-MM-DDTHH:MM:SS``
+    (optionally with trailing ``Z`` / fractional / offset). Returns None
+    on any failure rather than raising — callers decide how to handle.
+    """
+    if not value or not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    # First try datetime patterns (need at least 19 chars).
+    if len(s) >= 19:
+        # Trim to a 19-char ``YYYY-MM-DD?HH:MM:SS`` window; this tolerates
+        # trailing fractional seconds / timezone designators like Z or +08:00.
+        head = s[:19]
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(head, fmt)
+            except (ValueError, TypeError):
+                continue
+    # Fall back to date-only.
+    if len(s) >= 10:
+        try:
+            return datetime.strptime(s[:10], "%Y-%m-%d")
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _next_business_day(ts: pd.Timestamp) -> pd.Timestamp:
+    """Strict next-business-day: always advance at least one BDay."""
+    return (ts.normalize() + BDay(1)).normalize()
+
+
+def _compute_pit_times(
+    publish_time: str,
+    *,
+    parser_lag_seconds: int = 0,
+    available_time_override: str | None = None,
+) -> dict[str, str]:
+    """Derive (available_time, signal_date, execution_date) from publish_time.
+
+    Rules (see module docstring):
+      - available_time = publish_time + parser_lag_seconds
+                         (or override when caller supplies one)
+      - signal_date    = next business day AFTER available_time
+      - execution_date = signal_date + BDay(1) if available_time >= 15:00
+                         else signal_date
+
+    Returns a dict with keys ``available_time`` / ``signal_date`` /
+    ``execution_date`` (all strings). Raises ``PITContractError`` if
+    ``publish_time`` cannot be parsed and no override is supplied — the
+    caller is expected to either provide a parseable ``publish_time`` or
+    pre-compute the fields.
+    """
+    pub_dt = _parse_dt(publish_time)
+    if pub_dt is None and not available_time_override:
+        raise PITContractError(
+            f"_compute_pit_times: cannot parse publish_time={publish_time!r}"
+        )
+
+    # available_time
+    if available_time_override:
+        avail_str = available_time_override
+        avail_dt = _parse_dt(available_time_override)
+        if avail_dt is None:
+            # Override is a bare date — treat as midnight that day
+            try:
+                avail_dt = datetime.strptime(available_time_override[:10], "%Y-%m-%d")
+            except (ValueError, TypeError) as e:
+                raise PITContractError(
+                    f"_compute_pit_times: unparseable available_time_override={available_time_override!r}"
+                ) from e
+    else:
+        # Pad publish_time with parser_lag_seconds
+        avail_dt = pub_dt + timedelta(seconds=max(0, int(parser_lag_seconds)))
+        avail_str = avail_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    # signal_date = strict next BDay after available_time (advance >= 1 BDay
+    # so even an event available on a Monday morning maps to Tuesday).
+    sig_ts = _next_business_day(pd.Timestamp(avail_dt))
+    sig_str = sig_ts.strftime("%Y-%m-%d")
+
+    # execution_date depends on whether available_time is post-close
+    if avail_dt.hour >= MARKET_CLOSE_HOUR:
+        exec_ts = (sig_ts + BDay(1)).normalize()
+    else:
+        exec_ts = sig_ts
+    exec_str = exec_ts.strftime("%Y-%m-%d")
+
+    return {
+        "available_time": avail_str,
+        "signal_date": sig_str,
+        "execution_date": exec_str,
+    }
+
+
+_REQUIRED_PIT_FIELDS = ("publish_time", "available_time", "signal_date", "execution_date")
+
+
+def _validate_pit_times(event: dict) -> None:
+    """Assert the PIT 4-time contract on ``event``.
+
+    Raises ``PITContractError`` if any required field is missing/empty
+    or if the date ordering is violated. Returns silently on success.
+    """
+    missing = [
+        f for f in _REQUIRED_PIT_FIELDS
+        if not event.get(f) or (isinstance(event.get(f), str) and not event[f].strip())
+    ]
+    if missing:
+        raise PITContractError(
+            f"PIT contract: missing/empty field(s) {missing} "
+            f"on event stock_code={event.get('stock_code', '?')!r} "
+            f"event_type={event.get('event_type', '?')!r}"
+        )
+
+    # Consistency: signal_date >= available_time (compare on date portion),
+    # execution_date >= signal_date.
+    avail_dt = _parse_dt(str(event["available_time"]))
+    if avail_dt is None:
+        raise PITContractError(
+            f"PIT contract: unparseable available_time={event['available_time']!r}"
+        )
+
+    try:
+        sig_ts = pd.Timestamp(str(event["signal_date"]))
+        exec_ts = pd.Timestamp(str(event["execution_date"]))
+    except (ValueError, TypeError) as e:
+        raise PITContractError(
+            f"PIT contract: unparseable signal_date / execution_date "
+            f"({event.get('signal_date')!r} / {event.get('execution_date')!r})"
+        ) from e
+
+    avail_date = pd.Timestamp(avail_dt.date())
+    if sig_ts.normalize() < avail_date:
+        raise PITContractError(
+            f"PIT contract: signal_date {event['signal_date']!r} < "
+            f"available_time {event['available_time']!r} (date portion)"
+        )
+    if exec_ts.normalize() < sig_ts.normalize():
+        raise PITContractError(
+            f"PIT contract: execution_date {event['execution_date']!r} < "
+            f"signal_date {event['signal_date']!r}"
+        )
+
+
 def _validate_event(event: dict) -> tuple[dict, list[str]]:
     """Validate and normalise an event dict.
 
@@ -280,34 +460,43 @@ def _validate_event(event: dict) -> tuple[dict, list[str]]:
     if "publish_time" not in out:
         out["publish_time"] = event.get("publish_time", "")
 
-    # available_time: when the system first ingested it (optional)
-    out["available_time"] = (
-        event.get("available_time")
-        or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    )
+    # PE-5 (task #144): derive available_time / signal_date / execution_date
+    # via the canonical _compute_pit_times helper so that every write goes
+    # through the same contract. Caller-supplied values still win — the
+    # helper only fills gaps. If caller supplied none and publish_time is
+    # unparseable, _compute_pit_times raises; we catch and let
+    # _validate_pit_times produce the final, contract-shaped error at the
+    # write-path entry point.
+    pub = (out.get("publish_time") or "").strip()
+    avail_override = event.get("available_time")
+    try:
+        derived = _compute_pit_times(
+            pub, available_time_override=avail_override,
+        )
+    except PITContractError:
+        derived = {}
 
-    # signal_date & execution_date: auto-computed from publish_time
-    pub = out.get("publish_time", "") or ""
-    fallback = out.get("date", "")
+    if event.get("available_time"):
+        out["available_time"] = event["available_time"]
+    elif derived.get("available_time"):
+        out["available_time"] = derived["available_time"]
+    else:
+        # Last-resort fallback — leave empty so _validate_pit_times rejects.
+        out["available_time"] = ""
+
     if event.get("signal_date"):
         out["signal_date"] = event["signal_date"]
+    elif derived.get("signal_date"):
+        out["signal_date"] = derived["signal_date"]
     else:
-        out["signal_date"] = _compute_signal_date(pub, fallback)
+        out["signal_date"] = ""
 
     if event.get("execution_date"):
         out["execution_date"] = event["execution_date"]
+    elif derived.get("execution_date"):
+        out["execution_date"] = derived["execution_date"]
     else:
-        # execution_date = next business day after signal_date.
-        # signal_date is the first trading day the event becomes actionable.
-        # An order generated on that day fills at the FOLLOWING session's open
-        # (T+1), so execution_date must be that next business day, not signal_date.
-        # Previously these were equal — module docstring already documented this
-        # gap; the actual write path is now consistent with it.
-        try:
-            sd = pd.Timestamp(out["signal_date"])
-            out["execution_date"] = (sd + BDay(1)).strftime("%Y-%m-%d")
-        except (ValueError, TypeError):
-            out["execution_date"] = out["signal_date"]
+        out["execution_date"] = ""
 
     # Dedup hash
     out["_hash"] = _event_hash(out)
@@ -322,9 +511,26 @@ def _validate_event(event: dict) -> tuple[dict, list[str]]:
 class EventStore:
     """Unified event store backed by daily JSONL files."""
 
-    def __init__(self, store_dir: str | Path | None = None):
+    def __init__(
+        self,
+        store_dir: str | Path | None = None,
+        *,
+        strict_pit: bool = True,
+    ):
+        """Create / open an EventStore.
+
+        Args:
+            store_dir: directory of daily ``YYYY-MM-DD.jsonl`` files.
+                Defaults to ``data/storage/events/``.
+            strict_pit: enforce the PE-5 PIT 4-time contract on every
+                write. Default True — set False only for the migration
+                helper (``scripts/migrate_eventstore_pit_times.py``) or
+                legacy regression tests that intentionally exercise
+                non-PIT inputs. See module docstring.
+        """
         self.store_dir = Path(store_dir) if store_dir else STORE_DIR
         self.store_dir.mkdir(parents=True, exist_ok=True)
+        self.strict_pit = strict_pit
         # In-memory dedup set for current session (per-file dedup also on disk)
         self._seen_hashes: set[str] = set()
 
@@ -352,10 +558,26 @@ class EventStore:
         return hashes
 
     def add_event(self, event: dict) -> bool:
-        """Validate and append one event. Returns True if stored (not dup)."""
+        """Validate and append one event. Returns True if stored (not dup).
+
+        PE-5 (task #144): when ``self.strict_pit`` is True (default),
+        the PIT 4-time contract is enforced — a write missing any of
+        ``publish_time`` / ``available_time`` / ``signal_date`` /
+        ``execution_date`` (or with inconsistent date ordering) raises
+        ``PITContractError``. The migration helper passes
+        ``strict_pit=False`` because its input is intentionally
+        pre-contract JSONL.
+        """
         ev, warns = _validate_event(event)
         for w in warns:
             logger.warning("EventStore validation: %s  event=%s", w, event.get("stock_code", "?"))
+
+        # PE-5 PIT 4-time contract — raise on violation so the bad row is
+        # never persisted. Callers that intentionally want to write
+        # pre-contract rows (migration / legacy backfill) must use
+        # ``EventStore(strict_pit=False)``.
+        if self.strict_pit:
+            _validate_pit_times(ev)
 
         date_str = ev.get("date", "")
         if not date_str:
@@ -603,12 +825,32 @@ def _convert_legacy_event(raw: dict, file_date: str) -> dict:
     if "magnitude" in raw:
         magnitude = float(raw["magnitude"])
 
-    # Compute the 5 explicit time fields for migrated events
-    signal_date = _compute_signal_date(publish_time, available_date)
+    # PE-5 (task #144): compute PIT 4-time fields via the canonical helper.
+    # Preference order for available_time:
+    #   1. raw["available_time"] if present (already PIT-shaped)
+    #   2. raw["extract_date"]   (legacy LLM cache provides this)
+    #   3. publish_time          (no parser lag known)
+    # When publish_time itself is unparseable (truly pre-PIT-era rows)
+    # we fall back to file_date so the row still satisfies the contract.
+    avail_override = (
+        raw.get("available_time")
+        or raw.get("extract_date")
+        or publish_time
+        or file_date
+    )
     try:
-        execution_date = (pd.Timestamp(signal_date) + BDay(1)).strftime("%Y-%m-%d")
-    except (ValueError, TypeError):
-        execution_date = signal_date
+        pit = _compute_pit_times(
+            publish_time or file_date,
+            available_time_override=avail_override,
+        )
+    except PITContractError:
+        # Last-resort: use file_date as a midnight available_time so
+        # the contract is satisfied. This only fires on truly malformed
+        # rows; the migration helper logs + skips when even that fails.
+        pit = _compute_pit_times(
+            f"{file_date} 00:00:00",
+            available_time_override=f"{file_date} 00:00:00",
+        )
 
     unified = {
         "date": available_date,
@@ -619,16 +861,13 @@ def _convert_legacy_event(raw: dict, file_date: str) -> dict:
         "confidence": max(0.0, min(1.0, float(raw.get("confidence", 0.5)))),
         "summary": str(raw.get("summary", ""))[:200],
         # Optional
-        "publish_time": publish_time,
+        "publish_time": publish_time or f"{file_date} 00:00:00",
         "topic": raw.get("topic", ""),
-        # 5 explicit time fields
+        # 5 explicit time fields (PE-5)
         "event_time": publish_time or file_date,   # best guess for legacy
-        "available_time": raw.get("extract_date", file_date),
-        "signal_date": signal_date,
-        # execution_date = next business day after signal_date. A T+1-open
-        # order generated on signal_date can only fill at the FOLLOWING
-        # session's open, so execution_date must be that next business day.
-        "execution_date": execution_date,
+        "available_time": pit["available_time"],
+        "signal_date": pit["signal_date"],
+        "execution_date": pit["execution_date"],
         # Metadata
         "llm_model": raw.get("model_version", ""),
         "prompt_version": raw.get("prompt_version", ""),
