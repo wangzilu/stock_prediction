@@ -6,6 +6,7 @@ Saves to: data/storage/brinson_attribution.json
 Usage:
     python scripts/run_brinson_attribution.py
 """
+import argparse
 import json
 import logging
 import os
@@ -29,7 +30,7 @@ DATA_DIR = PROJECT_ROOT / "data" / "storage"
 OUTPUT_PATH = DATA_DIR / "brinson_attribution.json"
 
 
-def run_attribution():
+def run_attribution(model_path: str | None = None, profile: str | None = None):
     from config.qlib_runtime import init_qlib
     from config.settings import (
         LGB_INFERENCE_UNIVERSE,
@@ -39,17 +40,26 @@ def run_attribution():
     from models.portfolio_policy import sector_from_code
 
     # 2026-06-04 cx round 8 P1-3: use the production-safe loader so
-    # Brinson attribution sees the SAME 242-dim feature shape as
-    # the live champion. Pre-fix the script unpickled the 242-dim
-    # model against a 158-dim Alpha158 dataset → silent default-leaf
-    # predictions → garbage sector/timing attribution numbers.
+    # Brinson attribution sees the SAME profile-aligned feature shape as
+    # the live champion. Pre-fix the script unpickled the model against
+    # a bare Alpha158 (158-dim) dataset → silent default-leaf predictions
+    # → garbage sector/timing attribution numbers.
+    # cx round 23 E.P2 #6: route to active-profile binary by default and
+    # thread profile= through so candidates can be attributed correctly.
     from models.production_inference import load_production_model
 
     label_expr = f"Ref($close, -{PREDICTION_HORIZON_DAYS}) / Ref($close, -1) - 1"
 
-    model_path = DATA_DIR / "lgb_model.pkl"
-    if not model_path.exists():
-        logger.error("Model not found")
+    if model_path is not None:
+        resolved_model_path = Path(model_path)
+    else:
+        try:
+            from config.production_features import production_model_filename
+            resolved_model_path = DATA_DIR / production_model_filename(profile)
+        except Exception:
+            resolved_model_path = DATA_DIR / "lgb_model.pkl"
+    if not resolved_model_path.exists():
+        logger.error("Model not found: %s", resolved_model_path)
         return None
 
     today = datetime.now()
@@ -59,9 +69,10 @@ def run_attribution():
     logger.info(f"Loading dataset for {test_start} ~ {test_end}...")
     model, dataset = load_production_model(
         test_start, test_end,
-        model_path=str(model_path),
+        model_path=str(resolved_model_path),
         instruments=LGB_INFERENCE_UNIVERSE,
         label_expr=label_expr,
+        profile=profile,
     )
 
     pred = model.predict(dataset=dataset)
@@ -164,7 +175,20 @@ def run_attribution():
 
 
 def main():
-    result = run_attribution()
+    # cx round 23 E.P2 #6: explicit overrides; defaults route to
+    # active-profile binary via run_attribution.
+    parser = argparse.ArgumentParser(description="Brinson attribution")
+    parser.add_argument(
+        "--model-path", default=None,
+        help="Override model binary. Default: active-profile binary.",
+    )
+    parser.add_argument(
+        "--profile", default=None,
+        help="Candidate profile name (e.g. xgb_242). Default: active profile.",
+    )
+    args = parser.parse_args()
+
+    result = run_attribution(model_path=args.model_path, profile=args.profile)
     if result is None:
         return 1
 

@@ -32,7 +32,12 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = PROJECT_ROOT / "data" / "storage"
 QLIB_DATA = str(DATA_DIR / "qlib_data" / "cn_data")
-MODEL_PATH = str(DATA_DIR / "lgb_model.pkl")
+# cx round 23 E.P2 #6: default to active-profile binary, not legacy alias.
+try:
+    from config.production_features import production_model_filename
+    MODEL_PATH = str(DATA_DIR / production_model_filename())
+except Exception:
+    MODEL_PATH = str(DATA_DIR / "lgb_model.pkl")
 ATTRIBUTION_PATH = DATA_DIR / "lgb_attribution_latest.json"
 
 
@@ -61,23 +66,32 @@ def get_industry_map() -> dict:
         return {}
 
 
-def simple_attribution(topk: int = 20, test_days: int = 30) -> dict:
-    """Run simplified Brinson attribution."""
-    # 2026-06-04 cx round 8 P1-3: production-safe loader (242-dim).
+def simple_attribution(
+    topk: int = 20, test_days: int = 30,
+    model_path: str | None = None, profile: str | None = None,
+) -> dict:
+    """Run simplified Brinson attribution.
+
+    cx round 23 E.P2 #6: takes explicit model_path / profile so a
+    candidate model can be attributed against ITS contract.
+    """
+    # 2026-06-04 cx round 8 P1-3: production-safe loader.
     from models.production_inference import load_production_model
 
     today = datetime.now()
     test_start = (today - timedelta(days=test_days)).strftime("%Y-%m-%d")
     test_end = today.strftime("%Y-%m-%d")
 
-    if not os.path.exists(MODEL_PATH):
-        return {"error": "Model not found"}
+    effective_model_path = model_path if model_path is not None else MODEL_PATH
+    if not os.path.exists(effective_model_path):
+        return {"error": f"Model not found: {effective_model_path}"}
 
     model, dataset = load_production_model(
         test_start, test_end,
-        model_path=MODEL_PATH,
+        model_path=effective_model_path,
         instruments="all",
         label_expr=f"Ref($close, -{PREDICTION_HORIZON_DAYS}) / Ref($close, -1) - 1",
+        profile=profile,
     )
 
     pred = model.predict(dataset=dataset)
@@ -179,12 +193,38 @@ def simple_attribution(topk: int = 20, test_days: int = 30) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="Brinson attribution")
+    # cx round 23 E.P2 #6: explicit overrides; defaults route to
+    # active-profile binary via simple_attribution.
+    parser.add_argument(
+        "--model-path", default=None,
+        help=f"Override model binary. Default: active-profile binary ({MODEL_PATH}).",
+    )
+    parser.add_argument(
+        "--profile", default=None,
+        help="Candidate profile name. Default: active profile.",
+    )
     parser.add_argument("--topk", type=int, default=20)
     parser.add_argument("--test-days", type=int, default=30)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
-    result = simple_attribution(topk=args.topk, test_days=args.test_days)
+    # Resolve effective model path: explicit > profile-derived > default.
+    if args.model_path is not None:
+        effective_model_path = args.model_path
+    elif args.profile is not None:
+        try:
+            from config.production_features import production_model_filename
+            effective_model_path = str(DATA_DIR / production_model_filename(args.profile))
+        except Exception as exc:
+            print(json.dumps({"error": f"profile resolution failed: {exc}"}))
+            sys.exit(1)
+    else:
+        effective_model_path = None  # let simple_attribution use MODEL_PATH
+
+    result = simple_attribution(
+        topk=args.topk, test_days=args.test_days,
+        model_path=effective_model_path, profile=args.profile,
+    )
 
     # Save
     ATTRIBUTION_PATH.parent.mkdir(parents=True, exist_ok=True)

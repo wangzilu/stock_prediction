@@ -30,7 +30,12 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = PROJECT_ROOT / "data" / "storage"
 QLIB_DATA = str(DATA_DIR / "qlib_data" / "cn_data")
-MODEL_PATH = str(DATA_DIR / "lgb_model.pkl")
+# cx round 23 E.P2 #6: default to active-profile binary, not legacy alias.
+try:
+    from config.production_features import production_model_filename
+    MODEL_PATH = str(DATA_DIR / production_model_filename())
+except Exception:
+    MODEL_PATH = str(DATA_DIR / "lgb_model.pkl")
 BACKTEST_PATH = DATA_DIR / "lgb_backtest_latest.json"
 
 # A-share transaction costs
@@ -46,6 +51,7 @@ def backtest(
     test_days: int = 60,
     topk: int = 20,
     max_drop: int = 5,
+    profile: str | None = None,
 ) -> dict:
     if not os.path.exists(model_path):
         return {"ok": False, "error": f"Model file not found: {model_path}"}
@@ -64,13 +70,16 @@ def backtest(
     rebalance_period = PREDICTION_HORIZON_DAYS
 
     # 2026-06-04 cx round 8 P1-3: production-safe loader.
+    # cx round 23 E.P2 #6: thread profile= through so a candidate binary
+    # is backtested against ITS contract, not the live champion's.
     from models.production_inference import load_production_model
-    logger.info("Loading dataset (242-dim production aligned)...")
+    logger.info("Loading dataset (profile-aligned)...")
     model, dataset = load_production_model(
         test_start, test_end,
         model_path=model_path,
         instruments=universe,
         label_expr=f"Ref($close, -{PREDICTION_HORIZON_DAYS}) / Ref($close, -1) - 1",
+        profile=profile,
     )
 
     pred = model.predict(dataset=dataset)
@@ -206,7 +215,16 @@ def backtest(
 
 def main():
     parser = argparse.ArgumentParser(description="Backtest LGB signal")
-    parser.add_argument("--model-path", default=MODEL_PATH)
+    # cx round 23 E.P2 #6: --model-path default None → active-profile;
+    # --profile lets the caller backtest a specific candidate.
+    parser.add_argument(
+        "--model-path", default=None,
+        help=f"Override model binary. Default: active-profile binary ({MODEL_PATH}).",
+    )
+    parser.add_argument(
+        "--profile", default=None,
+        help="Candidate profile name (e.g. xgb_242). Default: active profile.",
+    )
     parser.add_argument("--universe", default="all")
     parser.add_argument("--test-days", type=int, default=60)
     parser.add_argument("--topk", type=int, default=20)
@@ -214,12 +232,25 @@ def main():
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
+    if args.model_path is not None:
+        effective_model_path = args.model_path
+    elif args.profile is not None:
+        try:
+            from config.production_features import production_model_filename
+            effective_model_path = str(DATA_DIR / production_model_filename(args.profile))
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": f"profile resolution failed: {exc}"}))
+            sys.exit(1)
+    else:
+        effective_model_path = MODEL_PATH
+
     result = backtest(
-        model_path=args.model_path,
+        model_path=effective_model_path,
         universe=args.universe,
         test_days=args.test_days,
         topk=args.topk,
         max_drop=args.max_drop,
+        profile=args.profile,
     )
 
     # Save

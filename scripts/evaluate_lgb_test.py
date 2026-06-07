@@ -32,7 +32,14 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = PROJECT_ROOT / "data" / "storage"
 QLIB_DATA = str(DATA_DIR / "qlib_data" / "cn_data")
-MODEL_PATH = str(DATA_DIR / "lgb_model.pkl")
+# cx round 23 E.P2 #6: resolve to the ACTIVE profile's binary instead of
+# the legacy alias. Evaluating the legacy path while the live champion is
+# a different profile produces numbers that don't represent reality.
+try:
+    from config.production_features import production_model_filename
+    MODEL_PATH = str(DATA_DIR / production_model_filename())
+except Exception:
+    MODEL_PATH = str(DATA_DIR / "lgb_model.pkl")
 EVAL_PATH = DATA_DIR / "lgb_eval_latest.json"
 EVAL_HISTORY_PATH = DATA_DIR / "lgb_eval_history.json"
 
@@ -46,6 +53,7 @@ def evaluate(
     min_predictions: int = LGB_MIN_PREDICTIONS,
     test_days: int = 30,
     topk: int = 20,
+    profile: str | None = None,
 ) -> dict:
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
@@ -69,11 +77,14 @@ def evaluate(
     # and produced silent-garbage IC/spread that misled "is 242 ok?"
     # decisions.
     from models.production_inference import load_production_model
+    # cx round 23 E.P2 #6: thread profile= through so a candidate binary
+    # is evaluated against ITS contract, not the live champion's.
     model, dataset = load_production_model(
         test_start, test_end,
         model_path=model_path,
         instruments=universe,
         label_expr=LABEL_EXPR,
+        profile=profile,
     )
 
     logger.info("Running predictions...")
@@ -193,7 +204,18 @@ def evaluate(
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate LGB model quality")
-    parser.add_argument("--model-path", default=MODEL_PATH)
+    # cx round 23 E.P2 #6: --model-path defaults to None so production-safe
+    # semantics (active-profile binary) kick in when omitted; --profile lets
+    # the caller evaluate a specific candidate without aliasing through the
+    # legacy lgb_model.pkl symlink.
+    parser.add_argument(
+        "--model-path", default=None,
+        help=f"Override the model binary. Default: active-profile binary ({MODEL_PATH}).",
+    )
+    parser.add_argument(
+        "--profile", default=None,
+        help="Candidate profile name (e.g. xgb_242). Default: active profile.",
+    )
     parser.add_argument("--universe", default="all")
     parser.add_argument("--min-predictions", type=int, default=LGB_MIN_PREDICTIONS)
     parser.add_argument("--test-days", type=int, default=30)
@@ -201,12 +223,28 @@ def main():
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
+    # Resolve effective model path: explicit --model-path > profile binary
+    # > active-profile default. load_production_model will refuse to fall
+    # back to the live champion contract when model_path is custom.
+    if args.model_path is not None:
+        effective_model_path = args.model_path
+    elif args.profile is not None:
+        try:
+            from config.production_features import production_model_filename
+            effective_model_path = str(DATA_DIR / production_model_filename(args.profile))
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": f"profile resolution failed: {exc}"}))
+            sys.exit(1)
+    else:
+        effective_model_path = MODEL_PATH
+
     result = evaluate(
-        model_path=args.model_path,
+        model_path=effective_model_path,
         universe=args.universe,
         min_predictions=args.min_predictions,
         test_days=args.test_days,
         topk=args.topk,
+        profile=args.profile,
     )
 
     # Save latest
