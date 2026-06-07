@@ -37,7 +37,9 @@ logger = logging.getLogger(__name__)
 EDGES_PATH = PROJECT_ROOT / "data" / "config" / "supply_chain_edges.yaml"
 NEWS_DIR = PROJECT_ROOT / "data" / "storage" / "global_industry_news"
 EVENTS_DIR = PROJECT_ROOT / "data" / "storage" / "global_chain_events"
+EVENTS_DIR_LLM = PROJECT_ROOT / "data" / "storage" / "global_chain_events_llm"
 OUTPUT_PATH = PROJECT_ROOT / "data" / "storage" / "global_chain_factors.parquet"
+OUTPUT_PATH_LLM = PROJECT_ROOT / "data" / "storage" / "global_chain_factors_llm.parquet"
 
 # Decay half-life in days (event impact halves every N days)
 DECAY_HALF_LIFE = 3
@@ -171,18 +173,27 @@ def _build_entity_edge_map(edges: list[dict]) -> dict[str, list[dict]]:
 def _load_pre_extracted_events(
     target_date: str,
     lookback_days: int = EVENT_LOOKBACK_DAYS,
+    source: str = "rule",
 ) -> list[dict]:
-    """Load pre-extracted events from global_chain_events/ directory.
+    """Load pre-extracted events from global_chain_events/ or global_chain_events_llm/.
 
-    These are produced by extract_global_supply_chain_events.py and are
-    preferred over re-extracting from raw news.
+    2026-06-07: added ``source`` arg for B.7 ablation. ``"rule"`` reads
+    from the rule-based extractor's output (production cron), ``"llm"``
+    reads from the LLM extractor's output. Both share the downstream
+    propagation logic so the LOO is comparing pipelines, not propagation.
     """
     import json
+    if source == "llm":
+        events_dir = EVENTS_DIR_LLM
+    elif source == "rule":
+        events_dir = EVENTS_DIR
+    else:
+        raise ValueError(f"Unknown source {source!r}, must be 'rule' or 'llm'")
     target = pd.Timestamp(target_date)
     events = []
     for i in range(lookback_days):
         d = (target - pd.Timedelta(days=i)).strftime("%Y-%m-%d")
-        path = EVENTS_DIR / f"{d}.jsonl"
+        path = events_dir / f"{d}.jsonl"
         if path.exists():
             for line in open(path):
                 line = line.strip()
@@ -191,7 +202,7 @@ def _load_pre_extracted_events(
                     e.setdefault("date", d)
                     events.append(e)
     if events:
-        logger.info(f"Loaded {len(events)} pre-extracted events from {EVENTS_DIR}")
+        logger.info(f"Loaded {len(events)} pre-extracted events from {events_dir}")
     return events
 
 
@@ -458,6 +469,7 @@ def build_factors(
     target_date: str,
     demo: bool = False,
     lookback_days: int = EVENT_LOOKBACK_DAYS,
+    source: str = "rule",
 ) -> pd.DataFrame:
     """End-to-end: load edges + events, propagate, output parquet.
 
@@ -465,6 +477,8 @@ def build_factors(
         target_date: YYYY-MM-DD
         demo: if True, use synthetic demo events
         lookback_days: how many days of news to look back
+        source: "rule" (default, production cron path) or "llm"
+            (reads extract_global_chain_llm.py output for B.7 ablation).
 
     Returns:
         DataFrame with factor values.
@@ -477,8 +491,12 @@ def build_factors(
         # Prefer pre-extracted events from global_chain_events/ (produced by
         # extract_global_supply_chain_events.py). Fall back to raw news + rule
         # extraction if pre-extracted events don't exist.
-        events = _load_pre_extracted_events(target_date, lookback_days)
-        if not events:
+        # 2026-06-07: source="llm" routes to global_chain_events_llm/
+        # produced by extract_global_chain_llm.py.
+        events = _load_pre_extracted_events(target_date, lookback_days, source=source)
+        if not events and source == "rule":
+            # LLM source has no fallback — if extraction failed, the
+            # B.7 ablation must reflect that absence honestly.
             events = load_events_from_news(target_date, lookback_days=lookback_days)
 
     if not events:
@@ -593,11 +611,14 @@ def build_factors(
         logger.warning("No factor scores produced")
         return df
 
-    # Save to parquet (append if exists)
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Save to parquet (append if exists). 2026-06-07: route to
+    # OUTPUT_PATH_LLM when source="llm" so the B.7 ablation doesn't
+    # clobber the production rule-based parquet.
+    out_path = OUTPUT_PATH_LLM if source == "llm" else OUTPUT_PATH
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if OUTPUT_PATH.exists():
-        existing = pd.read_parquet(OUTPUT_PATH)
+    if out_path.exists():
+        existing = pd.read_parquet(out_path)
         # Remove existing rows for this date to avoid duplicates
         if "datetime" in existing.index.names:
             dt = pd.Timestamp(target_date)
@@ -606,8 +627,8 @@ def build_factors(
         df = pd.concat([existing, df])
         df = df.sort_index()
 
-    df.to_parquet(OUTPUT_PATH)
-    logger.info("Saved factors to %s (%d rows)", OUTPUT_PATH, len(df))
+    df.to_parquet(out_path)
+    logger.info("Saved factors to %s (%d rows)", out_path, len(df))
 
     return df
 
@@ -653,12 +674,21 @@ def main():
         "--lookback", type=int, default=EVENT_LOOKBACK_DAYS,
         help=f"Days of news to look back (default: {EVENT_LOOKBACK_DAYS})",
     )
+    parser.add_argument(
+        "--source", choices=["rule", "llm"], default="rule",
+        help="Event source: 'rule' (default, production cron) or 'llm' "
+             "(B.7 ablation — reads global_chain_events_llm/ from "
+             "extract_global_chain_llm.py output). LLM source writes "
+             "to global_chain_factors_llm.parquet so it doesn't "
+             "clobber the production parquet.",
+    )
     args = parser.parse_args()
 
     target_date = args.date or datetime.now().strftime("%Y-%m-%d")
 
     try:
-        df = build_factors(target_date, demo=args.demo, lookback_days=args.lookback)
+        df = build_factors(target_date, demo=args.demo, lookback_days=args.lookback,
+                           source=args.source)
         if not df.empty:
             print(f"\n=== Global Chain Factors for {target_date} ===")
             print(f"Stocks affected: {len(df)}")

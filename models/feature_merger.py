@@ -731,6 +731,18 @@ class FeatureMerger:
             if guba is not None:
                 frames.append(guba)
 
+        # Global supply chain alpha (rule-based) — shadow group
+        if allowed is None or "global_chain" in allowed:
+            gc = _run("global_chain", self._load_global_chain)
+            if gc is not None:
+                frames.append(gc)
+
+        # Global supply chain alpha (LLM source) — Phase B.7 candidate
+        if allowed is None or "global_chain_llm" in allowed:
+            gcl = _run("global_chain_llm", self._load_global_chain_llm)
+            if gcl is not None:
+                frames.append(gcl)
+
         # Cross-market regime signals (恒生/纳指 - broadcast to all stocks per date)
         if allowed is None or "cross_market_regime" in allowed:
             cross_mkt = _run("cross_market_regime", self._load_cross_market_regime)
@@ -1399,6 +1411,51 @@ class FeatureMerger:
         except Exception as e:
             logger.warning(f"ST holder_number load failed: {e}")
             return None
+
+    def _load_global_chain(self, index: pd.MultiIndex,
+                            llm: bool = False) -> pd.DataFrame | None:
+        """Load global supply chain alpha factors.
+
+        2026-06-07 (Phase B.7): added so xgb_209_chain / xgb_209_chain_llm
+        candidate profiles can ablate via the standard --drop-group path.
+        ``llm=False`` reads the rule-based parquet (production cron).
+        ``llm=True`` reads the LLM-extracted parquet (B.7 ablation).
+        Both share the same downstream loader so only the source events
+        differ — the propagation, decay and shrink are identical.
+
+        Drops the non-numeric ``level`` column before reindex.
+        """
+        name = "global_chain_factors_llm.parquet" if llm else "global_chain_factors.parquet"
+        path = self.data_dir / name
+        if not path.exists():
+            logger.warning("Chain factors parquet not found: %s", path)
+            return None
+        try:
+            df = pd.read_parquet(path)
+            if df.empty:
+                return None
+            if not isinstance(df.index, pd.MultiIndex):
+                logger.warning("Chain parquet has unexpected index: %s",
+                               df.index.names)
+                return None
+            factor_cols = [
+                c for c in df.columns
+                if pd.api.types.is_numeric_dtype(df[c])
+            ]
+            if not factor_cols:
+                return None
+            result = df[factor_cols].reindex(index)
+            non_null = result.notna().any(axis=1).sum()
+            logger.info("Chain factors (%s): %d cols, %d rows non-null",
+                        "llm" if llm else "rule", len(factor_cols), non_null)
+            return result
+        except Exception as e:
+            logger.warning(f"Chain factors load failed: {e}")
+            return None
+
+    def _load_global_chain_llm(self, index: pd.MultiIndex) -> pd.DataFrame | None:
+        """LLM source thin wrapper around _load_global_chain."""
+        return self._load_global_chain(index, llm=True)
 
     def _load_guba(self, index: pd.MultiIndex) -> pd.DataFrame | None:
         """Load Eastmoney Guba popularity factors.

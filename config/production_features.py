@@ -101,6 +101,35 @@ SUPPLEMENTARY_GROUPS_BY_PROFILE: dict[str, tuple[str, ...]] = {
         "st_moneyflow",
         "st_holder_number",
     ),
+    # xgb_209_chain — CANDIDATE profile, NOT YET PRODUCTION.
+    # xgb_209 + global supply chain rule-based factors (6 numeric cols).
+    # Shadow contract; promotion gated by ablation evidence.
+    "xgb_209_chain": (
+        "fundamental",
+        "macro_zero_baseline",
+        "valuation",
+        "northbound",
+        "quality",
+        "st_daily_basic",
+        "st_moneyflow",
+        "st_holder_number",
+        "global_chain",
+    ),
+    # xgb_209_chain_llm — CANDIDATE profile for Phase B.7 ablation.
+    # xgb_209 + global supply chain LLM-extracted factors (same 6 cols
+    # as xgb_209_chain but from extract_global_chain_llm.py output).
+    # Differs from xgb_209_chain only in event source.
+    "xgb_209_chain_llm": (
+        "fundamental",
+        "macro_zero_baseline",
+        "valuation",
+        "northbound",
+        "quality",
+        "st_daily_basic",
+        "st_moneyflow",
+        "st_holder_number",
+        "global_chain_llm",
+    ),
     # xgb_209_guba — CANDIDATE profile, NOT YET PRODUCTION.
     # xgb_209 + 3 Eastmoney Guba popularity cols
     # (popularity_rank / rank_change / popularity_score). Same shadow
@@ -235,6 +264,29 @@ PROFILE_EXPECTED_COUNTS: dict[str, dict[str, int]] = {
         "supplementary": 51,
         "qlib_custom": 0,
         "total": 209,
+    },
+    # xgb_209_guba — xgb_209 + 3 guba popularity cols.
+    "xgb_209_guba": {
+        "alpha158": 158,
+        "supplementary": 54,    # 51 base + 3 guba
+        "qlib_custom": 0,
+        "total": 212,
+    },
+    # xgb_209_chain / xgb_209_chain_llm — 6 supply-chain alpha cols
+    # (global_chain_alpha + event_count + pos_score + neg_score +
+    # company_level_alpha + industry_level_alpha; "level" is text and
+    # excluded by the loader).
+    "xgb_209_chain": {
+        "alpha158": 158,
+        "supplementary": 57,    # 51 base + 6 chain
+        "qlib_custom": 0,
+        "total": 215,
+    },
+    "xgb_209_chain_llm": {
+        "alpha158": 158,
+        "supplementary": 57,    # same shape as chain rule-based
+        "qlib_custom": 0,
+        "total": 215,
     },
     # xgb_209_llm — xgb_209 + 12 LLM event factor cols. The L1
     # fact-count rebuild on 2026-06-06 21:25 grew the parquet from
