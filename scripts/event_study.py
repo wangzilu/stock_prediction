@@ -236,35 +236,92 @@ def offset_column_name(offset: int) -> str:
 #   2. production uses qlib.data.D.features (see qlib_close_loader below)
 
 
+# A-share index parquets shipped under data/storage. Used as a fallback
+# when qlib's cn_data bundle does not ship index instruments (sh000300 /
+# sh000905 etc are not in this repo's qlib snapshot — only individual
+# stocks are). Map: lowercase qlib code → parquet file name.
+INDEX_PARQUET_FALLBACK = {
+    "sh000300": "ak_index_csi300.parquet",
+    "sh000905": "ak_index_csi500.parquet",
+    "sh000852": "ak_index_csi1000.parquet",
+}
+
+
+def _load_index_from_parquet(code: str) -> pd.Series | None:
+    """Try to load an index's close series from the parquet fallback.
+
+    Returns None if the code is not in the fallback map or the file is
+    missing / malformed. The series is indexed by tz-naive
+    ``DatetimeIndex`` and named ``close``.
+    """
+    fname = INDEX_PARQUET_FALLBACK.get(code.lower())
+    if not fname:
+        return None
+    path = DATA_DIR / fname
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_parquet(path)
+    except Exception as exc:  # pragma: no cover — corrupt file
+        logger.warning("event_study: cannot read %s (%s)", path, exc)
+        return None
+    if "date" not in df.columns or "close" not in df.columns:
+        return None
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date", "close"]).sort_values("date")
+    return pd.Series(
+        df["close"].astype(float).values,
+        index=pd.DatetimeIndex(df["date"]),
+        name="close",
+    )
+
+
 def qlib_close_loader(
     instruments,
     start: str,
     end: str,
 ) -> dict:
-    """Production CloseLoader backed by qlib.data.D.
+    """Production CloseLoader backed by qlib.data.D + index parquet fallback.
 
     Reads daily close prices for each instrument in [start, end] inclusive.
     Caller is responsible for ``init_qlib`` before invoking.
 
+    For instruments qlib cannot resolve, falls back to
+    ``data/storage/ak_index_*.parquet`` (sh000300 / sh000905 / sh000852
+    — the indices that ship in this repo as separate parquets rather
+    than under qlib).
+
     Returns dict[upper-case instrument code, close Series]. Instruments
-    qlib can't resolve are simply omitted from the dict.
+    neither qlib nor the fallback can resolve are simply omitted.
     """
     from qlib.data import D  # heavy import; deferred
 
-    insts = [str(i).lower() for i in instruments]
-    if not insts:
+    insts_lower = [str(i).lower() for i in instruments]
+    if not insts_lower:
         return {}
-    raw = D.features(insts, ["$close"], start_time=start, end_time=end)
-    if raw is None or raw.empty:
-        return {}
-    raw.columns = ["close"]
     out: dict[str, pd.Series] = {}
-    for inst, sub in raw.groupby(level=0):
-        sub = sub.droplevel(0)
-        sub.index = pd.to_datetime(sub.index)
-        sub = sub["close"].dropna().astype(float)
-        if not sub.empty:
-            out[str(inst).upper()] = sub.sort_index()
+    raw = D.features(insts_lower, ["$close"], start_time=start, end_time=end)
+    if raw is not None and not raw.empty:
+        raw.columns = ["close"]
+        for inst, sub in raw.groupby(level=0):
+            sub = sub.droplevel(0)
+            sub.index = pd.to_datetime(sub.index)
+            sub = sub["close"].dropna().astype(float)
+            if not sub.empty:
+                out[str(inst).upper()] = sub.sort_index()
+    # Fallback for missing instruments (mostly indices).
+    s_ts = pd.Timestamp(start)
+    e_ts = pd.Timestamp(end)
+    for inst in insts_lower:
+        if inst.upper() in out:
+            continue
+        ser = _load_index_from_parquet(inst)
+        if ser is None:
+            continue
+        ser = ser.loc[(ser.index >= s_ts) & (ser.index <= e_ts)]
+        if not ser.empty:
+            out[inst.upper()] = ser
     return out
 
 
