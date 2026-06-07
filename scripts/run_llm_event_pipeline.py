@@ -24,6 +24,20 @@ from pathlib import Path
 
 import pandas as pd
 
+# 2026-06-07 cx P1 #1 fix: pre-fix the L0 cache path expression
+# (``DATA_DIR / "llm_event_cache" / "seen.jsonl"``) raised NameError
+# every run because DATA_DIR was never imported. The broad
+# ``except Exception`` at line ~250 swallowed the error and the
+# pipeline silently degraded to a fallback that lost cross-day dedup
+# AND classify_l0 stats. Adding the import + sys.path bootstrap so
+# the constant is available when the file runs as a script (cron
+# invokes it via ``python scripts/run_llm_event_pipeline.py``).
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from config.settings import DATA_DIR  # noqa: E402
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -219,6 +233,32 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
                     "  Rank+select: %d L1 candidates -> %d for LLM",
                     len(routed["l1"]), total_after,
                 )
+
+                # 2026-06-07 cx P2 #3 fix: persist prefilter stats so
+                # llm_factor_quality_report has something to read.
+                # Pre-fix the report read llm_prefilter_stats/<date>.json
+                # but the pipeline only logged the numbers — so the
+                # quality JSON's prefilter_* fields were always null and
+                # operators couldn't tell L0 was failing silently.
+                try:
+                    stats_path = (DATA_DIR / "llm_prefilter_stats" /
+                                   f"{target_date}.json")
+                    stats_path.parent.mkdir(parents=True, exist_ok=True)
+                    stats_to_persist = {
+                        "target_date": target_date,
+                        "written_at": datetime.now().isoformat(timespec="seconds"),
+                        "generic_drop_count": int(stats.get("drop", 0)),
+                        "dedup_drop_count": int(stats.get("dup", 0)),
+                        "l0_kept": int(stats.get("direct", 0)),
+                        "l1_kept": int(total_after),
+                        "rule_hits": stats.get("rule_hits", {}),
+                    }
+                    tmp = stats_path.with_suffix(".tmp")
+                    tmp.write_text(_json_filter.dumps(
+                        stats_to_persist, ensure_ascii=False, indent=2))
+                    tmp.replace(stats_path)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Failed to persist prefilter stats: %s", e)
 
                 filtered_dir = news_path.parent.parent / "daily_news_filtered"
                 filtered_dir.mkdir(parents=True, exist_ok=True)

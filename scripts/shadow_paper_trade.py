@@ -38,7 +38,7 @@ import argparse
 import json
 import logging
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta  # noqa: F401
 from pathlib import Path
 
 import numpy as np
@@ -351,9 +351,19 @@ def summary() -> None:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--date", default=None, help="YYYY-MM-DD (default: today)")
-    ap.add_argument("--backfill", action="store_true",
-                    help="Also compute realised top-20 mean return.")
+    ap.add_argument(
+        "--date", default=None,
+        help="YYYY-MM-DD. Generate-mode default: today. "
+             "--backfill mode default: YESTERDAY — cx P1 #2 fix because "
+             "today's t+1 labels aren't available at 16:30 cron time.",
+    )
+    ap.add_argument(
+        "--backfill", action="store_true",
+        help="Compute realised Spread20 (top mean − bottom mean, basis "
+             "points) using __pnl_return_1d / __label_1d. Without "
+             "--date, defaults to YESTERDAY because today's t+1 return "
+             "isn't observable until tomorrow's close.",
+    )
     ap.add_argument("--summary", action="store_true",
                     help="Print cumulative comparison and exit.")
     args = ap.parse_args()
@@ -362,7 +372,14 @@ def main():
         summary()
         return
 
-    date = args.date or datetime.now().strftime("%Y-%m-%d")
+    # cx P1 #2 fix: in --backfill mode, the default date must be
+    # yesterday because today's t+1 return is not yet observable.
+    if args.date:
+        date = args.date
+    elif args.backfill:
+        date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    else:
+        date = datetime.now().strftime("%Y-%m-%d")
     run_one_day(date, backfill=args.backfill)
 
 

@@ -51,17 +51,27 @@ def _load_events_via_eventstore(start_dt: datetime, end_dt: datetime) -> pd.Data
         return None
     try:
         store = EventStore()
-        df = store.query(
-            start_date=start_dt.strftime("%Y-%m-%d"),
-            end_date=end_dt.strftime("%Y-%m-%d"),
-        )
-        if df is None or df.empty:
+        # 2026-06-07 cx P2 #4 fix: use signal_date filtering instead of
+        # the legacy ``query(start, end)`` which scans by file date and
+        # forced the builder to recompute event_date from publish_time
+        # — exactly the path the L2 docstring claimed it had moved AWAY
+        # from. Iterate over signal_date in [start, end] so the
+        # weekend/holiday/after-hours bdays_offset is respected.
+        from pandas.tseries.offsets import BDay  # noqa: F401
+        dates = pd.date_range(start_dt, end_dt, freq="D")
+        frames = []
+        for d in dates:
+            day_df = store.query_by_signal_date(d.strftime("%Y-%m-%d"))
+            if day_df is not None and not day_df.empty:
+                frames.append(day_df)
+        if not frames:
             return None
+        df = pd.concat(frames, ignore_index=True)
         # Match the legacy schema the rest of build_llm_event_factors expects.
         # EventStore rows have: stock_code, event_type, direction, confidence,
         # publish_time, signal_date, source, summary, source_quality, etc.
-        # Legacy code expects file_date (proxy for "extract day") + the V2
-        # impact synthesis based on direction/is_price_sensitive.
+        # The builder uses ``file_date`` as the time-bucket key downstream;
+        # bind it to signal_date so the PIT promise holds end-to-end.
         df = df.copy()
         df["file_date"] = df.get("signal_date", "")
         # Derive qlib_code from stock_code (legacy schema expects qlib_code,
