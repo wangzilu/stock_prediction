@@ -120,8 +120,20 @@ JOB_DEPS: dict[str, list[str]] = {
         "llm_event_pipeline",
     ],
     # ---- Training and inference depend on fresh cache --------------------
+    # 2026-06-07 cx batch D P1 #4: lgb_after_close_smoke moved off
+    # feature_cache_rebuild (legacy 174-family cache) onto
+    # champion_cache_rebuild (xgb_209 / xgb_209_llm 209-family caches
+    # that smoke + paper actually consume). Pre-fix the smoke gate
+    # passed even when champion_cache_rebuild had failed — only the
+    # legacy 174 cache needed to be fresh. The 174 cache is now
+    # research-only; production smoke/paper read 209-family parquets.
+    # midweek_train + weekly_full_retrain + predict_crash_daily stay
+    # on feature_cache_rebuild for now: midweek/weekly_train re-train
+    # is a research operation and predict_crash uses the smaller 174
+    # cache for its head-only crash model. They will migrate when the
+    # 174 vs 209 retrain decision (#112) lands.
     "midweek_train": ["feature_cache_rebuild"],
-    "lgb_after_close_smoke": ["feature_cache_rebuild"],
+    "lgb_after_close_smoke": ["champion_cache_rebuild"],
     "weekly_full_retrain": ["feature_cache_rebuild"],
     "predict_crash_daily": ["feature_cache_rebuild"],
     # ---- Shadow optimizer + paper trading depend on smoke test -----------

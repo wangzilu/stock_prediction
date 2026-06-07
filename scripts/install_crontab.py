@@ -316,6 +316,15 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         # must wait for it via the upstream gate or it'll build on stale flows.
         # enforce_deps=True makes run_with_status poll until both upstreams have
         # successfully completed (up to 30 min by default).
+        #
+        # 2026-06-07 cx batch D P1 #4: this job rebuilds the LEGACY 174-family
+        # cache (``feature_cache_174_holder_regime_ma.parquet``). Production
+        # smoke / paper / shadow_paper_trade now read 209-family parquets
+        # refreshed by ``champion_cache_rebuild`` instead. We keep this cron
+        # alive because midweek_train / weekly_full_retrain / predict_crash_daily
+        # still read the 174 cache for the 174-vs-209 retrain comparison
+        # (#112) + the head-only crash model. Once #112 lands and the 174
+        # path retires, this job can be removed.
         CronJob("feature_cache_rebuild", "25 18 * * 1-5",
                 [py, str(scripts / "build_feature_cache.py"), "--all"], "feature_cache_rebuild.log",
                 network="domestic", timeout_sec=1800, critical=True, enforce_deps=True),
@@ -336,17 +345,23 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                 network="none", timeout_sec=1200,
                 enforce_deps=True),
         # --- Prediction + Paper (none, critical) ---
-        # Smoke depends on feature_cache_rebuild; downstream paper/shadow
+        # Smoke depends on champion_cache_rebuild (xgb_209 / xgb_209_llm
+        # 209-family parquets it actually reads); downstream paper/shadow
         # opt into --enforce-deps so stale upstream blocks rather than
         # silently trades on yesterday's signal.
         #
+        # 2026-06-07 cx batch D P1 #4: smoke moved off feature_cache_rebuild
+        # (legacy 174 cache) onto champion_cache_rebuild. Pre-fix the smoke
+        # gate passed even when the 209 chain had failed — only the legacy
+        # 174 cache needed to be fresh.
+        #
         # Wait-budget reasoning:
         #   qlib_data_update 17:45 + timeout 3600s → worst-case done 18:45
-        #   feature_cache_rebuild 18:25 + (waits up to 30min for qlib) +
-        #     own 30min timeout → worst-case done 19:15
-        #   lgb_after_close_smoke 18:35 must therefore wait up to 40 min
-        #     to see cache_rebuild complete; 30 min default would give
-        #     up at 19:05, 10 min short. 3600s = 60 min covers it.
+        #   champion_cache_rebuild 18:30 + (waits up to 30min for upstreams) +
+        #     own 20min timeout → worst-case done 19:20
+        #   lgb_after_close_smoke 18:35 must therefore wait up to 45 min
+        #     to see champion_cache_rebuild complete; 30 min default would
+        #     give up at 19:05, 15 min short. 3600s = 60 min covers it.
         #   All later jobs inherit the same worst case → 3600s across.
         # 2026-06-04 bumped 900 → 1800 — see morning_recommendation
         # comment above. Same inject_supplementary_into_handler cost
