@@ -620,12 +620,101 @@ def propagate_scores(
 # Main pipeline
 # ---------------------------------------------------------------------------
 
+SHRINK_MODES = ("hard_zero", "sqrt_dampen", "soft_clip")
+DEFAULT_SHRINK_MODE = "sqrt_dampen"
+
+
+def _apply_shrink(
+    industry_only_pairs: list[tuple[str, float]],
+    *,
+    mode: str,
+) -> list[tuple[str, float]]:
+    """Apply the chosen industry-level shrink to ``industry_only_pairs``.
+
+    Returns a list of ``(stock, shrunk_score)`` pairs. The three modes
+    were introduced under #174 step 2 because the legacy zscore × 0.2
+    + clip[±3] pipeline collapsed to a hard zero whenever the cross-
+    stock variance was tiny, which killed the chain-factor density on
+    low-event days (see docs/phase_b7_verdict_20260607.md).
+
+    Modes
+    -----
+    hard_zero (legacy)
+        zscore × 0.2 then clip to [-3, +3]; if cross-stock std < 1e-9
+        the WHOLE column collapses to 0. Preserved for rollback.
+
+    sqrt_dampen (new default)
+        ``score / sqrt(n_industry_stocks)`` followed by tanh clamp
+        into [-1, +1]. A 100-stock industry contributes 1/10 per stock
+        instead of 0; a 1-stock industry contributes the raw magnitude
+        bounded by tanh so a single outlier never blows up the scale.
+        Bias-free: an industry where every event was negative stays
+        negative across all its stocks.
+
+    soft_clip
+        ``tanh(score / 10) * 0.5``. Per-stock magnitude is bounded
+        without any cross-stock normalisation; useful when callers want
+        the raw event sign to dominate over the per-day distribution.
+    """
+    if mode not in SHRINK_MODES:
+        raise ValueError(f"shrink_mode must be one of {SHRINK_MODES}, got {mode!r}")
+
+    if not industry_only_pairs:
+        return []
+
+    import numpy as _np
+    import math as _math
+
+    if mode == "hard_zero":
+        pool_scores = _np.array([s for _, s in industry_only_pairs], dtype=float)
+        if pool_scores.std() > 1e-9:
+            mu = float(pool_scores.mean())
+            sigma = float(pool_scores.std())
+            SHRINK = 0.2
+            CLIP = 3.0
+            out = []
+            for stock, score in industry_only_pairs:
+                z = (score - mu) / sigma
+                shrunk = max(-CLIP, min(CLIP, z * SHRINK))
+                out.append((stock, shrunk))
+            return out
+        # zero-variance branch — hard zero column.
+        return [(stock, 0.0) for stock, _ in industry_only_pairs]
+
+    if mode == "sqrt_dampen":
+        # Group stocks by topic-affinity is approximated by the size of
+        # the industry-only pool — every event already routes through
+        # mapper.get_all_affected_stocks which collapses topic+industry
+        # weight into a single per-stock score. n here is the total
+        # cross-topic affected count, which is a fair proxy for the
+        # "industry breadth" the spec asked us to dampen by. A 3000-
+        # stock day downweights ~55× harder than a 30-stock day,
+        # protecting against an entire-market sweep dominating the
+        # cache.
+        n = max(1, len(industry_only_pairs))
+        denom = _math.sqrt(n)
+        out = []
+        for stock, score in industry_only_pairs:
+            damped = score / denom
+            # tanh clamp into [-1, +1] keeps the magnitude bounded
+            # regardless of the raw event score scale.
+            out.append((stock, _math.tanh(damped)))
+        return out
+
+    # soft_clip
+    out = []
+    for stock, score in industry_only_pairs:
+        out.append((stock, _math.tanh(score / 10.0) * 0.5))
+    return out
+
+
 def build_factors(
     target_date: str,
     demo: bool = False,
     lookback_days: int = EVENT_LOOKBACK_DAYS,
     source: str = "rule",
     schema: str = "v1",
+    shrink_mode: str = DEFAULT_SHRINK_MODE,
 ) -> pd.DataFrame:
     """End-to-end: load edges + events, propagate, output parquet.
 
@@ -640,6 +729,11 @@ def build_factors(
             and adapts to v1-shaped propagation input). When schema="v2"
             the ``source`` arg is overridden to "llm_v2" since v2 only
             exists for the LLM path.
+        shrink_mode: industry-level shrink policy — one of
+            {hard_zero, sqrt_dampen, soft_clip}. Default sqrt_dampen
+            (#174 step 2) preserves per-stock non-zero values even in
+            low-variance topics. hard_zero is the legacy behaviour and
+            stays available for fast rollback.
 
     Returns:
         DataFrame with factor values.
@@ -695,24 +789,23 @@ def build_factors(
             if not df.empty:
                 company_stocks = set(df.index.get_level_values("instrument"))
 
-            # Phase D / SC-A1: industry-level alpha must be
-            # zscore-by-date + shrunk + clipped before consumers see it.
-            # Raw scores have mean ~ -14 and span [-47, +15] which is
-            # not usable as either a feature or an overlay weight.
+            # Phase D / SC-A1: industry-level alpha used to be
+            # zscore-by-date + shrunk × 0.2 + clipped [±3], with a
+            # hard-zero collapse whenever cross-stock std < 1e-9.
+            # docs/phase_b7_verdict_20260607.md showed that policy left
+            # industry_level_alpha uniformly 0 in production caches
+            # (< 0.01 % non-zero rows), so xgb trees never split on it.
             #
-            # 2026-06-06 cx review:
-            #   1. Z-score must be computed AFTER filtering out the
-            #      company-level stocks (those rows never reach the
-            #      industry frame, so they would skew μ/σ — see review
-            #      P2). Filter first, then compute moments.
-            #   2. When the resulting σ is below the float threshold we
-            #      set the WHOLE column to 0, not score * 0.2. Zero
-            #      variance means "no information"; preserving the raw
-            #      magnitude was what reintroduced the unscaled value
-            #      flagged in P1.
-            import numpy as _np
-            SHRINK = 0.2
-            CLIP = 3.0  # post-clip range [-3, 3], well within model input scale
+            # 2026-06-07 (#174 step 2): the shrink policy is now
+            # selectable. Default ``sqrt_dampen`` preserves a per-stock
+            # non-zero floor (score / sqrt(n) → tanh) so a low-
+            # variance topic no longer zero-collapses the column.
+            # ``hard_zero`` remains the rollback path.
+            #
+            # 2026-06-06 cx review (preserved): the industry pool MUST
+            # be filtered against company-level stocks BEFORE any
+            # cross-stock moment / dampening is computed, otherwise the
+            # company-level rows would skew the per-day distribution.
 
             # Step A: build the (stock, score) list that will actually
             # become industry rows, dropping company-level overlap.
@@ -722,29 +815,10 @@ def build_factors(
                 if stock.lower() not in company_stocks
             ]
 
-            if industry_only_pairs:
-                pool_scores = _np.array(
-                    [s for _, s in industry_only_pairs], dtype=float
-                )
-                if pool_scores.std() > 1e-9:
-                    mu = float(pool_scores.mean())
-                    sigma = float(pool_scores.std())
-                    zero_variance = False
-                else:
-                    mu, sigma = 0.0, 1.0
-                    zero_variance = True
-            else:
-                mu, sigma, zero_variance = 0.0, 1.0, True
+            shrunk_pairs = _apply_shrink(industry_only_pairs, mode=shrink_mode)
 
             industry_rows = []
-            for stock, score in industry_only_pairs:
-                if zero_variance:
-                    # No spread → no signal. Hard zero so the column
-                    # never re-injects raw magnitude.
-                    shrunk = 0.0
-                else:
-                    z = (score - mu) / sigma
-                    shrunk = max(-CLIP, min(CLIP, z * SHRINK))
+            for stock, shrunk in shrunk_pairs:
                 industry_rows.append({
                     "datetime": dt,
                     "instrument": stock,
@@ -763,12 +837,17 @@ def build_factors(
                 })
 
             if industry_rows:
+                import numpy as _np
+                shrunk_arr = _np.array([s for _, s in shrunk_pairs], dtype=float)
+                nz = int((shrunk_arr != 0).sum())
+                logger.info(
+                    f"Industry-level: +{len(industry_rows)} stocks "
+                    f"(shrink_mode={shrink_mode}, non-zero={nz}, "
+                    f"range=[{shrunk_arr.min():+.4f}, {shrunk_arr.max():+.4f}]). "
+                    f"Total {len(df) + len(industry_rows)} stocks."
+                )
                 ind_df = pd.DataFrame(industry_rows).set_index(["datetime", "instrument"])
                 df = pd.concat([df, ind_df])
-                logger.info(f"Industry-level: +{len(industry_rows)} stocks "
-                            f"(zscore × {SHRINK} × clip[±{CLIP}], "
-                            f"raw mean={mu:.1f} std={sigma:.1f}). "
-                            f"Total {len(df)} stocks.")
     except ImportError:
         logger.warning("supply_chain_mapper not available — company-level only")
 
@@ -857,13 +936,23 @@ def main():
              "confidence shape) or 'v2' (SC-A2 src_entity + relations). "
              "Setting --schema v2 implicitly sets --source llm_v2.",
     )
+    parser.add_argument(
+        "--shrink-mode", choices=list(SHRINK_MODES),
+        default=DEFAULT_SHRINK_MODE,
+        help=f"Industry-level shrink policy (#174 step 2). "
+             f"Default {DEFAULT_SHRINK_MODE}. 'hard_zero' is the legacy "
+             "zscore × 0.2 + clip[±3] with zero-variance collapse to 0; "
+             "'sqrt_dampen' divides each per-stock score by sqrt(n) and "
+             "tanh-clamps to [-1, +1]; 'soft_clip' uses tanh(score/10) × 0.5.",
+    )
     args = parser.parse_args()
 
     target_date = args.date or datetime.now().strftime("%Y-%m-%d")
 
     try:
         df = build_factors(target_date, demo=args.demo, lookback_days=args.lookback,
-                           source=args.source, schema=args.schema)
+                           source=args.source, schema=args.schema,
+                           shrink_mode=args.shrink_mode)
         if not df.empty:
             print(f"\n=== Global Chain Factors for {target_date} ===")
             print(f"Stocks affected: {len(df)}")
