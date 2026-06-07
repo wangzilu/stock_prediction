@@ -608,6 +608,58 @@ class PaperOMS:
     def _filled_orders_path(self, date: str) -> Path:
         return self._state_dir / f"filled_orders_{date}.json"
 
+    def _load_quote_snapshot(self, date: str, codes: list) -> dict:
+        """Build {code: quote_dict} from qlib OHLCV for `date`.
+
+        Returns akshare-style quote dicts (最新价 / 最高 / 最低 / 成交量)
+        the CandidateSanitizer expects. Missing codes simply absent
+        from the returned dict — the sanitizer will then reject them
+        under actionable_required=True. Failures degrade to an empty
+        dict so the same-exam gate stays strict (no quote → reject)
+        rather than silently letting candidates through.
+
+        same-exam: mirrors scheduler/jobs.py:1431 which combines
+        require_quote=True + actionable_required=True with a real
+        quote dict so the live recommendation path's actionable
+        filter applies here too.
+        """
+        snapshot: dict = {}
+        if not codes:
+            return snapshot
+        try:
+            from qlib.data import D
+            try:
+                D.calendar(freq="day", start_time="2020-01-01", end_time="2020-01-02")
+            except Exception:
+                from config.qlib_runtime import init_qlib
+                init_qlib(str(DATA_DIR / "qlib_data" / "cn_data"))
+            qlib_insts = [c.lower() for c in codes]
+            df = D.features(
+                qlib_insts,
+                ["$close", "$high", "$low", "$volume"],
+                start_time=date, end_time=date,
+            )
+            if df is None or df.empty:
+                return snapshot
+            for idx, row in df.iterrows():
+                inst = str(idx[0]).upper()
+                close = float(row.iloc[0]) if np.isfinite(row.iloc[0]) else 0.0
+                high = float(row.iloc[1]) if np.isfinite(row.iloc[1]) else 0.0
+                low = float(row.iloc[2]) if np.isfinite(row.iloc[2]) else 0.0
+                volume = float(row.iloc[3]) if np.isfinite(row.iloc[3]) else 0.0
+                snapshot[inst] = {
+                    "最新价": close,
+                    "最高": high,
+                    "最低": low,
+                    "成交量": volume,
+                }
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Paper OMS quote snapshot build failed (%s) — "
+                "actionable_required will reject all candidates this cycle", e,
+            )
+        return snapshot
+
     def _load_and_filter_predictions(self, date: str):
         """Load predictions, apply unified candidate sanitizer, return dict or None.
 
@@ -615,8 +667,19 @@ class PaperOMS:
         excluded ST + BJ — narrower than the training-time tradable_mask
         (which also handles IPO<60d, 一字板, suspended, low liquidity). The
         unified CandidateSanitizer brings inference-side filtering in line.
-        Quote data isn't reliably available at OMS load time (before market
-        open in some paths), so require_quote=False.
+
+        2026-06-07 cx batch B P1 #2: previously initialised the sanitizer
+        with require_quote=False AND passed quote=None to check(), which
+        meant the suspended / 一字板 / low_volume / invalid_price rules
+        were SKIPPED entirely (per factors/candidate_sanitizer.py:348-360).
+        Paper OMS was therefore willing to buy a stock that the live
+        recommendation path (scheduler/jobs.py:1431-1432) would reject
+        because it has zero volume or a one-zb-line print. Same-exam fix:
+        build a qlib-OHLCV quote snapshot for the signal date and
+        initialise the sanitizer with require_quote=True +
+        actionable_required=True (mirrors the live path exactly). If the
+        snapshot build fails or a code isn't in it, the candidate is
+        rejected rather than let through.
         """
         predictions = self.load_predictions()
         if not predictions:
@@ -630,17 +693,32 @@ class PaperOMS:
         # trade this cycle.
         try:
             from factors.candidate_sanitizer import CandidateSanitizer
-            sanitizer = CandidateSanitizer(today=date, require_quote=False)
+            # cx batch B P1 #2 (same-exam): require_quote=True +
+            # actionable_required=True so quote-dependent rules
+            # (suspended / 一字板 / low_volume) actually run, matching
+            # the live recommendation path. Missing quote → reject.
+            sanitizer = CandidateSanitizer(
+                today=date,
+                require_quote=True,
+                actionable_required=True,
+            )
         except Exception as e:
             logger.error(
                 "Paper OMS CandidateSanitizer import/init failed: %s — "
                 "refusing to trade unfiltered.", e,
             )
             return None
+        # Build quote snapshot covering all prediction codes. Codes
+        # absent from the snapshot pass quote=None to check() which,
+        # under actionable_required=True, results in rejection — the
+        # explicit reject the reviewer asked for instead of the
+        # silent "rules skipped" pre-fix behaviour.
+        quote_snapshot = self._load_quote_snapshot(date, list(predictions.keys()))
         filtered = {}
         try:
             for code, score in predictions.items():
-                ok, _reason = sanitizer.check(code, None)
+                quote = quote_snapshot.get(code.upper())
+                ok, _reason = sanitizer.check(code, None, quote=quote)
                 if ok:
                     filtered[code] = score
             sanitizer.log_summary(label=f"paper_oms[{date}]")
