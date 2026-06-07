@@ -107,9 +107,25 @@ def main():
     except ImportError:
         pass
 
+    # 2026-06-08 case-bug prevention (post-B.8): every joiner MUST
+    # normalize the instrument level to lowercase before reindex
+    # (base cache convention) AND run the coverage gate after to
+    # catch silent zero-match outcomes. The B.6.3 LLM verdict was
+    # PRNG drift precisely because the reindex matched 0 rows
+    # silently and the model trained on constant-zero columns.
+    from factors.feature_cache_utils import (
+        assert_join_coverage, normalize_instrument_index,
+    )
+    chain = normalize_instrument_index(chain, source_name="chain")
+
     # Reindex and concat — drop duplicate keys keeping last.
     chain_clean = chain[factor_cols][~chain.index.duplicated(keep="last")]
-    chain_aligned = chain_clean.reindex(base.index).fillna(0.0)
+    chain_aligned = chain_clean.reindex(base.index)
+    assert_join_coverage(
+        source_df=chain, reindexed=chain_aligned,
+        factor_cols=factor_cols, source_name="chain",
+    )
+    chain_aligned = chain_aligned.fillna(0.0)
     print(f"[209_chain] chain non-zero rows after align: "
           f"{(chain_aligned != 0).any(axis=1).sum()} / {len(chain_aligned)}")
 

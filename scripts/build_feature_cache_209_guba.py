@@ -114,23 +114,26 @@ def main():
     except ImportError:
         pass
 
-    # Normalize instrument case to match base cache (lowercase sh/sz).
-    # The base cache uses lowercase; cx F.P1 #3 wants upstream to write
-    # UPPERCASE, but as of 2026-06-07 the parquet is still lowercase.
-    # Force lowercase here so the join works either way.
-    try:
-        guba.index = guba.index.set_levels(
-            guba.index.levels[1].astype(str).str.lower(), level=1,
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(f"[209_guba] WARN: index case normalize skipped: {exc}")
+    # 2026-06-08 case-bug prevention (post-B.8): centralised helpers.
+    from factors.feature_cache_utils import (
+        assert_join_coverage, normalize_instrument_index,
+    )
+    guba = normalize_instrument_index(guba, source_name="guba")
 
     # Dedupe by index (keep last per date+stock).
     guba = guba[factor_cols][~guba.index.duplicated(keep="last")]
     print(f"[209_guba] guba deduped: {guba.shape}")
 
-    # Pre-fillna coverage count (mirrors LLM joiner P2 #5 fix).
+    # Coverage gate — refuses the silent zero-match outcome that hid
+    # B.6.3's LLM bug. NB: guba currently has 0% date overlap with the
+    # base 209 cache (collector covers 2026-05-22 → 2026-06-05 vs base
+    # ends 2026-05-19) — this gate will RAISE until the base cache is
+    # refreshed. That is the correct loud failure.
     guba_raw = guba.reindex(base.index)
+    assert_join_coverage(
+        source_df=guba, reindexed=guba_raw,
+        factor_cols=factor_cols, source_name="guba",
+    )
     rows_with_real_guba = int(guba_raw.notna().any(axis=1).sum())
     print(f"[209_guba] guba coverage (pre-fillna): "
           f"{rows_with_real_guba} / {len(guba_raw)} rows = "

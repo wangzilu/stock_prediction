@@ -120,18 +120,21 @@ def main():
         "qlib_code": "instrument",
         "signal_date": "datetime",
     })
-    # 2026-06-07 phase B.8 finding: build_llm_event_factors.py emits
-    # UPPERCASE qlib codes ('SH603536') while feature_cache_209_production
-    # uses LOWERCASE ('sh600000'). Pre-fix the reindex silently produced
-    # 0% coverage so prior LLM caches contained constant-zero columns
-    # for every row — phase B.6.3's reported +0.0044 RankIC was therefore
-    # pure stochastic noise, not LLM signal. Lowercase here mirrors the
-    # F.P1 #3 belt-and-braces normalization in
-    # FeatureMerger._load_guba.
-    llm["instrument"] = llm["instrument"].astype(str).str.lower()
     llm = llm.set_index(["datetime", "instrument"])[llm_cols]
     # Drop duplicate (date, code) rows — keep most recent.
     llm = llm[~llm.index.duplicated(keep="last")]
+
+    # 2026-06-08 case-bug prevention (post-B.8): the previous ad-hoc
+    # ``str.lower()`` is now centralised in
+    # factors.feature_cache_utils, alongside the coverage gate that
+    # raises if reindex matches near-zero rows despite a non-empty
+    # source. The B.6.3 +0.0044 RankIC verdict was exactly that
+    # failure mode — silent 0% match shipping as PRNG drift. Refuse
+    # to repeat.
+    from factors.feature_cache_utils import (
+        assert_join_coverage, normalize_instrument_index,
+    )
+    llm = normalize_instrument_index(llm, source_name="llm_event")
     print(f"[209_llm] llm deduped: {llm.shape}")
 
     # 2026-06-07 (cx P2 #5 fix): pre-fix this fillna(0.0)'d FIRST and
@@ -140,6 +143,10 @@ def main():
     # universe. Compute the TRUE coverage (rows where the reindex
     # actually found a matching LLM event) BEFORE filling.
     llm_raw = llm.reindex(base.index)
+    assert_join_coverage(
+        source_df=llm, reindexed=llm_raw,
+        factor_cols=llm_cols, source_name="llm_event",
+    )
     rows_with_real_llm = int(llm_raw.notna().any(axis=1).sum())
     print(f"[209_llm] LLM coverage (real, pre-fillna): "
           f"{rows_with_real_llm} / {len(llm_raw)} rows = "

@@ -149,16 +149,18 @@ def main():
         )
     print(f"[209_xwlb] broadcast frame shape: {broadcast.shape}")
 
-    # Normalize stock case in broadcast index to match base (lowercase).
-    try:
-        broadcast.index = broadcast.index.set_levels(
-            broadcast.index.levels[1].astype(str).str.lower(), level=1,
-        )
-    except Exception:  # noqa: BLE001
-        pass
+    # 2026-06-08 case-bug prevention (post-B.8): centralised helpers.
+    from factors.feature_cache_utils import (
+        assert_join_coverage, normalize_instrument_index,
+    )
+    broadcast = normalize_instrument_index(broadcast, source_name="xwlb")
 
-    # Reindex onto base index.
+    # Reindex onto base index + coverage gate.
     xwlb_raw = broadcast.reindex(base.index)
+    assert_join_coverage(
+        source_df=broadcast, reindexed=xwlb_raw,
+        factor_cols=factor_cols, source_name="xwlb",
+    )
     rows_with_real = int(xwlb_raw.notna().any(axis=1).sum())
     print(f"[209_xwlb] XWLB coverage (pre-fillna): "
           f"{rows_with_real} / {len(xwlb_raw)} rows = "
