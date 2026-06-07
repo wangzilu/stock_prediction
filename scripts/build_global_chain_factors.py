@@ -334,6 +334,60 @@ _LLM_V1_EVIDENCE_WEIGHT = {
 }
 
 
+# 2026-06-07 (#174 step 1 follow-up): infer the chain-mapper topic
+# string from the LLM's free-text ``industry`` field. The LLM extractor
+# emits e.g. ``"AI server/semiconductor"``, ``"EV battery"``, etc.
+# without picking from the closed TOPIC_TO_INDUSTRY vocabulary. Without
+# this, every LLM event arrived at the industry-level mapper with
+# topic=None and silently produced 0 industry-level rows.
+_LLM_INDUSTRY_TOPIC_HINTS = (
+    # (lowercase substring, canonical topic key)
+    ("ai server", "ai_server"),
+    ("ai-server", "ai_server"),
+    ("hbm", "ai_server"),
+    ("data center", "ai_server"),
+    ("server", "ai_server"),
+    ("semiconductor", "semiconductor"),
+    ("chip", "semiconductor"),
+    ("foundry", "semiconductor"),
+    ("wafer", "semiconductor"),
+    ("apple", "apple_chain"),
+    ("iphone", "apple_chain"),
+    ("ev battery", "ev_battery"),
+    ("battery", "ev_battery"),
+    ("electric vehicle", "ev_battery"),
+    ("ev ", "ev_battery"),
+    ("robot", "tesla_robot"),
+    ("humanoid", "tesla_robot"),
+    ("lithium", "lithium"),
+    ("solar", "solar"),
+    ("photovoltaic", "solar"),
+    ("oil", "commodity"),
+    ("copper", "commodity"),
+    ("commodity", "commodity"),
+    ("rare earth", "strategic_material"),
+    ("graphite", "strategic_material"),
+    ("strategic material", "strategic_material"),
+    ("appliance", "consumer_appliance"),
+    ("pharma", "pharma"),
+    ("drug", "pharma"),
+    ("biotech", "pharma"),
+    ("defense", "defense"),
+    ("military", "defense"),
+)
+
+
+def _infer_llm_topic(industry_text: str) -> str | None:
+    """Map LLM's free-text industry into a TOPIC_TO_INDUSTRY key."""
+    if not industry_text:
+        return None
+    s = industry_text.lower()
+    for hint, topic in _LLM_INDUSTRY_TOPIC_HINTS:
+        if hint in s:
+            return topic
+    return None
+
+
 def _llm_v1_to_propagation_shape(e: dict) -> dict:
     """Translate one v1-LLM event (``global_entity`` + ``chain_relevance_score``)
     into the shape ``propagate_scores`` consumes (``source_entity`` +
@@ -343,6 +397,13 @@ def _llm_v1_to_propagation_shape(e: dict) -> dict:
     Without this, B.7-LLM ablation produced 0 propagation pairs because
     ``_match_event_to_edges`` looked up ``source_entity`` but the LLM
     pipeline only ever wrote ``global_entity``.
+
+    2026-06-07 (#174 step 1 follow-up): also infers a closed-vocab
+    ``topic`` from the LLM's ``industry`` field so the industry-level
+    mapper can broadcast — previously LLM events arrived with topic=None
+    and skipped industry expansion entirely (verified: 33 LLM dates
+    each produced exactly 20 company-only rows / 0 industry rows in
+    the old parquet).
     """
     if "source_entity" not in e and "global_entity" in e:
         e["source_entity"] = e["global_entity"]
@@ -358,6 +419,12 @@ def _llm_v1_to_propagation_shape(e: dict) -> dict:
         # 0.6 (unknown evidence_level) sits between trade_press and
         # rumor — conservative but non-zero.
         e["confidence"] = ev_weight * rel
+    # Infer topic from the LLM's free-text industry field. If already
+    # set (e.g. for tests) keep it.
+    if not e.get("topic"):
+        inferred = _infer_llm_topic(e.get("industry", ""))
+        if inferred:
+            e["topic"] = inferred
     return e
 
 
