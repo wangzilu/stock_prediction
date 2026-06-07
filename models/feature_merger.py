@@ -191,6 +191,44 @@ class FeatureMerger:
         # Drop inf so XGB doesn't crash
         supp = supp.replace([np.inf, -np.inf], np.nan)
 
+        # cx F.P2 #5 back-compat (2026-06-07): the loader output column
+        # ``st_holder_num`` was previously emitted as ``holder_num``
+        # (no profile prefix). Existing live contracts
+        # (production_feature_contract_*.json) and deployed model.pkl
+        # binaries still reference the old name; renaming purely on the
+        # loader side would fail ``verify_inference_dataset`` until the
+        # next retrain regenerates the contract. We detect the legacy
+        # contract in-process and rename ``st_holder_num`` →
+        # ``holder_num`` so old contracts keep matching. Once
+        # ``scripts/train_lgb.py`` runs after this commit, the new
+        # contract will name the column ``st_holder_num`` and this
+        # branch becomes a no-op.
+        if "st_holder_num" in supp.columns:
+            try:
+                from pathlib import Path as _P
+                from models.feature_contract import load_contract as _load_contract
+                _data_dir = _P(self.data_dir)
+                _legacy_contract = _load_contract(_data_dir)
+                if _legacy_contract is not None:
+                    _legacy_names = {
+                        str(f.get("name"))
+                        for f in (_legacy_contract.get("features") or [])
+                    }
+                    if "holder_num" in _legacy_names and "st_holder_num" not in _legacy_names:
+                        supp = supp.rename(
+                            columns={"st_holder_num": "holder_num"},
+                        )
+                        logger.info(
+                            "F.P2 #5 back-compat: renamed "
+                            "st_holder_num → holder_num to match "
+                            "legacy contract (run scripts/train_lgb.py "
+                            "to retire this alias)."
+                        )
+            except Exception as _exc:  # noqa: BLE001
+                logger.debug(
+                    "F.P2 #5 contract-aware alias skipped: %s", _exc,
+                )
+
         if preprocess:
             supp = self._preprocess_supplementary(
                 supp, base_index, mode="rank",
@@ -1465,7 +1503,22 @@ class FeatureMerger:
             return None
 
     def _load_st_holder_number(self, index: pd.MultiIndex) -> pd.DataFrame:
-        """Load ST_CLIENT holder number (股东户数) - PIT-safe quarterly via ann_date."""
+        """Load ST_CLIENT holder number (股东户数) - PIT-safe quarterly via ann_date.
+
+        cx F.P2 #5 (2026-06-07): output column renamed
+        ``holder_num`` → ``st_holder_num`` so the profile prefix matches
+        every other ``st_*`` loader (st_daily_basic, st_moneyflow). The
+        contract artifacts (production_feature_contract_xgb_242.json /
+        xgb_209.json / xgb_209_llm.json + symlink) are updated in the
+        same commit to expect the new name. The xgb_175 research model
+        binary still encodes the old ``holder_num`` name in its
+        ``feature_names`` list — it is NOT a cron-deployed champion
+        (only train_175_and_recommend.py / xgb_175_holder_model.json
+        exist), so retraining or temporary column rename at consumer
+        side is the migration path for that script. No live cron
+        breaks because the production contract gate validates by NAME
+        against the JSON artifact, which is regenerated to match.
+        """
         path = self.data_dir / "st_holder_number.parquet"
         if not path.exists():
             return None
@@ -1487,9 +1540,13 @@ class FeatureMerger:
             ts["ann_date"] = ts["ann_date"] + pd.tseries.offsets.BDay(1)
 
             result = self._asof_merge_timeseries(ts, index, "ann_date", ["holder_num"])
-            if result is not None:
-                logger.info(f"ST holder_number (PIT-safe, ann_date+1BDay): 1 factor, "
-                            f"{result['holder_num'].notna().sum()} non-null")
+            if result is None:
+                return None
+            # cx F.P2 #5: profile-prefix the column so it matches the
+            # ``st_*`` family naming used by every other ST loader.
+            result = result.rename(columns={"holder_num": "st_holder_num"})
+            logger.info(f"ST holder_number (PIT-safe, ann_date+1BDay): 1 factor, "
+                        f"{result['st_holder_num'].notna().sum()} non-null")
             return result
         except Exception as e:
             logger.warning(f"ST holder_number load failed: {e}")
