@@ -1213,17 +1213,36 @@ class FeatureMerger:
         factor_cols: list,
         prefix: str,
         label: str,
+        as_of_strict: bool = True,
     ) -> pd.DataFrame | None:
         """Align stock-level factors using point-in-time effective dates.
 
         Snapshot financial data must not be broadcast backward through history.
         If a source does not provide any usable date, skip it rather than leak the
         latest snapshot into old training samples.
+
+        Parameters
+        ----------
+        as_of_strict:
+            When ``True`` (the default), the underlying
+            ``_effective_date_from_frame`` treats this caller as
+            "financial-disclosure semantics": if no explicit
+            announcement-date column is present (``ann_date`` /
+            ``f_ann_date`` / ``publish_date`` / ``disclosure_date``),
+            falling back to a generic ``date`` column is treated as a
+            disclosure snapshot and skipped with a warning, because
+            ``date`` on disclosure loaders is typically the report-period
+            end or a scrape snapshot — neither of which is the actual
+            availability date. Daily market loaders (valuation daily,
+            capital_flow, fund_flow) should pass ``as_of_strict=False``
+            so a same-day ``date`` is accepted.
         """
         if df.empty or "qlib_code" not in df.columns:
             return None
 
-        effective_date = self._effective_date_from_frame(df)
+        effective_date = self._effective_date_from_frame(
+            df, as_of_strict=as_of_strict, label=label,
+        )
         if effective_date is None or effective_date.notna().sum() == 0:
             logger.warning(
                 f"{label} skipped: no PIT date column found; refusing latest-snapshot broadcast"
@@ -1255,14 +1274,37 @@ class FeatureMerger:
             out_cols,
         )
 
-    def _effective_date_from_frame(self, df: pd.DataFrame) -> pd.Series | None:
+    def _effective_date_from_frame(
+        self,
+        df: pd.DataFrame,
+        as_of_strict: bool = True,
+        label: str = "",
+    ) -> pd.Series | None:
         """Return the first usable PIT date for a stock-level factor frame.
 
         Priority:
         1. ann_date / f_ann_date / publish_date: actual announcement date + 1 BDay
            (data becomes available the trading day after announcement)
-        2. effective_date / trade_date / date: already represents availability
-        3. report period end_date: conservative statutory delay fallback
+        2. effective_date / pub_date / trade_date: already represents availability
+           same day (T-open)
+        3. ``date``: ambiguous semantics — see ``as_of_strict`` below
+        4. ``collected_at``: scrape time, NOT market-open availability — shift
+           +1 BDay so a Tuesday-evening scrape becomes Wednesday open at earliest
+        5. report period end_date: conservative statutory delay fallback
+
+        Parameters
+        ----------
+        as_of_strict:
+            When ``True`` (financial-disclosure semantics): if NO explicit
+            announcement-date column is present, the generic ``date`` field
+            is REFUSED (warn + skip the loader) because ``date`` on
+            disclosure parquets is typically the report-period end or a
+            snapshot — neither matches the actual availability moment.
+            When ``False`` (daily market-data semantics, e.g. ``valuation``
+            / ``capital_flow``), ``date`` is accepted as same-day
+            availability with no lag.
+        label:
+            Loader label, used only for the warn-skip log line.
         """
         # Tier 1: announcement dates — add 1 BDay for availability lag
         announce_cols = ["ann_date", "f_ann_date", "publish_date", "disclosure_date"]
@@ -1273,15 +1315,50 @@ class FeatureMerger:
                     # Available next trading day after announcement
                     return parsed + pd.tseries.offsets.BDay(1)
 
-        # Tier 2: already-available dates (no lag needed)
-        avail_cols = ["effective_date", "pub_date", "trade_date", "date", "collected_at"]
+        # Tier 2: unambiguous already-available dates (no lag needed)
+        avail_cols = ["effective_date", "pub_date", "trade_date"]
         for col in avail_cols:
             if col in df.columns:
                 parsed = _parse_date_series(df[col])
                 if parsed.notna().any():
                     return parsed
 
-        # Tier 3: report period fallback — conservative statutory deadlines
+        # Tier 3: generic `date` — same-day for market-data loaders only.
+        # For disclosure-typed loaders (``as_of_strict=True``) we refuse it:
+        # `date` on a disclosure parquet is most often the report-period end
+        # or a snapshot date, NEITHER of which is the announcement-availability
+        # moment, and accepting it leaks the report values back through
+        # the entire history before the announcement.
+        if "date" in df.columns:
+            parsed = _parse_date_series(df["date"])
+            if parsed.notna().any():
+                if as_of_strict:
+                    logger.warning(
+                        "%s: no explicit announcement-date column found "
+                        "and as_of_strict=True. Refusing to fall back to "
+                        "raw `date` for a disclosure-typed loader — that "
+                        "would mean broadcasting report-period or snapshot "
+                        "values back through history. Loader skipped.",
+                        label or "<unknown loader>",
+                    )
+                    # fall through to report-period fallback so we still
+                    # emit conservative statutory dates if available
+                else:
+                    return parsed
+
+        # Tier 4: collected_at is scrape time, NOT market-open
+        # availability. A Tuesday-evening scrape only becomes safely
+        # usable for Wednesday's open at earliest, so shift +1 BDay
+        # exactly like an announcement date. Without this shift the
+        # asof-merge would accept Tuesday's training row as "had this
+        # scrape already", which is post-close information leak.
+        if "collected_at" in df.columns:
+            parsed = _parse_date_series(df["collected_at"])
+            if parsed.notna().any():
+                # collected_at = scrape time, NOT market-open availability
+                return parsed + pd.tseries.offsets.BDay(1)
+
+        # Tier 5: report period fallback — conservative statutory deadlines
         # Only used when no announcement date exists at all
         report_cols = ["stat_date", "period", "report_period", "end_date"]
         for col in report_cols:
