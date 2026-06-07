@@ -743,6 +743,12 @@ class FeatureMerger:
             if gcl is not None:
                 frames.append(gcl)
 
+        # PBC monetary policy liquidity (PE-1 step 3 output)
+        if allowed is None or "pbc_liquidity" in allowed:
+            pbc = _run("pbc_liquidity", self._load_pbc_liquidity)
+            if pbc is not None:
+                frames.append(pbc)
+
         # Cross-market regime signals (恒生/纳指 - broadcast to all stocks per date)
         if allowed is None or "cross_market_regime" in allowed:
             cross_mkt = _run("cross_market_regime", self._load_cross_market_regime)
@@ -1456,6 +1462,62 @@ class FeatureMerger:
     def _load_global_chain_llm(self, index: pd.MultiIndex) -> pd.DataFrame | None:
         """LLM source thin wrapper around _load_global_chain."""
         return self._load_global_chain(index, llm=True)
+
+    def _load_pbc_liquidity(self, index: pd.MultiIndex) -> pd.DataFrame | None:
+        """Load PBC monetary policy liquidity factors (market-level).
+
+        2026-06-07 (Phase E.1 wiring): PE-1 step 3 produces
+        ``pbc_liquidity_factors.parquet`` keyed by (datetime, instrument)
+        with instrument always == "MARKET" (the synthetic broadcast key
+        chain used by cross_market_regime). Cols:
+        ``pbc_liquidity_zscore_20d`` / ``pbc_easing_dummy`` /
+        ``pbc_tightening_dummy`` / ``short_rate_pressure``.
+
+        Broadcast logic: each MARKET row is replicated across every
+        instrument on the same date (same approach as
+        ``_load_cross_market_regime``). The original index is preserved
+        so unobserved dates get NaN → zero-fill downstream.
+        """
+        path = self.data_dir / "pbc_liquidity_factors.parquet"
+        if not path.exists():
+            logger.warning("PBC liquidity parquet not found: %s", path)
+            return None
+        try:
+            df = pd.read_parquet(path)
+            if df.empty:
+                return None
+            # Normalize to (datetime, instrument) MultiIndex regardless
+            # of how the source wrote it.
+            if isinstance(df.index, pd.MultiIndex):
+                base = df.copy()
+            elif {"datetime", "instrument"}.issubset(df.columns):
+                base = df.set_index(["datetime", "instrument"])
+            else:
+                logger.warning("PBC parquet has unexpected shape: %s",
+                               df.columns.tolist())
+                return None
+            factor_cols = [c for c in base.columns
+                           if pd.api.types.is_numeric_dtype(base[c])]
+            if not factor_cols:
+                return None
+            # Reduce to date-keyed frame (MARKET instrument only).
+            base = base.reset_index()
+            base["datetime"] = pd.to_datetime(base["datetime"])
+            # Use the first MARKET row per date (build script guarantees one).
+            market_df = (base[base["instrument"] == "MARKET"]
+                         .drop_duplicates("datetime")
+                         .set_index("datetime")[factor_cols])
+            # Broadcast: align by caller's datetime level, regardless of stock.
+            caller_dates = index.get_level_values("datetime")
+            aligned = market_df.reindex(caller_dates)
+            aligned.index = index
+            non_null = aligned.notna().any(axis=1).sum()
+            logger.info("PBC liquidity: %d cols, %d rows non-null",
+                        len(factor_cols), non_null)
+            return aligned
+        except Exception as e:
+            logger.warning(f"PBC liquidity load failed: {e}")
+            return None
 
     def _load_guba(self, index: pd.MultiIndex) -> pd.DataFrame | None:
         """Load Eastmoney Guba popularity factors.

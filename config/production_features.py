@@ -130,6 +130,22 @@ SUPPLEMENTARY_GROUPS_BY_PROFILE: dict[str, tuple[str, ...]] = {
         "st_holder_number",
         "global_chain_llm",
     ),
+    # xgb_209_pbc — CANDIDATE profile for PE-1 PBOC liquidity input.
+    # xgb_209 + 4 PBC liquidity cols (zscore_20d / easing_dummy /
+    # tightening_dummy / short_rate_pressure). These are MARKET-level
+    # signals broadcast to all stocks per date — same shape as
+    # cross_market_regime. Shadow until B.7-style LOO confirms lift.
+    "xgb_209_pbc": (
+        "fundamental",
+        "macro_zero_baseline",
+        "valuation",
+        "northbound",
+        "quality",
+        "st_daily_basic",
+        "st_moneyflow",
+        "st_holder_number",
+        "pbc_liquidity",
+    ),
     # xgb_209_guba — CANDIDATE profile, NOT YET PRODUCTION.
     # xgb_209 + 3 Eastmoney Guba popularity cols
     # (popularity_rank / rank_change / popularity_score). Same shadow
@@ -264,6 +280,13 @@ PROFILE_EXPECTED_COUNTS: dict[str, dict[str, int]] = {
         "supplementary": 51,
         "qlib_custom": 0,
         "total": 209,
+    },
+    # xgb_209_pbc — xgb_209 + 4 PBC liquidity cols.
+    "xgb_209_pbc": {
+        "alpha158": 158,
+        "supplementary": 55,    # 51 base + 4 PBC
+        "qlib_custom": 0,
+        "total": 213,
     },
     # xgb_209_guba — xgb_209 + 3 guba popularity cols.
     "xgb_209_guba": {
