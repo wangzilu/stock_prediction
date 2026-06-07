@@ -311,6 +311,36 @@ def test_excess_return_skips_event_with_short_window():
     assert panel.empty
 
 
+def test_broadcast_theme_events_to_baskets():
+    """A THEME_X event expands to one row per stock in the basket."""
+    theme_events = pd.DataFrame([
+        {"event_id": "x", "event_date": pd.Timestamp("2026-05-20"),
+         "instrument": "THEME_AI_DEMO", "event_type": "ai_demo"},
+        {"event_id": "y", "event_date": pd.Timestamp("2026-05-21"),
+         "instrument": "THEME_NOT_IN_MAP", "event_type": "missing"},
+    ])
+    baskets = {
+        "THEME_AI_DEMO": ["SH600519", "SZ000858"],
+        # THEME_NOT_IN_MAP intentionally absent.
+    }
+    out = es.broadcast_theme_events(theme_events, theme_to_basket=baskets)
+    # One theme matches; expanded to 2 rows (basket size 2). Theme that
+    # isn't in the map is dropped.
+    assert len(out) == 2
+    assert set(out["instrument"]) == {"SH600519", "SZ000858"}
+    assert (out["event_type"] == "ai_demo").all()
+    # event_id is suffixed so each (event, stock) is unique.
+    assert out["event_id"].nunique() == 2
+
+
+def test_broadcast_theme_events_empty_input():
+    out = es.broadcast_theme_events(
+        pd.DataFrame(columns=["event_id", "event_date", "instrument", "event_type"]),
+        theme_to_basket={"THEME_FOO": ["SH600519"]},
+    )
+    assert out.empty
+
+
 def test_excess_return_market_keyed_uses_benchmark_for_self():
     """MARKET instrument → 'excess return' is 0 by construction."""
     dates = pd.bdate_range("2026-01-05", periods=20)

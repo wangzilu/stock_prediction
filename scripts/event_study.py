@@ -268,6 +268,64 @@ def qlib_close_loader(
     return out
 
 
+def broadcast_theme_events(
+    events: pd.DataFrame,
+    *,
+    theme_to_basket: dict[str, list[str]] | None = None,
+) -> pd.DataFrame:
+    """Expand THEME_X events into one row per basket member stock.
+
+    Args:
+        events: long-form event frame from ``load_events``. Rows whose
+            ``instrument`` is not a ``THEME_*`` code pass through
+            unchanged.
+        theme_to_basket: optional dict[theme_upper, [SHxxxxxx, ...]].
+            Defaults to ``factors.xwlb_theme_baskets.load_theme_baskets()``.
+            Themes absent from the map are DROPPED — the basket coverage
+            is intentionally partial (see ``config/xwlb_theme_baskets.yaml``).
+
+    The returned frame's ``event_id`` is suffixed with the stock code so
+    each (event, stock) is unique downstream.
+    """
+    if events is None or events.empty:
+        return events.iloc[0:0].copy() if events is not None else pd.DataFrame()
+
+    if theme_to_basket is None:
+        try:
+            from factors.xwlb_theme_baskets import load_theme_baskets
+            theme_to_basket = load_theme_baskets()
+        except Exception as exc:  # pragma: no cover — broken install
+            logger.warning(
+                "event_study: cannot load xwlb baskets (%s); themes dropped.",
+                exc,
+            )
+            theme_to_basket = {}
+
+    is_theme = events["instrument"].astype(str).str.startswith("THEME_")
+    passthru = events[~is_theme]
+    themed = events[is_theme]
+    if themed.empty:
+        return events.copy()
+
+    rows: list[dict] = []
+    for _, ev in themed.iterrows():
+        theme = str(ev["instrument"]).upper()
+        basket = theme_to_basket.get(theme) or []
+        for stock in basket:
+            stock_code = str(stock).upper().strip()
+            if not stock_code:
+                continue
+            new_row = ev.to_dict()
+            new_row["instrument"] = stock_code
+            new_row["event_id"] = f"{ev['event_id']}:{stock_code}"
+            rows.append(new_row)
+
+    if not rows and passthru.empty:
+        return events.iloc[0:0].copy()
+    expanded = pd.DataFrame(rows) if rows else pd.DataFrame(columns=events.columns)
+    return pd.concat([passthru, expanded], ignore_index=True)
+
+
 def build_excess_return_panel(
     *,
     events: pd.DataFrame,
