@@ -418,6 +418,7 @@ def resolve_llm_event_factor_source(
             a hard fail rather than silently substituting a default.
     """
     import os as _os
+    import warnings as _warnings
     raw = (
         explicit
         if explicit is not None
@@ -428,6 +429,21 @@ def resolve_llm_event_factor_source(
         raise RuntimeError(
             f"Invalid LLM event factor source {raw!r}. "
             f"Allowed: {list(_ALLOWED_FACTOR_SOURCES)}."
+        )
+    # 2026-06-07 LLM L2 closure: EventStore is the canonical PIT source
+    # for LLM events. The JSONL path stays for explicit backfills /
+    # debug only — warn the operator every time it's selected so
+    # nobody accidentally ships a production cron with the legacy
+    # source and degrades the signal_date semantics.
+    if norm == "jsonl":
+        _warnings.warn(
+            "LLM_EVENT_FACTOR_SOURCE=jsonl is the legacy debug-only "
+            "path. EventStore (the default) groups by signal_date "
+            "(next business day after publish_time) which matches "
+            "every downstream PIT-safe overlay; JSONL groups by "
+            "file_date which is mis-PIT for live trading. Pass "
+            "source='jsonl' only for back-compat backfills.",
+            stacklevel=2,
         )
     return norm
 
