@@ -1,7 +1,8 @@
 """Collect policy texts — Phase E.1 step 1 (PBOC liquidity overlay) +
-Phase E.2 step 1 (State Council / ministry industry policy overlay).
+Phase E.2 step 1 (State Council / ministry industry policy overlay) +
+Phase E.3 step 1 (NBS macro statistics overlay).
 
-Fetches policy texts from one of two source registries:
+Fetches policy texts from one of three source registries:
 
 - ``--source pbc`` — People's Bank of China monetary policy texts
   (www.pbc.gov.cn), output under
@@ -9,6 +10,9 @@ Fetches policy texts from one of two source registries:
 - ``--source state_council`` — State Council policy docs + ministry
   bulletins from ``www.gov.cn``, output under
   ``data/storage/policy_texts/state_council/<YYYY-MM-DD>.jsonl``.
+- ``--source nbs`` — National Bureau of Statistics CPI / PPI / PMI /
+  retail-sales monthly releases from ``www.stats.gov.cn``, output
+  under ``data/storage/policy_texts/nbs/<YYYY-MM-DD>.jsonl``.
 
 Raw HTML for any item that fails to parse is dropped into
 ``data/storage/policy_texts/<source>_raw_html/`` so the LLM extract step
@@ -80,6 +84,9 @@ RAW_HTML_DIR = DATA_DIR / "policy_texts" / "pbc_raw_html"
 # Phase E.2 (PE-2): State Council + ministry policy docs from gov.cn
 POLICY_DIR_SC = DATA_DIR / "policy_texts" / "state_council"
 RAW_HTML_DIR_SC = DATA_DIR / "policy_texts" / "state_council_raw_html"
+# Phase E.3 (PE-3): NBS (国家统计局) macro statistics from stats.gov.cn
+POLICY_DIR_NBS = DATA_DIR / "policy_texts" / "nbs"
+RAW_HTML_DIR_NBS = DATA_DIR / "policy_texts" / "nbs_raw_html"
 
 # ── PBOC list pages — kept as named constants so a structural change
 # is one-line patchable. URLs verified against the public PBOC
@@ -115,6 +122,7 @@ INTER_REQUEST_DELAY = 0.4  # be polite to gov.cn / pbc.gov.cn
 
 HEALTH_SOURCE_NAME = "pbc_policy_texts"
 HEALTH_SOURCE_NAME_SC = "state_council_policy_texts"
+HEALTH_SOURCE_NAME_NBS = "nbs_policy_texts"
 
 # ── Phase E.2 (PE-2) — State Council + ministry list pages.
 # Like the PBOC registry above, these are LIST pages: each renders an
@@ -145,6 +153,53 @@ STATE_COUNCIL_LIST_URLS: dict[str, str] = {
 STATE_COUNCIL_POLICY_TYPES: frozenset[str] = frozenset(
     STATE_COUNCIL_LIST_URLS.keys()
 )
+
+
+# ── Phase E.3 (PE-3) — NBS (国家统计局) macro statistics list pages.
+#
+# NBS publishes monthly headline data points (CPI / PPI / PMI / 社零)
+# on its "最新发布" / "数据发布" index pages. We point at the two
+# top-level indices and the per-series 月度数据 pages; the list-page
+# parser is shared with PBC/PE-2 (gov.cn ``/YYYY-MM/DD/content_*.html``
+# pattern matches NBS's preferred URL layout).
+#
+# Note: NBS structural URLs have moved several times (xxgk → sj → ...);
+# the parser is tolerant of structural drift via the same regex fan-out
+# already in parse_list_page. If a list page 404s on a given day the
+# collector records an error and continues — the SLA budget is 35 days
+# (monthly publish cadence) so a few empty days are expected.
+NBS_LIST_URLS: dict[str, str] = {
+    # CPI 月度数据 — published mid-month (e.g. May data on ~10 June)
+    "cpi": "http://www.stats.gov.cn/sj/zxfb/",
+    # PPI 月度数据 — same release window as CPI
+    "ppi": "http://www.stats.gov.cn/sj/sjjd/",
+    # PMI 月度数据 — published end-of-month / start-of-next
+    "pmi": "http://www.stats.gov.cn/xxgk/sjfb/zxfb2020/",
+    # 社会消费品零售总额 月度 — published mid-month
+    "retail_sales": "http://www.stats.gov.cn/sj/",
+}
+
+# policy_type values emitted by collect_nbs. The downstream extractor
+# uses these as routing hints (e.g. only CPI rows feed cpi_surprise).
+NBS_POLICY_TYPES_BY_SERIES: dict[str, str] = {
+    "cpi": "cpi_monthly",
+    "ppi": "ppi_monthly",
+    "pmi": "pmi_monthly",
+    "retail_sales": "retail_sales_monthly",
+}
+
+NBS_POLICY_TYPES: frozenset[str] = frozenset(NBS_POLICY_TYPES_BY_SERIES.values())
+
+# Title-keyword filters used to keep only series-relevant list rows. NBS
+# tends to publish many adjacent items on the same index page (CPI / PPI
+# / 社零 / etc) — filtering by title keyword lets each series-key fetch
+# only its own rows from a shared index, avoiding double-counting.
+NBS_TITLE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "cpi": ("居民消费价格", "CPI"),
+    "ppi": ("工业生产者", "PPI", "出厂价格"),
+    "pmi": ("采购经理指数", "PMI", "制造业景气"),
+    "retail_sales": ("社会消费品零售", "社零", "消费品零售总额"),
+}
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -755,6 +810,175 @@ def collect_state_council(
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Phase E.3 (PE-3) — NBS (国家统计局) macro statistics collector.
+#
+# Same shape as collect_pbc / collect_state_council. The list-page
+# parser is shared (gov.cn /YYYY-MM/DD/ pattern handles NBS just fine);
+# the only NBS-specific logic is the title-keyword filter that keeps
+# only series-relevant rows from a shared index page.
+# ─────────────────────────────────────────────────────────────────────
+def _title_matches_series(title: str, series_key: str) -> bool:
+    """Return True if ``title`` contains any keyword for ``series_key``.
+
+    Used to filter rows on a shared index page so the CPI fetch only
+    keeps CPI rows even when the same index also lists PPI / 社零 /
+    PMI. Falls back to True if the keyword tuple is missing (so a typo
+    can't silently drop everything).
+    """
+    keywords = NBS_TITLE_KEYWORDS.get(series_key, ())
+    if not keywords:
+        return True
+    return any(kw in title for kw in keywords)
+
+
+def collect_nbs(
+    *,
+    start: str,
+    end: str,
+    policy_types: Iterable[str] = ("cpi", "ppi", "pmi", "retail_sales"),
+    bonus_types: Iterable[str] = (),
+    http_get_fn: Callable[..., requests.Response] = http_get,
+    output_dir: Path | None = None,
+) -> dict:
+    """Collect NBS macro-statistics texts for [start, end] inclusive.
+
+    Shape-identical to ``collect_pbc`` — same summary dict, same JSONL
+    schema, same atomic per-day writes. NBS-specific differences:
+
+      - LIST URL registry is NBS_LIST_URLS
+      - source field is ``"stats.gov.cn"``
+      - raw-html-on-failure dump goes to RAW_HTML_DIR_NBS
+      - policy_type ∈ {"cpi_monthly", "ppi_monthly", "pmi_monthly",
+        "retail_sales_monthly"} via NBS_POLICY_TYPES_BY_SERIES
+      - title-keyword filter (NBS_TITLE_KEYWORDS) keeps only the
+        series-relevant rows from a shared index page
+
+    Like the PE-2 collector, a list-page 5xx does not kill the run —
+    errors accumulate in summary["errors"] and the per-day file is
+    still written. NBS publishes monthly so a 0-row day on a Friday is
+    expected; the SLA budget is 35 days for that reason.
+    """
+    output_root = output_dir or POLICY_DIR_NBS
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    dates = _date_range(start, end)
+    date_set: set[str] = set(dates)
+
+    summary: dict = {
+        "rows_by_date": {d: 0 for d in dates},
+        "errors": [],
+        "files_written": [],
+        "policy_types_seen": {},
+        "n_total": 0,
+    }
+
+    by_date_rows: dict[str, list[dict]] = {d: [] for d in dates}
+    seen_urls: set[str] = set()
+    session = requests.Session()
+
+    for pt in list(policy_types) + list(bonus_types):
+        list_url = NBS_LIST_URLS.get(pt)
+        if not list_url:
+            continue
+        try:
+            resp = http_get_fn(list_url, session=session)
+            list_html = resp.content.decode("utf-8", errors="replace")
+        except Exception as e:
+            logger.warning("NBS list page failed for %s: %s", pt, e)
+            summary["errors"].append(
+                {"url": list_url, "stage": "list", "msg": str(e)}
+            )
+            continue
+
+        links = parse_list_page(list_html, list_url)
+        logger.info("NBS %s list page: %d candidate links", pt, len(links))
+
+        for ln in links:
+            # Title-keyword filter: keep only rows whose title matches
+            # the requested series. NBS indices mix multiple series in
+            # one page; without this filter the CPI fetch would also
+            # ingest PPI / 社零 rows and double-count them across
+            # series_keys.
+            if not _title_matches_series(ln.title, pt):
+                continue
+            if ln.url in seen_urls:
+                continue
+            if ln.publish_date and ln.publish_date not in date_set:
+                continue
+            seen_urls.add(ln.url)
+            time.sleep(INTER_REQUEST_DELAY)
+            try:
+                art_resp = http_get_fn(ln.url, session=session)
+                art_html = art_resp.content.decode("utf-8", errors="replace")
+            except Exception as e:
+                logger.warning("NBS article fetch failed %s: %s", ln.url, e)
+                summary["errors"].append(
+                    {"url": ln.url, "stage": "article", "msg": str(e)}
+                )
+                continue
+            try:
+                content, article_date = parse_article_page(art_html)
+            except Exception as e:
+                logger.warning("NBS article parse failed %s: %s", ln.url, e)
+                summary["errors"].append(
+                    {"url": ln.url, "stage": "parse", "msg": str(e)}
+                )
+                _save_raw_html_on_failure(
+                    ln.url, art_html, ln.publish_date or start,
+                    raw_html_dir=RAW_HTML_DIR_NBS,
+                )
+                continue
+
+            publish_date = ln.publish_date or article_date
+            if not publish_date:
+                _save_raw_html_on_failure(
+                    ln.url, art_html, start, raw_html_dir=RAW_HTML_DIR_NBS,
+                )
+                summary["errors"].append(
+                    {"url": ln.url, "stage": "no_date", "msg": "no publish_date"}
+                )
+                continue
+            if publish_date not in date_set:
+                continue
+            if not content or len(content) < 20:
+                _save_raw_html_on_failure(
+                    ln.url, art_html, publish_date,
+                    raw_html_dir=RAW_HTML_DIR_NBS,
+                )
+                summary["errors"].append(
+                    {"url": ln.url, "stage": "empty_body", "msg": "len(content)<20"}
+                )
+                continue
+
+            policy_type_value = NBS_POLICY_TYPES_BY_SERIES.get(pt, "other")
+            row = {
+                "publish_date": publish_date,
+                "policy_type": policy_type_value,
+                "title": ln.title,
+                "url": ln.url,
+                "content": content,
+                "source": "stats.gov.cn",
+                "fetch_time": _now_utc_iso(),
+            }
+            by_date_rows[publish_date].append(row)
+            summary["policy_types_seen"][policy_type_value] = (
+                summary["policy_types_seen"].get(policy_type_value, 0) + 1
+            )
+
+    for d in dates:
+        rows = by_date_rows[d]
+        rows.sort(key=lambda r: (r["policy_type"], r["url"]))
+        out_path = output_root / f"{d}.jsonl"
+        _atomic_write_jsonl(rows, out_path)
+        summary["rows_by_date"][d] = len(rows)
+        summary["files_written"].append(out_path)
+        summary["n_total"] += len(rows)
+        logger.info("Wrote %d row(s) -> %s", len(rows), out_path)
+
+    return summary
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Health publishing
 # ─────────────────────────────────────────────────────────────────────
 def publish_health(
@@ -822,12 +1046,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--source",
         default="pbc",
-        choices=["pbc", "state_council"],
+        choices=["pbc", "state_council", "nbs"],
         help=(
             "Policy source. 'pbc' = People's Bank monetary policy texts "
             "(Phase E.1). 'state_council' = State Council + 3 ministry "
-            "policy docs from gov.cn (Phase E.2). 'nbs' (statistics "
-            "bureau) reserved for Phase E.3."
+            "policy docs from gov.cn (Phase E.2). 'nbs' = National "
+            "Bureau of Statistics CPI / PPI / PMI / retail sales "
+            "monthly releases (Phase E.3)."
         ),
     )
     parser.add_argument(
@@ -883,6 +1108,16 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         health_source = HEALTH_SOURCE_NAME_SC
+    elif args.source == "nbs":
+        # PE-3: NBS macro statistics. All 4 series at once; include-bonus
+        # is a no-op since NBS doesn't have a bonus tier. NBS publishes
+        # monthly so a 0-row day is the steady-state expectation — the
+        # SLA budget is 35 days (one monthly release cycle).
+        collector = lambda: collect_nbs(
+            start=start, end=end,
+            policy_types=("cpi", "ppi", "pmi", "retail_sales"),
+        )
+        health_source = HEALTH_SOURCE_NAME_NBS
     else:
         # Re-raise as a hard error rather than silently no-op. The
         # argparse choices= already prevents this, but defend.

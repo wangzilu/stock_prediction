@@ -200,6 +200,29 @@ SLA_BY_SOURCE: dict[str, SourceSLA] = {
         "(industry, date) rows; FeatureMerger maps stocks to industries "
         "at execution time. 3-day budget tolerates sparse publish days.",
     ),
+    # ── PE-3 NBS macro-statistics chain (Phase E.3) ─────────────────
+    # NBS publishes monthly (CPI / PPI / PMI / 社零) so the budget is
+    # 35 trading days — roughly one monthly release cycle. A daily
+    # weekday with zero new releases is the steady-state expectation;
+    # the gate must not flip red between monthly publish dates.
+    "nbs_policy_texts": SourceSLA(
+        "daily", 35,
+        "NBS macro-statistics text collection from stats.gov.cn. "
+        "35-day budget matches NBS's monthly publish cadence — a "
+        "zero-row weekday between monthly releases must NOT paint "
+        "the gate red.",
+    ),
+    "nbs_policy_events": SourceSLA(
+        "daily", 35,
+        "Daily LLM extraction of NBS macro statistics → structured "
+        "surprise events. 35-day budget matches the upstream collector.",
+    ),
+    "nbs_macro_factors": SourceSLA(
+        "daily", 35,
+        "Daily NBS macro-surprise factor build (3-month rolling "
+        "aggregates). MARKET-keyed; broadcast to every stock by the "
+        "FeatureMerger. 35-day budget matches the monthly release cycle.",
+    ),
     # ── Auxiliary ───────────────────────────────────────────────────
     "weekly_mask_rebuild": SourceSLA(
         "weekly", 7,

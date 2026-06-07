@@ -1,5 +1,6 @@
-"""Extract structured policy events from PBC + State Council texts —
-Phase E.1 step 2 (PBC) + Phase E.2 step 2 (PE-2 State Council / ministry).
+"""Extract structured policy events from PBC + State Council + NBS texts —
+Phase E.1 step 2 (PBC) + Phase E.2 step 2 (State Council / ministry) +
+Phase E.3 step 2 (NBS macro surprise).
 
 PE-1 (PBC) reads ``data/storage/policy_texts/pbc/<YYYY-MM-DD>.jsonl``
 and writes ``data/storage/policy_events/pbc/<YYYY-MM-DD>.jsonl`` —
@@ -9,6 +10,12 @@ PE-2 (State Council) reads
 ``data/storage/policy_texts/state_council/<YYYY-MM-DD>.jsonl`` and
 writes ``data/storage/policy_events/state_council/<YYYY-MM-DD>.jsonl``
 — extracts target industries / fiscal support / regulatory direction.
+
+PE-3 (NBS) reads
+``data/storage/policy_texts/nbs/<YYYY-MM-DD>.jsonl`` and writes
+``data/storage/policy_events/nbs/<YYYY-MM-DD>.jsonl`` — extracts
+series name (CPI / PPI / PMI / retail sales) / headline value /
+consensus / mom & yoy change / surprise direction.
 
 The same events are also appended to the unified ``EventStore`` so
 downstream factor builders / overlays can query them by ``signal_date``.
@@ -85,9 +92,14 @@ OUTPUT_DIR = DATA_DIR / "policy_events" / "pbc"
 INPUT_DIR_SC = DATA_DIR / "policy_texts" / "state_council"
 OUTPUT_DIR_SC = DATA_DIR / "policy_events" / "state_council"
 
+# Phase E.3 (PE-3) — NBS macro surprise chain.
+INPUT_DIR_NBS = DATA_DIR / "policy_texts" / "nbs"
+OUTPUT_DIR_NBS = DATA_DIR / "policy_events" / "nbs"
+
 # Health source name matches the convention used by collect_policy_texts.
 HEALTH_SOURCE_NAME = "pbc_policy_events"
 HEALTH_SOURCE_NAME_SC = "state_council_policy_events"
+HEALTH_SOURCE_NAME_NBS = "nbs_policy_events"
 
 # ─────────────────────────────────────────────────────────────────────
 # Schema enumerations — the validator gate.
@@ -115,6 +127,17 @@ POLICY_DIRECTIONS: frozenset[str] = frozenset({
 })
 SUBSIDY_TAX_TYPES: frozenset[str] = frozenset({
     "subsidy", "tax_reduction", "tax_increase", "neither",
+})
+
+# Phase E.3 (PE-3) — NBS macro surprise enums. The LLM extracts which
+# series the article covers and the direction of the surprise vs
+# consensus. Downgrade rules: out-of-vocab series_name → "other",
+# out-of-vocab surprise_direction → "unknown".
+NBS_SERIES_NAMES: frozenset[str] = frozenset({
+    "cpi", "ppi", "pmi", "retail_sales", "other",
+})
+NBS_SURPRISE_DIRECTIONS: frozenset[str] = frozenset({
+    "upside", "downside", "inline", "unknown",
 })
 
 # Fact-only system prompt. Explicitly bans price prediction and trading
@@ -164,6 +187,44 @@ Schema:
   "subsidy_or_tax": "<one of: subsidy|tax_reduction|tax_increase|neither>",
   "regulatory_tightening": <bool: true 仅当原文明确加强监管/限制/禁止/处罚>,
   "implementation_deadline": "<YYYY-MM-DD or null>"
+}"""
+
+
+# Phase E.3 (PE-3) NBS macro statistics prompt. Fact-only: extract the
+# headline number / prior / consensus / surprise vs expectations. The
+# "DO NOT predict stock direction" line is critical because macro
+# releases are reflexively associated with market reactions in training
+# data — without the guard the LLM would output "CPI undershoots →
+# stocks rally" which is exactly the prediction we forbid.
+SYSTEM_PROMPT_NBS = """You are a Chinese macro-statistics analyst. Extract
+structured facts from the National Bureau of Statistics (NBS) release
+text below.
+
+Output ONLY one JSON object. No prose, no explanation, no preamble.
+The first character must be { .
+
+Strict rules:
+1. Extract ONLY facts literally stated in the text. DO NOT predict
+   stock prices, DO NOT give trading advice, DO NOT infer market
+   reactions.
+2. If a field is absent or not stated in the text, output null. Do not
+   guess. Do not fill 0.
+3. Numeric fields are plain numbers (no units, no % sign, no 亿元).
+4. release_period is the YYYY-MM of the DATA POINT (e.g. "April CPI
+   released in May" => release_period="2026-04"), NOT the release date.
+5. surprise_direction is "upside" / "downside" / "inline" only when
+   the text quotes a consensus or expectation; otherwise "unknown".
+
+Schema:
+{
+  "series_name": "<one of: cpi|ppi|pmi|retail_sales|other>",
+  "release_period": "<YYYY-MM of the data point, or null>",
+  "headline_value": <float, the headline number reported, or null>,
+  "prior_value": <float, the previous month's value if quoted, or null>,
+  "consensus_value": <float, analyst consensus / market expectation if quoted, or null>,
+  "mom_change": <float, month-on-month change in percentage points / %, or null>,
+  "yoy_change": <float, year-on-year change in percentage points / %, or null>,
+  "surprise_direction": "<one of: upside|downside|inline|unknown>"
 }"""
 
 
@@ -382,6 +443,80 @@ def validate_event_state_council(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Phase E.3 (PE-3) — NBS macro-surprise validator. Same downgrade
+# discipline as PBC / PE-2: bad enums demote, bad numerics → None,
+# never drop a row.
+# ─────────────────────────────────────────────────────────────────────
+_PERIOD_RE = re.compile(r"^(\d{4})-(\d{1,2})$")
+
+
+def _coerce_period(value: Any) -> str | None:
+    """Normalize a YYYY-MM-ish release period. None / unparseable → None.
+
+    Tolerates trailing day component (``YYYY-MM-DD`` → ``YYYY-MM``) so a
+    LLM that confuses publish-date with release-period yields something
+    rather than null.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s or s.lower() in ("null", "none", "n/a"):
+        return None
+    # Accept YYYY-MM-DD by truncating to YYYY-MM.
+    if _DATE_RE.match(s):
+        s = s[:7]
+    m = _PERIOD_RE.match(s)
+    if not m:
+        return None
+    try:
+        y, mo = (int(g) for g in m.groups())
+        if not (1900 < y < 2200 and 1 <= mo <= 12):
+            return None
+        return f"{y:04d}-{mo:02d}"
+    except ValueError:
+        return None
+
+
+def validate_event_nbs(raw: dict[str, Any]) -> dict[str, Any]:
+    """Validate NBS LLM output, downgrading on out-of-vocab enums.
+
+    Mirrors ``validate_event`` / ``validate_event_state_council``
+    discipline: missing → None, bad enums demote rather than drop the
+    row. Returns a fresh dict with every documented field present.
+    """
+    series = raw.get("series_name")
+    if (
+        not isinstance(series, str)
+        or series.lower() not in NBS_SERIES_NAMES
+    ):
+        series = "other"
+    else:
+        series = series.lower()
+
+    direction = raw.get("surprise_direction")
+    if (
+        not isinstance(direction, str)
+        or direction.lower() not in NBS_SURPRISE_DIRECTIONS
+    ):
+        direction = "unknown"
+    else:
+        direction = direction.lower()
+
+    return {
+        "series_name": series,
+        "release_period": _coerce_period(raw.get("release_period")),
+        "headline_value": _coerce_number(raw.get("headline_value")),
+        "prior_value": _coerce_number(raw.get("prior_value")),
+        "consensus_value": _coerce_number(raw.get("consensus_value")),
+        "mom_change": _coerce_number(raw.get("mom_change")),
+        "yoy_change": _coerce_number(raw.get("yoy_change")),
+        "surprise_direction": direction,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────
 # LLM wrapper — uses the same MiniMax client wired into
 # ``factors/llm_event_extractor_v2.py``. The wrapper here owns the
 # PBOC-specific system prompt; the network plumbing (auth header,
@@ -454,6 +589,21 @@ def _llm_extract_with_state_council_prompt(
     running concurrently.
     """
     return _llm_extract_via_minimax(content, system_prompt=SYSTEM_PROMPT_SC)
+
+
+def _llm_extract_with_nbs_prompt(
+    content: str,
+) -> dict[str, Any] | None:
+    """Production LLM call with SYSTEM_PROMPT_NBS threaded as a kwarg.
+
+    Same thread-safety contract as the PBC / SC wrappers: we MUST NEVER
+    monkey-patch ``factors.llm_event_extractor_v2.SYSTEM_PROMPT_V2``.
+    The per-call ``system_prompt`` arg is the only safe channel — the
+    per-stock LLM pipeline and the macro-stats extraction can both be
+    running in-process at 16:00 (PE-3 sits between the 15:50 PE-1
+    extract and the 16:10 PE-1 factor build).
+    """
+    return _llm_extract_via_minimax(content, system_prompt=SYSTEM_PROMPT_NBS)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -580,6 +730,58 @@ def _append_to_event_store_sc(
             })
         except Exception as e:
             logger.warning("EventStore.add_event failed (%s): %s", industry, e)
+
+
+def _append_to_event_store_nbs(
+    row: dict, *, source_row: dict, eventstore_dir: Path | None,
+) -> None:
+    """Append a PE-3 NBS macro-surprise event to the unified EventStore.
+
+    Schema choices:
+      - source = "policy" (same category as PBC; macro releases are
+        market-wide signals).
+      - event_type = "macro_surprise_<series>" (e.g. "macro_surprise_cpi").
+      - direction = +1 for upside, -1 for downside, 0 for inline / unknown.
+      - confidence = 0.7 when surprise_direction is known, 0.4 otherwise.
+        (Lower default than the PBC unexpectedness=0.5 floor because a
+        macro release with no consensus quoted is genuinely lower-info.)
+      - stock_code = "MARKET" — macro stats affect the whole market.
+    """
+    try:
+        from factors.event_store import EventStore
+    except Exception as e:  # pragma: no cover — broken install
+        logger.warning("EventStore import failed (%s); skipping append", e)
+        return
+
+    try:
+        store = EventStore(store_dir=eventstore_dir) if eventstore_dir else EventStore()
+    except Exception as e:
+        logger.warning("EventStore init failed (%s); skipping append", e)
+        return
+
+    direction_str = row.get("surprise_direction", "unknown")
+    dir_int = {"upside": 1, "downside": -1}.get(direction_str, 0)
+    series = row.get("series_name", "other")
+    event_type = f"macro_surprise_{series}"
+    confidence = 0.7 if direction_str in ("upside", "downside") else 0.4
+
+    publish_time = source_row.get("publish_date", "")
+    summary_text = (source_row.get("title") or "")[:200]
+    try:
+        store.add_event({
+            "date": publish_time,
+            "stock_code": "MARKET",
+            "source": "policy",
+            "event_type": event_type,
+            "direction": dir_int,
+            "confidence": confidence,
+            "summary": summary_text,
+            "publish_time": publish_time,
+            "topic": series,
+            "is_policy": True,
+        })
+    except Exception as e:
+        logger.warning("EventStore.add_event failed: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -855,6 +1057,138 @@ def extract_state_council(
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Phase E.3 (PE-3) — NBS macro-surprise extract loop. Same shape as
+# extract_pbc / extract_state_council but uses NBS validator + NBS LLM
+# wrapper + NBS EventStore append. stock_code is MARKET (same as PBC):
+# macro releases are market-wide signals.
+# ─────────────────────────────────────────────────────────────────────
+def extract_nbs(
+    *,
+    target_date: str,
+    input_dir: Path | None = None,
+    output_dir: Path | None = None,
+    eventstore_dir: Path | None = None,
+    llm_extract_fn: Callable[[str], dict[str, Any] | None] | None = None,
+) -> dict:
+    """Extract NBS macro-surprise events for a single date.
+
+    See ``extract_pbc`` for the parameter shape. NBS-specific differences:
+
+      - default input is ``policy_texts/nbs/<date>.jsonl``
+      - default output is ``policy_events/nbs/<date>.jsonl``
+      - default LLM wrapper is ``_llm_extract_with_nbs_prompt``
+      - validator is ``validate_event_nbs``
+      - EventStore append uses the NBS variant (MARKET-keyed)
+    """
+    input_root = input_dir or INPUT_DIR_NBS
+    output_root = output_dir or OUTPUT_DIR_NBS
+    llm_fn = llm_extract_fn or _llm_extract_with_nbs_prompt
+
+    input_path = input_root / f"{target_date}.jsonl"
+    output_path = output_root / f"{target_date}.jsonl"
+
+    summary = {
+        "target_date": target_date,
+        "n_input": 0,
+        "n_extracted": 0,
+        "n_failed": 0,
+        "n_downgraded": 0,
+        "output_path": str(output_path),
+        "errors": [],
+    }
+
+    if not input_path.exists():
+        logger.info(
+            "No NBS input file for %s at %s — writing empty output",
+            target_date, input_path,
+        )
+        _atomic_write_jsonl([], output_path)
+        return summary
+
+    input_rows: list[dict] = []
+    with open(input_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                input_rows.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                summary["errors"].append({"stage": "input_parse", "msg": str(e)})
+
+    summary["n_input"] = len(input_rows)
+    output_rows: list[dict] = []
+
+    for src in input_rows:
+        content = (src.get("content") or "").strip()
+        if not content:
+            summary["n_failed"] += 1
+            summary["errors"].append({
+                "stage": "empty_content",
+                "url": src.get("url", ""),
+            })
+            continue
+
+        try:
+            raw = llm_fn(content)
+        except Exception as e:
+            summary["n_failed"] += 1
+            summary["errors"].append({
+                "stage": "llm_call",
+                "url": src.get("url", ""),
+                "msg": str(e)[:200],
+            })
+            continue
+
+        if raw is None:
+            summary["n_failed"] += 1
+            summary["errors"].append({
+                "stage": "llm_parse",
+                "url": src.get("url", ""),
+            })
+            continue
+
+        validated = validate_event_nbs(raw)
+        # Track downgrades for visibility (out-of-vocab enum → fallback).
+        if (
+            validated["series_name"] == "other"
+            and isinstance(raw.get("series_name"), str)
+            and raw.get("series_name", "").lower() not in NBS_SERIES_NAMES
+        ):
+            summary["n_downgraded"] += 1
+        if (
+            validated["surprise_direction"] == "unknown"
+            and isinstance(raw.get("surprise_direction"), str)
+            and raw.get("surprise_direction", "").lower()
+            not in NBS_SURPRISE_DIRECTIONS
+        ):
+            summary["n_downgraded"] += 1
+
+        row = {
+            "publish_date": src.get("publish_date", target_date),
+            "policy_type": src.get("policy_type", "other"),
+            "title": src.get("title", ""),
+            "url": src.get("url", ""),
+            **validated,
+            "extracted_at": _now_utc_iso(),
+        }
+        output_rows.append(row)
+        summary["n_extracted"] += 1
+
+        _append_to_event_store_nbs(
+            row, source_row=src, eventstore_dir=eventstore_dir,
+        )
+
+    _atomic_write_jsonl(output_rows, output_path)
+    logger.info(
+        "NBS extracted %d/%d events for %s (failed=%d, downgraded=%d) → %s",
+        summary["n_extracted"], summary["n_input"], target_date,
+        summary["n_failed"], summary["n_downgraded"], output_path,
+    )
+    return summary
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Health publishing
 # ─────────────────────────────────────────────────────────────────────
 def publish_health(
@@ -909,10 +1243,13 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     parser.add_argument(
-        "--source", default="pbc", choices=["pbc", "state_council"],
+        "--source", default="pbc",
+        choices=["pbc", "state_council", "nbs"],
         help=(
             "Policy source. 'pbc' = monetary policy (Phase E.1). "
-            "'state_council' = State Council + 3 ministries (Phase E.2)."
+            "'state_council' = State Council + 3 ministries (Phase E.2). "
+            "'nbs' = NBS macro statistics CPI/PPI/PMI/retail sales "
+            "(Phase E.3)."
         ),
     )
     parser.add_argument(
@@ -943,6 +1280,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.source == "state_council":
         extract_fn = extract_state_council
         health_source = HEALTH_SOURCE_NAME_SC
+    elif args.source == "nbs":
+        extract_fn = extract_nbs
+        health_source = HEALTH_SOURCE_NAME_NBS
     else:
         logger.error("Unsupported --source %s", args.source)
         return 2

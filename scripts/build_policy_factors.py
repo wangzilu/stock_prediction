@@ -14,10 +14,19 @@ Phase E.2 step 3 (PE-2, State Council / ministry):
   a follow-up; for now the parquet carries synthetic industry
   instruments and the consumer is responsible for the join.
 
+Phase E.3 step 3 (PE-3, NBS macro surprise):
+  Reads ``data/storage/policy_events/nbs/<YYYY-MM-DD>.jsonl`` and
+  emits a parquet keyed by ``(datetime, "MARKET")`` (same as PE-1
+  PBC) because macro statistics affect the whole market, not specific
+  industries. Factors are rolling 3-month aggregates of CPI / PPI
+  surprises plus a PMI-above-50 dummy and a 3-month yoy retail-sales
+  average.
+
 Output
 ------
     data/storage/pbc_liquidity_factors.parquet (PE-1, MARKET-keyed)
     data/storage/state_council_policy_factors.parquet (PE-2, INDUSTRY-keyed)
+    data/storage/nbs_macro_factors.parquet (PE-3, MARKET-keyed)
     Plus .health.json sidecars next to each parquet.
 
 Factor definitions (per the phase doc)
@@ -76,6 +85,12 @@ OUTPUT_PATH_SC = DATA_DIR / "state_council_policy_factors.parquet"
 HEALTH_PATH_SC = DATA_DIR / "state_council_policy_factors.health.json"
 HEALTH_SOURCE_NAME_SC = "state_council_policy_factors"
 
+# Phase E.3 (PE-3) — NBS macro surprise (MARKET-keyed, same as PBC).
+INPUT_DIR_NBS = DATA_DIR / "policy_events" / "nbs"
+OUTPUT_PATH_NBS = DATA_DIR / "nbs_macro_factors.parquet"
+HEALTH_PATH_NBS = DATA_DIR / "nbs_macro_factors.health.json"
+HEALTH_SOURCE_NAME_NBS = "nbs_macro_factors"
+
 # Window sizes — match the phase doc; kept as constants so changes
 # require a code edit rather than a config drift.
 ZSCORE_WINDOW_DAYS = 20
@@ -88,6 +103,12 @@ RATE_PRESSURE_WINDOW_DAYS = 20
 INDUSTRY_SUPPORT_SHORT_DAYS = 5
 INDUSTRY_SUPPORT_LONG_DAYS = 20
 INDUSTRY_NOVELTY_WINDOW_DAYS = 60
+
+# PE-3 windows. 3-month rolling sums match the NBS monthly publish
+# cadence (3 months ≈ 90 calendar days). The PMI dummy is a point-in-
+# time check against the latest release only.
+NBS_SURPRISE_WINDOW_DAYS = 90
+NBS_PMI_THRESHOLD = 50.0
 
 # Synthetic instrument the cross-market regime overlay already uses;
 # the FeatureMerger broadcasts MARKET-keyed rows to every stock at
@@ -445,6 +466,163 @@ SC_FACTOR_COLUMNS = (
     "industry_policy_support_20d",
     "industry_policy_novelty",
 )
+NBS_FACTOR_COLUMNS = (
+    "nbs_cpi_surprise_3m",
+    "nbs_ppi_surprise_3m",
+    "nbs_pmi_above_50_dummy",
+    "nbs_retail_growth_yoy_3m",
+)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Phase E.3 (PE-3) — NBS macro surprise factor builder. MARKET-keyed
+# (same as PBC) because CPI / PPI / PMI / retail sales are market-wide
+# macro signals, not per-industry.
+#
+# Factors:
+#   - nbs_cpi_surprise_3m:   sum of (consensus - headline) over last 3
+#                             months for CPI releases. Positive ↔ inflation
+#                             undershoots expectations.
+#   - nbs_ppi_surprise_3m:   same for PPI.
+#   - nbs_pmi_above_50_dummy: 1 if the LATEST PMI release in the trailing
+#                             3-month window is > 50, else 0.
+#   - nbs_retail_growth_yoy_3m: average of yoy_change for retail_sales
+#                             over the trailing 3-month window.
+# ─────────────────────────────────────────────────────────────────────
+def _load_nbs_events_from_dir(input_dir: Path) -> pd.DataFrame:
+    """Load NBS per-day JSONL files into one DataFrame.
+
+    Schema fields used downstream: series_name, headline_value,
+    consensus_value, yoy_change, publish_date. Missing files / unreadable
+    files are skipped silently (PIT-safe).
+    """
+    if not input_dir.exists():
+        return pd.DataFrame()
+    rows: list[dict] = []
+    for fp in sorted(input_dir.glob("*.jsonl")):
+        try:
+            for line in fp.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        except OSError as e:
+            logger.warning("Failed to read %s: %s", fp, e)
+            continue
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["publish_date"] = pd.to_datetime(df.get("publish_date"), errors="coerce")
+    df = df.dropna(subset=["publish_date"]).reset_index(drop=True)
+    for col in (
+        "headline_value", "prior_value", "consensus_value",
+        "mom_change", "yoy_change",
+    ):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        else:
+            df[col] = np.nan
+    df["series_name"] = df.get("series_name", "other").fillna("other")
+    return df
+
+
+def build_nbs_factors_for_date(
+    events_df: pd.DataFrame,
+    signal_date: pd.Timestamp,
+) -> dict[str, float]:
+    """Compute one row of NBS macro factors for ``signal_date``.
+
+    PIT: only consults events whose ``publish_date <= signal_date``.
+    All factors are NaN-safe — they coerce to 0.0 in the absence of
+    relevant data so downstream broadcasts don't have to defend.
+    """
+    zero = {
+        "nbs_cpi_surprise_3m": 0.0,
+        "nbs_ppi_surprise_3m": 0.0,
+        "nbs_pmi_above_50_dummy": 0.0,
+        "nbs_retail_growth_yoy_3m": 0.0,
+    }
+    if events_df.empty:
+        return dict(zero)
+    visible = events_df[events_df["publish_date"] <= signal_date]
+    if visible.empty:
+        return dict(zero)
+    cutoff = signal_date - pd.Timedelta(days=NBS_SURPRISE_WINDOW_DAYS - 1)
+    window = visible[visible["publish_date"] >= cutoff]
+
+    # CPI surprise: sum of (consensus - headline) for CPI releases. A
+    # positive value means actual inflation came in BELOW expectations.
+    cpi_rows = window[window["series_name"] == "cpi"]
+    cpi_pairs = cpi_rows[["consensus_value", "headline_value"]].dropna(
+        subset=["consensus_value", "headline_value"]
+    )
+    cpi_surprise = float((cpi_pairs["consensus_value"] - cpi_pairs["headline_value"]).sum())
+
+    ppi_rows = window[window["series_name"] == "ppi"]
+    ppi_pairs = ppi_rows[["consensus_value", "headline_value"]].dropna(
+        subset=["consensus_value", "headline_value"]
+    )
+    ppi_surprise = float((ppi_pairs["consensus_value"] - ppi_pairs["headline_value"]).sum())
+
+    # PMI dummy: look at the LATEST PMI release in the window. >50 = 1.
+    pmi_rows = window[window["series_name"] == "pmi"].dropna(
+        subset=["headline_value"]
+    )
+    if pmi_rows.empty:
+        pmi_dummy = 0.0
+    else:
+        latest_pmi = pmi_rows.sort_values("publish_date").iloc[-1]
+        pmi_dummy = 1.0 if float(latest_pmi["headline_value"]) > NBS_PMI_THRESHOLD else 0.0
+
+    # Retail growth yoy: simple mean across the window's retail releases.
+    retail_rows = window[window["series_name"] == "retail_sales"]
+    retail_yoy = retail_rows["yoy_change"].dropna()
+    retail_growth = float(retail_yoy.mean()) if not retail_yoy.empty else 0.0
+
+    return {
+        "nbs_cpi_surprise_3m": cpi_surprise,
+        "nbs_ppi_surprise_3m": ppi_surprise,
+        "nbs_pmi_above_50_dummy": pmi_dummy,
+        "nbs_retail_growth_yoy_3m": retail_growth,
+    }
+
+
+def build_nbs_factors_range(
+    start_date: str,
+    end_date: str,
+    input_dir: Path | None = None,
+) -> pd.DataFrame:
+    """Build a long-form NBS factor DataFrame for every date in [start, end].
+
+    Returns a DataFrame with columns::
+
+        datetime, instrument="MARKET", nbs_cpi_surprise_3m,
+        nbs_ppi_surprise_3m, nbs_pmi_above_50_dummy,
+        nbs_retail_growth_yoy_3m
+
+    Like PE-1, empty windows still produce one row per date with
+    zero-valued factors so downstream broadcasts do not get sparse holes.
+    """
+    input_root = input_dir or INPUT_DIR_NBS
+    events = _load_nbs_events_from_dir(input_root)
+    s = pd.Timestamp(start_date)
+    e = pd.Timestamp(end_date)
+    if e < s:
+        raise ValueError(f"end ({end_date}) must be >= start ({start_date})")
+    rows: list[dict] = []
+    cur = s
+    while cur <= e:
+        factors = build_nbs_factors_for_date(events, cur)
+        rows.append({
+            "datetime": cur,
+            "instrument": MARKET_INSTRUMENT,
+            **factors,
+        })
+        cur += pd.Timedelta(days=1)
+    return pd.DataFrame(rows)
 
 
 def _write_health_sidecar(
@@ -549,12 +727,14 @@ def main(argv: list[str] | None = None) -> int:
         description="Build PBOC / State Council policy factors from extracted policy events."
     )
     parser.add_argument(
-        "--source", default="pbc", choices=["pbc", "state_council"],
+        "--source", default="pbc",
+        choices=["pbc", "state_council", "nbs"],
         help=(
             "Source. 'pbc' = monetary policy (Phase E.1), produces a "
             "MARKET-keyed parquet. 'state_council' = State Council + 3 "
             "ministries (Phase E.2), produces an INDUSTRY_<NAME>-keyed "
-            "parquet."
+            "parquet. 'nbs' = NBS CPI/PPI/PMI/retail sales (Phase E.3), "
+            "produces a MARKET-keyed parquet."
         ),
     )
     parser.add_argument(
@@ -576,7 +756,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.source not in ("pbc", "state_council"):
+    if args.source not in ("pbc", "state_council", "nbs"):
         logger.error("Unsupported --source %s", args.source)
         return 2
 
@@ -600,7 +780,7 @@ def main(argv: list[str] | None = None) -> int:
         health_path = HEALTH_PATH
         health_source = HEALTH_SOURCE_NAME
         factor_columns = PBC_FACTOR_COLUMNS
-    else:
+    elif args.source == "state_council":
         build_fn = build_sc_factors_range
         load_fn = _load_sc_events_from_dir
         input_dir = INPUT_DIR_SC
@@ -608,6 +788,14 @@ def main(argv: list[str] | None = None) -> int:
         health_path = HEALTH_PATH_SC
         health_source = HEALTH_SOURCE_NAME_SC
         factor_columns = SC_FACTOR_COLUMNS
+    else:
+        build_fn = build_nbs_factors_range
+        load_fn = _load_nbs_events_from_dir
+        input_dir = INPUT_DIR_NBS
+        output_path = OUTPUT_PATH_NBS
+        health_path = HEALTH_PATH_NBS
+        health_source = HEALTH_SOURCE_NAME_NBS
+        factor_columns = NBS_FACTOR_COLUMNS
 
     df = build_fn(start_date=start, end_date=end)
     if df.empty:
