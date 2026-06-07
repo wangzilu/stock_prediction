@@ -56,10 +56,13 @@ No model inference — this is purely a return-curve tool.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -72,6 +75,65 @@ SUPPORTED_SOURCES: tuple[str, ...] = (
 )
 DEFAULT_BENCHMARK = "sh000300"
 DEFAULT_OUT_DIR = PROJECT_ROOT / "data" / "storage" / "event_study"
+DATA_DIR = PROJECT_ROOT / "data" / "storage"
+
+# Synthetic instrument code used when an event has no per-stock
+# attribution. The benchmark return is used as the "stock" return for
+# these events (see build_excess_return_panel).
+MARKET_INSTRUMENT = "MARKET"
+
+# Per-source on-disk layout. Each entry is (subdir under data/storage,
+# date field name, instrument-key resolver, attribution kind).
+#
+# attribution_kind:
+#   "stock"  — event keyed by a real qlib instrument
+#   "market" — event keyed at the market level (use benchmark return)
+#   "theme"  — event keyed by THEME_<UPPER>; broadcast via baskets
+#              (step 4 wires that in; loader returns the raw THEME row)
+SOURCE_SPEC: dict[str, dict] = {
+    "pe1": {
+        "subdir": "policy_events/pbc",
+        "date_field": "publish_date",
+        "event_type_field": "policy_stance",
+        "instrument_kind": "market",
+    },
+    "pe2": {
+        "subdir": "policy_events/state_council",
+        "date_field": "publish_date",
+        "event_type_field": "policy_direction",
+        "instrument_kind": "market",
+    },
+    "pe3": {
+        "subdir": "policy_events/nbs",
+        "date_field": "publish_date",
+        "event_type_field": "series_name",
+        "instrument_kind": "market",
+    },
+    "pe4": {
+        "subdir": "policy_events/xinwen_lianbo",
+        "date_field": "publish_date",
+        "event_type_field": "themes",
+        "instrument_kind": "theme",
+    },
+    "llm": {
+        "subdir": "llm_events_v2",
+        "date_field": "extract_date",
+        "event_type_field": "event_type",
+        "instrument_kind": "stock",
+    },
+    "chain_rule": {
+        "subdir": "global_chain_events",
+        "date_field": "date",
+        "event_type_field": "event_type",
+        "instrument_kind": "market",
+    },
+    "chain_llm": {
+        "subdir": "global_chain_events_llm",
+        "date_field": "date",
+        "event_type_field": "event_type",
+        "instrument_kind": "market",
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -151,6 +213,161 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=f"Output directory (default {DEFAULT_OUT_DIR}).",
     )
     return parser
+
+
+EVENT_OUTPUT_COLUMNS = (
+    "event_id", "event_date", "instrument", "event_type",
+)
+
+
+def _coerce_instrument_from_row(
+    row: dict,
+    instrument_kind: str,
+) -> str | None:
+    """Resolve the qlib-style instrument code for a single raw event row.
+
+    Returns None if the row cannot be attributed (e.g. an LLM event with
+    no qlib_code). The caller drops such rows from the panel.
+    """
+    if instrument_kind == "market":
+        return MARKET_INSTRUMENT
+    if instrument_kind == "stock":
+        # LLM events carry qlib_code = "sh600519". Some legacy rows only
+        # have stock_code = "600519" — derive the prefix from the first
+        # digit when needed (6 → sh, 0/3 → sz, 8/4 → bj).
+        q = row.get("qlib_code")
+        if isinstance(q, str) and q.strip():
+            return q.strip().upper()
+        c = row.get("stock_code")
+        if isinstance(c, str) and c.strip():
+            c = c.strip()
+            if c[0] == "6":
+                return f"SH{c}"
+            if c[0] in ("0", "3"):
+                return f"SZ{c}"
+            if c[0] in ("8", "4"):
+                return f"BJ{c}"
+        return None
+    if instrument_kind == "theme":
+        # XWLB events store a list under "themes"; one event row per
+        # theme (we'll explode at the caller).
+        theme = row.get("_theme_one")  # set by the explode pass
+        if isinstance(theme, str) and theme.strip():
+            return f"THEME_{theme.strip().upper()}"
+        return None
+    raise ValueError(f"unknown instrument_kind {instrument_kind!r}")
+
+
+def _iter_jsonl_rows(events_root: Path):
+    """Yield (path, parsed_dict) for every JSONL file under ``events_root``.
+
+    Silently skips unreadable files / malformed lines so a single bad
+    row doesn't poison the whole study.
+    """
+    if not events_root.exists():
+        return
+    for fp in sorted(events_root.glob("*.jsonl")):
+        try:
+            text = fp.read_text(encoding="utf-8")
+        except OSError as exc:
+            logger.warning("event_study: cannot read %s (%s)", fp, exc)
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield fp, json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+
+def load_events(
+    *,
+    source: str,
+    start: str,
+    end: str,
+    events_root: Path | None = None,
+) -> pd.DataFrame:
+    """Load events for ``source`` whose date falls in [start, end].
+
+    Returns a long-form DataFrame with columns
+    ``event_id, event_date (datetime64[ns]), instrument, event_type``
+    plus any source-specific extra columns (kept for downstream
+    inspection / extension).
+
+    For ``pe4`` (XWLB) the ``themes`` list is exploded: a single
+    broadcast row with two themes becomes two event rows, each with
+    instrument = ``THEME_<UPPER>``.
+
+    Missing event directories return an empty frame with the standard
+    columns (PIT-safe; never raises for missing data).
+    """
+    if source not in SOURCE_SPEC:
+        raise ValueError(
+            f"unknown source {source!r}; expected one of {SUPPORTED_SOURCES}"
+        )
+    spec = SOURCE_SPEC[source]
+    root = events_root if events_root is not None else DATA_DIR / spec["subdir"]
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    if end_ts < start_ts:
+        raise ValueError(f"end {end!r} must be >= start {start!r}")
+
+    rows: list[dict] = []
+    kind = spec["instrument_kind"]
+    date_field = spec["date_field"]
+    event_type_field = spec["event_type_field"]
+
+    for fp, raw in _iter_jsonl_rows(Path(root)):
+        date_raw = raw.get(date_field)
+        date = pd.to_datetime(date_raw, errors="coerce")
+        if pd.isna(date):
+            continue
+        if not (start_ts <= date <= end_ts):
+            continue
+        # Explode XWLB themes so each (date, theme) becomes its own row.
+        if kind == "theme":
+            themes = raw.get(event_type_field) or []
+            if isinstance(themes, str):
+                themes = [themes]
+            if not isinstance(themes, list):
+                continue
+            for theme in themes:
+                if not isinstance(theme, str) or not theme.strip():
+                    continue
+                row_copy = dict(raw)
+                row_copy["_theme_one"] = theme.strip().lower()
+                inst = _coerce_instrument_from_row(row_copy, kind)
+                if inst is None:
+                    continue
+                rows.append({
+                    "event_id": f"{fp.stem}:{len(rows)}",
+                    "event_date": date.normalize(),
+                    "instrument": inst,
+                    "event_type": row_copy["_theme_one"],
+                    "source_file": fp.name,
+                })
+            continue
+        inst = _coerce_instrument_from_row(raw, kind)
+        if inst is None:
+            continue
+        etype = raw.get(event_type_field) or "unknown"
+        if isinstance(etype, list):  # defensive: pe3 series_name is scalar
+            etype = etype[0] if etype else "unknown"
+        rows.append({
+            "event_id": f"{fp.stem}:{len(rows)}",
+            "event_date": date.normalize(),
+            "instrument": inst,
+            "event_type": str(etype),
+            "source_file": fp.name,
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=list(EVENT_OUTPUT_COLUMNS))
+    df = pd.DataFrame(rows)
+    df["event_date"] = pd.to_datetime(df["event_date"])
+    return df.sort_values(["event_date", "instrument"]).reset_index(drop=True)
 
 
 def parse_args(argv: list[str] | None = None) -> EventStudyConfig:
