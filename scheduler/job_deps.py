@@ -46,6 +46,13 @@ JOB_DEPS: dict[str, list[str]] = {
     "pbc_policy_texts": [],
     "pbc_policy_events": ["pbc_policy_texts"],
     "pbc_liquidity_factors": ["pbc_policy_events"],
+    # Phase E.2 PE-2 chain — 15:35 → 15:55 → 16:15 strict sequence.
+    # Same gating discipline as PE-1: no text → no LLM call; no events
+    # → no factor build. State Council is sparse so a 0-row day is the
+    # expected state; the SLA gate uses a 3-day budget to cope.
+    "state_council_policy_texts": [],
+    "state_council_policy_events": ["state_council_policy_texts"],
+    "state_council_policy_factors": ["state_council_policy_events"],
     # ---- Post-data-update processing -------------------------------------
     "fund_flow_update": ["qlib_data_update"],
     "st_daily_factors_update": ["qlib_data_update"],

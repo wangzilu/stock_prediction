@@ -1,10 +1,14 @@
-"""Extract structured policy events from PBOC texts — Phase E.1 step 2.
+"""Extract structured policy events from PBC + State Council texts —
+Phase E.1 step 2 (PBC) + Phase E.2 step 2 (PE-2 State Council / ministry).
 
-Reads ``data/storage/policy_texts/pbc/<YYYY-MM-DD>.jsonl`` (produced by
-``scripts/collect_policy_texts.py``), calls a non-reasoning LLM on each
-row's ``content`` field, and emits structured policy events to:
+PE-1 (PBC) reads ``data/storage/policy_texts/pbc/<YYYY-MM-DD>.jsonl``
+and writes ``data/storage/policy_events/pbc/<YYYY-MM-DD>.jsonl`` —
+extracts monetary-policy stance / liquidity injection / rate change.
 
-    data/storage/policy_events/pbc/<YYYY-MM-DD>.jsonl
+PE-2 (State Council) reads
+``data/storage/policy_texts/state_council/<YYYY-MM-DD>.jsonl`` and
+writes ``data/storage/policy_events/state_council/<YYYY-MM-DD>.jsonl``
+— extracts target industries / fiscal support / regulatory direction.
 
 The same events are also appended to the unified ``EventStore`` so
 downstream factor builders / overlays can query them by ``signal_date``.
@@ -77,8 +81,13 @@ logger = logging.getLogger(__name__)
 INPUT_DIR = DATA_DIR / "policy_texts" / "pbc"
 OUTPUT_DIR = DATA_DIR / "policy_events" / "pbc"
 
+# Phase E.2 (PE-2) — State Council + ministry chain.
+INPUT_DIR_SC = DATA_DIR / "policy_texts" / "state_council"
+OUTPUT_DIR_SC = DATA_DIR / "policy_events" / "state_council"
+
 # Health source name matches the convention used by collect_policy_texts.
 HEALTH_SOURCE_NAME = "pbc_policy_events"
+HEALTH_SOURCE_NAME_SC = "state_council_policy_events"
 
 # ─────────────────────────────────────────────────────────────────────
 # Schema enumerations — the validator gate.
@@ -94,6 +103,18 @@ POLICY_STANCES: frozenset[str] = frozenset({
 TOOL_TYPES: frozenset[str] = frozenset({
     "omo", "mlf", "slf", "rrr", "lpr",
     "quarterly_report", "press_conference", "other",
+})
+
+# Phase E.2 (PE-2) — State Council / ministry industry policy enums.
+# Downgrade rules: out-of-vocab policy_direction → "neutral",
+# out-of-vocab subsidy_or_tax → "neither". target_industries is a free
+# list (we do NOT lock the vocabulary because the industry taxonomy
+# evolves; the downstream mapper is the gate, not this validator).
+POLICY_DIRECTIONS: frozenset[str] = frozenset({
+    "supportive", "restrictive", "neutral",
+})
+SUBSIDY_TAX_TYPES: frozenset[str] = frozenset({
+    "subsidy", "tax_reduction", "tax_increase", "neither",
 })
 
 # Fact-only system prompt. Explicitly bans price prediction and trading
@@ -117,6 +138,32 @@ Schema:
   "tool_type": "<one of: omo|mlf|slf|rrr|lpr|quarterly_report|press_conference|other>",
   "duration_days": <int e.g. 7 for 7-day reverse repo, 365 for 1-year MLF, null if N/A>,
   "unexpectedness": <float in [0, 1]: 0=announced beforehand or routine; 1=surprise>
+}"""
+
+
+# Phase E.2 (PE-2) State Council / ministry industry-policy prompt.
+# Fact-only. The "DO NOT predict stock impact" line is explicit because
+# the LLM is being asked for a subjective ``policy_strength`` score and
+# would otherwise drift into "this benefits semi stocks +5%" hallucination.
+SYSTEM_PROMPT_SC = """你是中国产业政策分析师。从下文国务院/部委政策文件中提取结构化事实。
+
+只输出JSON，禁止解释、思考、前后缀文字。第一个字符必须是 { 。
+
+严格规则：
+1. 只提取原文明示的事实。禁止预测股价、不要给出交易建议、不要推断市场反应。
+2. 如果某字段在原文中没有，输出 null（不要猜测、不要填 0）。
+3. policy_strength 是文件本身力度的主观判断（资金量、覆盖面、强制度），不是股票影响预测。
+4. target_industries 使用英文小写下划线名（semiconductor / renewable_energy / real_estate / 等）。
+
+Schema:
+{
+  "target_industries": [<list of industry names>],
+  "policy_direction": "<one of: supportive|restrictive|neutral>",
+  "policy_strength": <float in [0, 1]: 0=泛泛表态; 1=明确大额、强制、即时>,
+  "fiscal_support": <float 亿元 of central/local fiscal money pledged, null if absent>,
+  "subsidy_or_tax": "<one of: subsidy|tax_reduction|tax_increase|neither>",
+  "regulatory_tightening": <bool: true 仅当原文明确加强监管/限制/禁止/处罚>,
+  "implementation_deadline": "<YYYY-MM-DD or null>"
 }"""
 
 
@@ -230,6 +277,111 @@ def validate_event(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Phase E.2 (PE-2) — State Council validator. Same downgrade discipline
+# as PBC: bad enums demote, bad numerics → None, never drop a row.
+# ─────────────────────────────────────────────────────────────────────
+_DATE_RE = re.compile(r"^(\d{4})-(\d{1,2})-(\d{1,2})$")
+
+
+def _coerce_industries(value: Any) -> list[str]:
+    """Coerce ``target_industries`` to a list of lowercased strings.
+
+    Accepts list / single string / None. Empty / non-list inputs become
+    an empty list rather than failing the row.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        # Sometimes the LLM returns a comma-joined string instead of a list.
+        parts = [p.strip() for p in re.split(r"[,，;；/、]", value) if p.strip()]
+        return [p.lower() for p in parts]
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            s = item.strip().lower()
+            if s:
+                out.append(s)
+        return out
+    return []
+
+
+def _coerce_iso_date(value: Any) -> str | None:
+    """Normalize a YYYY-MM-DD-ish string. None / unparseable → None."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s or s.lower() in ("null", "none", "n/a"):
+        return None
+    m = _DATE_RE.match(s)
+    if not m:
+        return None
+    try:
+        y, mo, d = (int(g) for g in m.groups())
+        # quick sanity bounds; don't bother with calendar correctness.
+        if not (1900 < y < 2200 and 1 <= mo <= 12 and 1 <= d <= 31):
+            return None
+        return f"{y:04d}-{mo:02d}-{d:02d}"
+    except ValueError:
+        return None
+
+
+def _coerce_bool(value: Any) -> bool:
+    """Coerce to bool. None / unparseable → False (the conservative
+    side: don't claim regulatory tightening if the LLM was silent)."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    s = str(value).strip().lower()
+    return s in ("true", "1", "yes", "y", "是")
+
+
+def validate_event_state_council(raw: dict[str, Any]) -> dict[str, Any]:
+    """Validate State Council LLM output, downgrading on out-of-vocab.
+
+    Mirrors ``validate_event`` discipline for PE-1: missing → None,
+    bad enums demote rather than drop. Returns a fresh dict with every
+    documented field present.
+    """
+    direction = raw.get("policy_direction")
+    if (
+        not isinstance(direction, str)
+        or direction.lower() not in POLICY_DIRECTIONS
+    ):
+        direction = "neutral"
+    else:
+        direction = direction.lower()
+
+    subsidy = raw.get("subsidy_or_tax")
+    if (
+        not isinstance(subsidy, str)
+        or subsidy.lower() not in SUBSIDY_TAX_TYPES
+    ):
+        subsidy = "neither"
+    else:
+        subsidy = subsidy.lower()
+
+    # policy_strength uses the same [0,1] clamp as unexpectedness.
+    strength = _coerce_unexpectedness(raw.get("policy_strength"))
+
+    return {
+        "target_industries": _coerce_industries(raw.get("target_industries")),
+        "policy_direction": direction,
+        "policy_strength": strength,
+        "fiscal_support": _coerce_number(raw.get("fiscal_support")),
+        "subsidy_or_tax": subsidy,
+        "regulatory_tightening": _coerce_bool(raw.get("regulatory_tightening")),
+        "implementation_deadline": _coerce_iso_date(
+            raw.get("implementation_deadline")
+        ),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────
 # LLM wrapper — uses the same MiniMax client wired into
 # ``factors/llm_event_extractor_v2.py``. The wrapper here owns the
 # PBOC-specific system prompt; the network plumbing (auth header,
@@ -290,6 +442,20 @@ def _llm_extract_with_pbc_prompt(content: str) -> dict[str, Any] | None:
     return _llm_extract_via_minimax(content, system_prompt=SYSTEM_PROMPT_PBC)
 
 
+def _llm_extract_with_state_council_prompt(
+    content: str,
+) -> dict[str, Any] | None:
+    """Production LLM call with the SC prompt threaded as a kwarg.
+
+    Same thread-safety constraint as ``_llm_extract_with_pbc_prompt``:
+    we must NEVER mutate ``factors.llm_event_extractor_v2.SYSTEM_PROMPT_V2``
+    or any other module-global. The per-call ``system_prompt`` arg is
+    the only safe channel because the per-stock LLM pipeline can be
+    running concurrently.
+    """
+    return _llm_extract_via_minimax(content, system_prompt=SYSTEM_PROMPT_SC)
+
+
 # ─────────────────────────────────────────────────────────────────────
 # EventStore append — best-effort. The unit tests pass an empty dir
 # and we want them to pass even when EventStore isn't fully bootstrapped.
@@ -345,6 +511,75 @@ def _append_to_event_store(
         })
     except Exception as e:
         logger.warning("EventStore.add_event failed: %s", e)
+
+
+def _append_to_event_store_sc(
+    row: dict, *, source_row: dict, eventstore_dir: Path | None,
+) -> None:
+    """Append a PE-2 State Council event to the unified EventStore.
+
+    Schema choices:
+      - source = "policy" (same category as PBC; the EventStore vocab
+        does not split monetary / industrial — the consumer can split
+        on event_type or topic).
+      - event_type = "industry_policy_support" / "industry_policy_negative"
+        / "other" derived from policy_direction.
+      - direction = +1 / -1 / 0.
+      - confidence = policy_strength when present, else 0.5.
+      - One event per target_industry: the LLM hands us a list of
+        industries and we emit one EventStore row per (industry, doc).
+        Industries are keyed as synthetic instruments
+        ``INDUSTRY_<UPPER>`` so the downstream factor builder can
+        broadcast without a stock-list join.
+    """
+    try:
+        from factors.event_store import EventStore
+    except Exception as e:  # pragma: no cover — broken install
+        logger.warning("EventStore import failed (%s); skipping append", e)
+        return
+
+    try:
+        store = EventStore(store_dir=eventstore_dir) if eventstore_dir else EventStore()
+    except Exception as e:
+        logger.warning("EventStore init failed (%s); skipping append", e)
+        return
+
+    direction_str = row.get("policy_direction", "neutral")
+    dir_int = {"supportive": 1, "restrictive": -1}.get(direction_str, 0)
+    event_type = {
+        "supportive": "industry_policy_support",
+        "restrictive": "industry_policy_negative",
+    }.get(direction_str, "other")
+    conf_raw = row.get("policy_strength")
+    confidence = float(conf_raw) if conf_raw is not None else 0.5
+
+    publish_time = source_row.get("publish_date", "")
+    summary_text = (source_row.get("title") or "")[:200]
+    industries = row.get("target_industries") or []
+    if not industries:
+        # No target industry — keep a single MARKET-keyed event so the
+        # text isn't silently lost.
+        industries = ["__market__"]
+    for industry in industries:
+        stock_code = (
+            "MARKET" if industry == "__market__"
+            else f"INDUSTRY_{industry.upper()}"
+        )
+        try:
+            store.add_event({
+                "date": publish_time,
+                "stock_code": stock_code,
+                "source": "policy",
+                "event_type": event_type,
+                "direction": dir_int,
+                "confidence": confidence,
+                "summary": summary_text,
+                "publish_time": publish_time,
+                "topic": industry,
+                "is_policy": True,
+            })
+        except Exception as e:
+            logger.warning("EventStore.add_event failed (%s): %s", industry, e)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -488,9 +723,146 @@ def extract_pbc(
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Phase E.2 (PE-2) — State Council extract loop. Same shape as
+# extract_pbc but uses SC validator + SC LLM wrapper + SC EventStore
+# append. Kept as a separate function so tests can drive each
+# independently and a future refactor can collapse them once the
+# field surface stabilises.
+# ─────────────────────────────────────────────────────────────────────
+def extract_state_council(
+    *,
+    target_date: str,
+    input_dir: Path | None = None,
+    output_dir: Path | None = None,
+    eventstore_dir: Path | None = None,
+    llm_extract_fn: Callable[[str], dict[str, Any] | None] | None = None,
+) -> dict:
+    """Extract State Council / ministry events for a single date.
+
+    See ``extract_pbc`` for the parameter shape. The only differences:
+
+      - default input is ``policy_texts/state_council/<date>.jsonl``
+      - default output is ``policy_events/state_council/<date>.jsonl``
+      - default LLM wrapper is ``_llm_extract_with_state_council_prompt``
+      - validator is ``validate_event_state_council``
+      - EventStore append uses the SC variant (one event per industry)
+    """
+    input_root = input_dir or INPUT_DIR_SC
+    output_root = output_dir or OUTPUT_DIR_SC
+    llm_fn = llm_extract_fn or _llm_extract_with_state_council_prompt
+
+    input_path = input_root / f"{target_date}.jsonl"
+    output_path = output_root / f"{target_date}.jsonl"
+
+    summary = {
+        "target_date": target_date,
+        "n_input": 0,
+        "n_extracted": 0,
+        "n_failed": 0,
+        "n_downgraded": 0,
+        "output_path": str(output_path),
+        "errors": [],
+    }
+
+    if not input_path.exists():
+        logger.info(
+            "No SC input file for %s at %s — writing empty output",
+            target_date, input_path,
+        )
+        _atomic_write_jsonl([], output_path)
+        return summary
+
+    input_rows: list[dict] = []
+    with open(input_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                input_rows.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                summary["errors"].append({"stage": "input_parse", "msg": str(e)})
+
+    summary["n_input"] = len(input_rows)
+    output_rows: list[dict] = []
+
+    for src in input_rows:
+        content = (src.get("content") or "").strip()
+        if not content:
+            summary["n_failed"] += 1
+            summary["errors"].append({
+                "stage": "empty_content",
+                "url": src.get("url", ""),
+            })
+            continue
+
+        try:
+            raw = llm_fn(content)
+        except Exception as e:
+            summary["n_failed"] += 1
+            summary["errors"].append({
+                "stage": "llm_call",
+                "url": src.get("url", ""),
+                "msg": str(e)[:200],
+            })
+            continue
+
+        if raw is None:
+            summary["n_failed"] += 1
+            summary["errors"].append({
+                "stage": "llm_parse",
+                "url": src.get("url", ""),
+            })
+            continue
+
+        validated = validate_event_state_council(raw)
+        # Track downgrades for visibility.
+        if (
+            validated["policy_direction"] == "neutral"
+            and isinstance(raw.get("policy_direction"), str)
+            and raw.get("policy_direction", "").lower() not in POLICY_DIRECTIONS
+        ):
+            summary["n_downgraded"] += 1
+        if (
+            validated["subsidy_or_tax"] == "neither"
+            and isinstance(raw.get("subsidy_or_tax"), str)
+            and raw.get("subsidy_or_tax", "").lower() not in SUBSIDY_TAX_TYPES
+        ):
+            summary["n_downgraded"] += 1
+
+        row = {
+            "publish_date": src.get("publish_date", target_date),
+            "policy_type": src.get("policy_type", "other"),
+            "title": src.get("title", ""),
+            "url": src.get("url", ""),
+            **validated,
+            "extracted_at": _now_utc_iso(),
+        }
+        output_rows.append(row)
+        summary["n_extracted"] += 1
+
+        _append_to_event_store_sc(
+            row, source_row=src, eventstore_dir=eventstore_dir,
+        )
+
+    _atomic_write_jsonl(output_rows, output_path)
+    logger.info(
+        "SC extracted %d/%d events for %s (failed=%d, downgraded=%d) → %s",
+        summary["n_extracted"], summary["n_input"], target_date,
+        summary["n_failed"], summary["n_downgraded"], output_path,
+    )
+    return summary
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Health publishing
 # ─────────────────────────────────────────────────────────────────────
-def publish_health(summary: dict, *, target_date: str) -> None:
+def publish_health(
+    summary: dict,
+    *,
+    target_date: str,
+    health_source: str = HEALTH_SOURCE_NAME,
+) -> None:
     try:
         from scheduler.data_health import HealthStatus, write_health
     except Exception as e:  # pragma: no cover — broken install
@@ -519,7 +891,7 @@ def publish_health(summary: dict, *, target_date: str) -> None:
             "n_downgraded": summary.get("n_downgraded", 0),
         },
     )
-    write_health(HEALTH_SOURCE_NAME, status, date=target_date)
+    write_health(health_source, status, date=target_date)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -531,11 +903,17 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     parser = argparse.ArgumentParser(
-        description="Extract structured policy events from PBOC texts."
+        description=(
+            "Extract structured policy events from PBC (E.1) or "
+            "State Council / ministry (E.2) texts."
+        )
     )
     parser.add_argument(
-        "--source", default="pbc", choices=["pbc"],
-        help="Policy source. Only 'pbc' is implemented today.",
+        "--source", default="pbc", choices=["pbc", "state_council"],
+        help=(
+            "Policy source. 'pbc' = monetary policy (Phase E.1). "
+            "'state_council' = State Council + 3 ministries (Phase E.2)."
+        ),
     )
     parser.add_argument(
         "--date", default=None,
@@ -559,7 +937,13 @@ def main(argv: list[str] | None = None) -> int:
         start = args.date or today
         end = args.date or today
 
-    if args.source != "pbc":
+    if args.source == "pbc":
+        extract_fn = extract_pbc
+        health_source = HEALTH_SOURCE_NAME
+    elif args.source == "state_council":
+        extract_fn = extract_state_council
+        health_source = HEALTH_SOURCE_NAME_SC
+    else:
         logger.error("Unsupported --source %s", args.source)
         return 2
 
@@ -567,10 +951,10 @@ def main(argv: list[str] | None = None) -> int:
     overall = {"n_input": 0, "n_extracted": 0, "n_failed": 0, "n_downgraded": 0}
     last_date = end
     for d in dates:
-        s = extract_pbc(target_date=d)
+        s = extract_fn(target_date=d)
         for k in overall:
             overall[k] += s.get(k, 0)
-        publish_health(s, target_date=d)
+        publish_health(s, target_date=d, health_source=health_source)
         last_date = d
 
     logger.info(

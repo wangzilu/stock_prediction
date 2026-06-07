@@ -162,6 +162,27 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                 "pbc_liquidity_factors.log",
                 network="none", timeout_sec=300,
                 enforce_deps=True),
+        # Phase E.2 (PE-2) — State Council + ministry policy chain.
+        # 2026-06-07 cron registration. 5-minute stagger from PE-1 PBC
+        # to avoid hammering gov.cn / pbc.gov.cn in the same minute.
+        # Same shape: collect → extract → build.
+        CronJob("state_council_policy_texts", "35 15 * * 1-5",
+                [py, str(scripts / "collect_policy_texts.py"),
+                 "--source", "state_council", "--fail-on-empty"],
+                "state_council_policy_texts.log",
+                network="domestic", timeout_sec=600),
+        CronJob("state_council_policy_events", "55 15 * * 1-5",
+                [py, str(scripts / "extract_policy_events.py"),
+                 "--source", "state_council"],
+                "state_council_policy_events.log",
+                network="llm", timeout_sec=1800,
+                enforce_deps=True),
+        CronJob("state_council_policy_factors", "15 16 * * 1-5",
+                [py, str(scripts / "build_policy_factors.py"),
+                 "--source", "state_council"],
+                "state_council_policy_factors.log",
+                network="none", timeout_sec=300,
+                enforce_deps=True),
         # Shadow paper-trade for xgb_209_llm promotion gate.
         # 2026-06-07 (cx P2 #3 fix): originally manual; now cron so the
         # 5-day shadow window auto-accumulates without operator drift.

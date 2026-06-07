@@ -1,19 +1,24 @@
-"""Build PBOC liquidity factors from extracted policy events — Phase E.1 step 3.
+"""Build policy factors from extracted policy events.
 
-Reads ``data/storage/policy_events/pbc/<YYYY-MM-DD>.jsonl`` produced by
-``scripts/extract_policy_events.py`` and emits a single parquet keyed
-by ``(datetime, "MARKET")`` — the synthetic instrument convention the
-cross_market_regime overlay uses to broadcast a market-level signal to
-every stock.
+Phase E.1 step 3 (PBC):
+  Reads ``data/storage/policy_events/pbc/<YYYY-MM-DD>.jsonl`` and emits
+  a single parquet keyed by ``(datetime, "MARKET")`` — the synthetic
+  instrument convention the cross_market_regime overlay uses to
+  broadcast a market-level signal to every stock.
+
+Phase E.2 step 3 (PE-2, State Council / ministry):
+  Reads ``data/storage/policy_events/state_council/<YYYY-MM-DD>.jsonl``
+  and emits a parquet keyed by ``(datetime, "INDUSTRY_<NAME>")`` —
+  per-industry, per-day rows so the FeatureMerger can map A-share
+  stocks to industries at execution time. The mapper-to-stock step is
+  a follow-up; for now the parquet carries synthetic industry
+  instruments and the consumer is responsible for the join.
 
 Output
 ------
-    data/storage/pbc_liquidity_factors.parquet
-        Columns: datetime, instrument="MARKET", pbc_liquidity_zscore_20d,
-        pbc_easing_dummy, pbc_tightening_dummy, short_rate_pressure
-    data/storage/pbc_liquidity_factors.health.json
-        Sidecar with n_events_used, latest_event_date, dates_with_events,
-        etc. Lets the SLA gate / daily report see what landed.
+    data/storage/pbc_liquidity_factors.parquet (PE-1, MARKET-keyed)
+    data/storage/state_council_policy_factors.parquet (PE-2, INDUSTRY-keyed)
+    Plus .health.json sidecars next to each parquet.
 
 Factor definitions (per the phase doc)
 --------------------------------------
@@ -65,16 +70,33 @@ OUTPUT_PATH = DATA_DIR / "pbc_liquidity_factors.parquet"
 HEALTH_PATH = DATA_DIR / "pbc_liquidity_factors.health.json"
 HEALTH_SOURCE_NAME = "pbc_liquidity_factors"
 
+# Phase E.2 (PE-2) — State Council / ministry industry policy.
+INPUT_DIR_SC = DATA_DIR / "policy_events" / "state_council"
+OUTPUT_PATH_SC = DATA_DIR / "state_council_policy_factors.parquet"
+HEALTH_PATH_SC = DATA_DIR / "state_council_policy_factors.health.json"
+HEALTH_SOURCE_NAME_SC = "state_council_policy_factors"
+
 # Window sizes — match the phase doc; kept as constants so changes
 # require a code edit rather than a config drift.
 ZSCORE_WINDOW_DAYS = 20
 DUMMY_WINDOW_DAYS = 5
 RATE_PRESSURE_WINDOW_DAYS = 20
 
+# PE-2 windows. 5d / 20d match the PBC convention; novelty is a
+# decay-style score keyed on first-mention date so a brand-new industry
+# in the policy stream lights up even before the 5d window fills.
+INDUSTRY_SUPPORT_SHORT_DAYS = 5
+INDUSTRY_SUPPORT_LONG_DAYS = 20
+INDUSTRY_NOVELTY_WINDOW_DAYS = 60
+
 # Synthetic instrument the cross-market regime overlay already uses;
 # the FeatureMerger broadcasts MARKET-keyed rows to every stock at
 # merge time. Kept as a named constant so a future rename is one edit.
 MARKET_INSTRUMENT = "MARKET"
+# PE-2 industry instrument prefix. The downstream FeatureMerger maps
+# A-share stocks -> industry via the supply_chain_mapper. Kept as a
+# named constant so the prefix is grep-discoverable in the merger.
+INDUSTRY_INSTRUMENT_PREFIX = "INDUSTRY_"
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -236,6 +258,195 @@ def build_factors_range(
     return pd.DataFrame(rows)
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Phase E.2 (PE-2) — State Council / industry-policy factor builder.
+# Per-(industry, date) parquet, NOT per-(MARKET, date). The factor
+# surface is:
+#   - industry_policy_support_5d:  sum of signed strength over 5d window
+#   - industry_policy_support_20d: sum of signed strength over 20d window
+#   - industry_policy_novelty:     1.0 when the industry's first mention
+#                                  in the trailing 60d window is on
+#                                  signal_date, decaying linearly to 0
+#                                  by the end of the window.
+# Sign convention: supportive=+1, restrictive=-1, neutral=0.
+# Strength bias: 0.5 floor so a neutral-direction mention still
+# contributes a half-step to the trailing sum (otherwise a string of
+# neutral mentions vanishes and we lose attention information).
+# ─────────────────────────────────────────────────────────────────────
+def _load_sc_events_from_dir(input_dir: Path) -> pd.DataFrame:
+    """Load State Council per-day JSONL files into one DataFrame.
+
+    Different schema from ``_load_events_from_dir``: target_industries
+    is a list, policy_direction is the stance, policy_strength is the
+    [0,1] confidence. We EXPLODE on target_industries so the downstream
+    factor calc is one row per (date, industry).
+    """
+    if not input_dir.exists():
+        return pd.DataFrame()
+    rows: list[dict] = []
+    for fp in sorted(input_dir.glob("*.jsonl")):
+        try:
+            for line in fp.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        except OSError as e:
+            logger.warning("Failed to read %s: %s", fp, e)
+            continue
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["publish_date"] = pd.to_datetime(df.get("publish_date"), errors="coerce")
+    df = df.dropna(subset=["publish_date"]).reset_index(drop=True)
+    # Default columns so downstream ops don't KeyError.
+    if "target_industries" not in df.columns:
+        df["target_industries"] = [[] for _ in range(len(df))]
+    df["policy_direction"] = df.get("policy_direction", "neutral").fillna("neutral")
+    df["policy_strength"] = pd.to_numeric(
+        df.get("policy_strength"), errors="coerce"
+    ).fillna(0.5)
+    # Explode on industries. Rows whose target_industries list is empty
+    # become a single "__market__" row so the policy doc is not lost.
+    def _coerce(item):
+        if isinstance(item, list):
+            return item if item else ["__market__"]
+        if isinstance(item, str) and item.strip():
+            return [item.strip()]
+        return ["__market__"]
+
+    df["target_industries"] = df["target_industries"].apply(_coerce)
+    df = df.explode("target_industries").reset_index(drop=True)
+    df = df.rename(columns={"target_industries": "industry"})
+    df["industry"] = df["industry"].astype(str).str.lower().str.strip()
+    df = df[df["industry"].astype(bool)].reset_index(drop=True)
+    # Signed score: +strength for supportive, -strength for restrictive,
+    # 0 for neutral / unknown. Half-floor so neutral mentions still
+    # carry attention (the 0.5 keeps the novelty signal alive).
+    def _signed_score(stance: str, strength: float) -> float:
+        s = max(float(strength or 0.0), 0.0)
+        if stance == "supportive":
+            return s
+        if stance == "restrictive":
+            return -s
+        # neutral / unknown — half-floor to register attention.
+        return 0.0
+    df["signed_strength"] = [
+        _signed_score(st, sg)
+        for st, sg in zip(df["policy_direction"], df["policy_strength"])
+    ]
+    return df
+
+
+def build_sc_factors_for_date(
+    events_df: pd.DataFrame,
+    signal_date: pd.Timestamp,
+) -> list[dict]:
+    """Compute per-industry factor rows for ``signal_date``.
+
+    PIT: only events with ``publish_date <= signal_date`` are visible.
+    Returns one dict per industry seen in the 60d window. If the
+    DataFrame is empty, returns ``[]`` (the caller is expected to
+    skip the date rather than emit a fake row).
+    """
+    if events_df.empty:
+        return []
+    visible = events_df[events_df["publish_date"] <= signal_date]
+    if visible.empty:
+        return []
+    cutoff_60d = signal_date - pd.Timedelta(days=INDUSTRY_NOVELTY_WINDOW_DAYS - 1)
+    novelty_window = visible[visible["publish_date"] >= cutoff_60d]
+    industries = sorted(novelty_window["industry"].unique().tolist())
+    short_cutoff = signal_date - pd.Timedelta(days=INDUSTRY_SUPPORT_SHORT_DAYS - 1)
+    long_cutoff = signal_date - pd.Timedelta(days=INDUSTRY_SUPPORT_LONG_DAYS - 1)
+    out: list[dict] = []
+    for ind in industries:
+        ind_rows = novelty_window[novelty_window["industry"] == ind]
+        # 5d / 20d signed-strength sums.
+        short_sum = float(
+            ind_rows[ind_rows["publish_date"] >= short_cutoff][
+                "signed_strength"
+            ].sum()
+        )
+        long_sum = float(
+            ind_rows[ind_rows["publish_date"] >= long_cutoff][
+                "signed_strength"
+            ].sum()
+        )
+        # Novelty: how recently the industry first appeared in the 60d
+        # window. first_seen=signal_date → 1.0; oldest possible → 0.0.
+        first_seen = ind_rows["publish_date"].min()
+        if pd.isna(first_seen):
+            novelty = 0.0
+        else:
+            age_days = (signal_date - first_seen).days
+            denom = max(INDUSTRY_NOVELTY_WINDOW_DAYS - 1, 1)
+            novelty = float(max(0.0, 1.0 - age_days / denom))
+        out.append({
+            "industry": ind,
+            "industry_policy_support_5d": short_sum,
+            "industry_policy_support_20d": long_sum,
+            "industry_policy_novelty": novelty,
+        })
+    return out
+
+
+def build_sc_factors_range(
+    start_date: str,
+    end_date: str,
+    input_dir: Path | None = None,
+) -> pd.DataFrame:
+    """Build a long-form per-industry factor DataFrame for [start, end].
+
+    Schema::
+        datetime, instrument="INDUSTRY_<UPPER>",
+        industry_policy_support_5d, industry_policy_support_20d,
+        industry_policy_novelty
+
+    Dates with no policy mentions in the 60d window produce ZERO rows
+    (not one per industry); this is consistent with the spec that
+    factors are sparse by industry rather than dense per date.
+    """
+    input_root = input_dir or INPUT_DIR_SC
+    events = _load_sc_events_from_dir(input_root)
+    s = pd.Timestamp(start_date)
+    e = pd.Timestamp(end_date)
+    if e < s:
+        raise ValueError(f"end ({end_date}) must be >= start ({start_date})")
+    rows: list[dict] = []
+    cur = s
+    while cur <= e:
+        per_industry = build_sc_factors_for_date(events, cur)
+        for r in per_industry:
+            industry = r.pop("industry")
+            rows.append({
+                "datetime": cur,
+                "instrument": (
+                    INDUSTRY_INSTRUMENT_PREFIX + industry.upper()
+                    if industry != "__market__" else MARKET_INSTRUMENT
+                ),
+                **r,
+            })
+        cur += pd.Timedelta(days=1)
+    return pd.DataFrame(rows)
+
+
+PBC_FACTOR_COLUMNS = (
+    "pbc_liquidity_zscore_20d",
+    "pbc_easing_dummy",
+    "pbc_tightening_dummy",
+    "short_rate_pressure",
+)
+SC_FACTOR_COLUMNS = (
+    "industry_policy_support_5d",
+    "industry_policy_support_20d",
+    "industry_policy_novelty",
+)
+
+
 def _write_health_sidecar(
     *,
     output_path: Path,
@@ -244,6 +455,8 @@ def _write_health_sidecar(
     events: pd.DataFrame,
     start_date: str,
     end_date: str,
+    health_source: str = HEALTH_SOURCE_NAME,
+    factor_columns: tuple[str, ...] = PBC_FACTOR_COLUMNS,
 ) -> None:
     """Sidecar JSON with stats for the SLA gate / daily report."""
     if events.empty:
@@ -255,17 +468,14 @@ def _write_health_sidecar(
         n_events = int(len(events))
         dates_with_events = int(events["publish_date"].nunique())
     sidecar = {
-        "source": HEALTH_SOURCE_NAME,
+        "source": health_source,
         "start_date": start_date,
         "end_date": end_date,
         "n_events_used": n_events,
         "latest_event_date": latest_event_date,
         "dates_with_events": dates_with_events,
         "n_factor_rows": int(len(df)),
-        "factor_columns": [
-            "pbc_liquidity_zscore_20d", "pbc_easing_dummy",
-            "pbc_tightening_dummy", "short_rate_pressure",
-        ],
+        "factor_columns": list(factor_columns),
         "written_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
         "output_path": str(output_path),
     }
@@ -291,6 +501,7 @@ def publish_health(
     n_events: int,
     latest_event_date: str,
     target_date: str,
+    health_source: str = HEALTH_SOURCE_NAME,
 ) -> None:
     """Publish PE-1 factor build health.
 
@@ -323,7 +534,7 @@ def publish_health(
             "latest_event_date": latest_event_date,
         },
     )
-    write_health(HEALTH_SOURCE_NAME, status, date=target_date)
+    write_health(health_source, status, date=target_date)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -335,11 +546,16 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     parser = argparse.ArgumentParser(
-        description="Build PBOC liquidity factors from extracted policy events."
+        description="Build PBOC / State Council policy factors from extracted policy events."
     )
     parser.add_argument(
-        "--source", default="pbc", choices=["pbc"],
-        help="Source. Only 'pbc' is implemented today.",
+        "--source", default="pbc", choices=["pbc", "state_council"],
+        help=(
+            "Source. 'pbc' = monetary policy (Phase E.1), produces a "
+            "MARKET-keyed parquet. 'state_council' = State Council + 3 "
+            "ministries (Phase E.2), produces an INDUSTRY_<NAME>-keyed "
+            "parquet."
+        ),
     )
     parser.add_argument(
         "--date", default=None,
@@ -360,7 +576,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.source != "pbc":
+    if args.source not in ("pbc", "state_council"):
         logger.error("Unsupported --source %s", args.source)
         return 2
 
@@ -376,15 +592,46 @@ def main(argv: list[str] | None = None) -> int:
             datetime.strptime(end, "%Y-%m-%d") - timedelta(days=args.lookback_days)
         ).strftime("%Y-%m-%d")
 
-    df = build_factors_range(start_date=start, end_date=end)
+    if args.source == "pbc":
+        build_fn = build_factors_range
+        load_fn = _load_events_from_dir
+        input_dir = INPUT_DIR
+        output_path = OUTPUT_PATH
+        health_path = HEALTH_PATH
+        health_source = HEALTH_SOURCE_NAME
+        factor_columns = PBC_FACTOR_COLUMNS
+    else:
+        build_fn = build_sc_factors_range
+        load_fn = _load_sc_events_from_dir
+        input_dir = INPUT_DIR_SC
+        output_path = OUTPUT_PATH_SC
+        health_path = HEALTH_PATH_SC
+        health_source = HEALTH_SOURCE_NAME_SC
+        factor_columns = SC_FACTOR_COLUMNS
+
+    df = build_fn(start_date=start, end_date=end)
     if df.empty:
         logger.warning("No factor rows built for [%s, %s]", start, end)
+        # PE-2 (state_council) is sparse by industry — an empty window
+        # at backfill bootstrap time is the steady-state expectation.
+        # Still publish health as no_events so the gate sees it.
+        events = load_fn(input_dir)
+        publish_health(
+            n_rows=0,
+            n_events=int(len(events)) if not events.empty else 0,
+            latest_event_date=(
+                events["publish_date"].max().strftime("%Y-%m-%d")
+                if not events.empty else ""
+            ),
+            target_date=end,
+            health_source=health_source,
+        )
         return 1
 
     # Merge with any existing parquet — drop overlapping dates first.
-    if OUTPUT_PATH.exists():
+    if output_path.exists():
         try:
-            existing = pd.read_parquet(OUTPUT_PATH)
+            existing = pd.read_parquet(output_path)
             existing["datetime"] = pd.to_datetime(existing["datetime"])
             new_dates = set(df["datetime"].astype("datetime64[ns]").tolist())
             existing = existing[~existing["datetime"].isin(new_dates)]
@@ -396,21 +643,23 @@ def main(argv: list[str] | None = None) -> int:
     else:
         combined = df
 
-    _atomic_write_parquet(combined, OUTPUT_PATH)
+    _atomic_write_parquet(combined, output_path)
     logger.info(
         "Wrote %d factor rows for [%s, %s] → %s",
-        len(df), start, end, OUTPUT_PATH,
+        len(df), start, end, output_path,
     )
 
     # Sidecar health JSON + scheduler data_health record.
-    events = _load_events_from_dir(INPUT_DIR)
+    events = load_fn(input_dir)
     _write_health_sidecar(
-        output_path=OUTPUT_PATH,
-        health_path=HEALTH_PATH,
+        output_path=output_path,
+        health_path=health_path,
         df=df,
         events=events,
         start_date=start,
         end_date=end,
+        health_source=health_source,
+        factor_columns=factor_columns,
     )
     publish_health(
         n_rows=len(df),
@@ -420,6 +669,7 @@ def main(argv: list[str] | None = None) -> int:
             if not events.empty else ""
         ),
         target_date=end,
+        health_source=health_source,
     )
     return 0
 

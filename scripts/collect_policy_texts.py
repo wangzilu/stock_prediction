@@ -1,16 +1,24 @@
-"""Collect policy texts — Phase E.1 step 1 (PBOC liquidity overlay).
+"""Collect policy texts — Phase E.1 step 1 (PBOC liquidity overlay) +
+Phase E.2 step 1 (State Council / ministry industry policy overlay).
 
-Fetches monetary-policy texts from the People's Bank of China
-(www.pbc.gov.cn) and writes one JSONL row per policy item under
-``data/storage/policy_texts/pbc/<YYYY-MM-DD>.jsonl``. Raw HTML for any
-item that fails to parse is dropped into
-``data/storage/policy_texts/pbc_raw_html/`` so the LLM extract step can
-be re-run with a different parser without re-fetching.
+Fetches policy texts from one of two source registries:
+
+- ``--source pbc`` — People's Bank of China monetary policy texts
+  (www.pbc.gov.cn), output under
+  ``data/storage/policy_texts/pbc/<YYYY-MM-DD>.jsonl``.
+- ``--source state_council`` — State Council policy docs + ministry
+  bulletins from ``www.gov.cn``, output under
+  ``data/storage/policy_texts/state_council/<YYYY-MM-DD>.jsonl``.
+
+Raw HTML for any item that fails to parse is dropped into
+``data/storage/policy_texts/<source>_raw_html/`` so the LLM extract step
+can be re-run with a different parser without re-fetching.
 
 Usage
 -----
     # Today only (cron mode)
     python scripts/collect_policy_texts.py --source pbc
+    python scripts/collect_policy_texts.py --source state_council
 
     # Backfill an explicit window
     python scripts/collect_policy_texts.py --source pbc \\
@@ -69,6 +77,9 @@ logger = logging.getLogger(__name__)
 # ── Storage layout ───────────────────────────────────────────────────
 POLICY_DIR = DATA_DIR / "policy_texts" / "pbc"
 RAW_HTML_DIR = DATA_DIR / "policy_texts" / "pbc_raw_html"
+# Phase E.2 (PE-2): State Council + ministry policy docs from gov.cn
+POLICY_DIR_SC = DATA_DIR / "policy_texts" / "state_council"
+RAW_HTML_DIR_SC = DATA_DIR / "policy_texts" / "state_council_raw_html"
 
 # ── PBOC list pages — kept as named constants so a structural change
 # is one-line patchable. URLs verified against the public PBOC
@@ -95,13 +106,45 @@ PBC_LIST_URLS: dict[str, str] = {
 }
 
 PBC_BASE = "http://www.pbc.gov.cn"
+GOV_CN_BASE = "http://www.gov.cn"
 USER_AGENT = "Mozilla/5.0 (compatible; StockPrediction-PolicyCollector/1.0)"
 REQUEST_TIMEOUT = 15  # seconds per attempt — required by spec
 RETRY_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = 2.0
-INTER_REQUEST_DELAY = 0.4  # be polite to pbc.gov.cn
+INTER_REQUEST_DELAY = 0.4  # be polite to gov.cn / pbc.gov.cn
 
 HEALTH_SOURCE_NAME = "pbc_policy_texts"
+HEALTH_SOURCE_NAME_SC = "state_council_policy_texts"
+
+# ── Phase E.2 (PE-2) — State Council + ministry list pages.
+# Like the PBOC registry above, these are LIST pages: each renders an
+# HTML <ul> / <div> of detail-page links. The detail URL patterns at
+# gov.cn vary by ministry — both the leading ``/zhengce/zhengceku/...``
+# State Council layout and the ``/n.../c.../content.html`` MIIT layout
+# are matched by ``parse_list_page`` below (timestamp-numeric path,
+# slash-separated YYYY/MM/DD, and ``_<digits>.html`` suffixes are all
+# attempted).
+#
+# Pick the three ministries with the most A-share industry impact:
+# 工信部 (MIIT) — semiconductor / EV / industrial policy
+# 发改委 (NDRC) — pricing / industrial planning / investment
+# 财政部 (MOF) — fiscal / subsidy / tax
+STATE_COUNCIL_LIST_URLS: dict[str, str] = {
+    # 国务院政策文件 (latest index page)
+    "state_council_doc": "http://www.gov.cn/zhengce/zuixin.htm",
+    # 国务院常务会议 (executive meeting briefings)
+    "state_council_meeting": "http://www.gov.cn/premier/changwu.htm",
+    # 工信部 (MIIT) policy releases — industrial policy / semi / EV
+    "miit_policy": "http://www.gov.cn/lianbo/bumen/202401/index.htm",
+    # 发改委 (NDRC) policy releases — investment / pricing
+    "ndrc_policy": "http://www.gov.cn/lianbo/bumen/ndrc/index.htm",
+    # 财政部 (MOF) policy releases — fiscal / subsidy / tax
+    "mof_policy": "http://www.gov.cn/lianbo/bumen/mof/index.htm",
+}
+
+STATE_COUNCIL_POLICY_TYPES: frozenset[str] = frozenset(
+    STATE_COUNCIL_LIST_URLS.keys()
+)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -182,6 +225,22 @@ def _try_parse_date(text: str) -> str:
     return ""
 
 
+def _host_base_from(base: str) -> str:
+    """Return ``scheme://host`` of ``base`` so /-rooted hrefs resolve.
+
+    Without this, mixing State Council (gov.cn) and PBOC (pbc.gov.cn)
+    sources would resolve every leading-slash href onto ``PBC_BASE``,
+    which would turn gov.cn paths into invalid pbc.gov.cn URLs.
+    """
+    if base.startswith("http://"):
+        rest = base[len("http://"):]
+        return "http://" + rest.split("/", 1)[0]
+    if base.startswith("https://"):
+        rest = base[len("https://"):]
+        return "https://" + rest.split("/", 1)[0]
+    return PBC_BASE  # last-ditch default for legacy callers
+
+
 def _absolutize(href: str, base: str) -> str:
     if href.startswith("http://") or href.startswith("https://"):
         return href
@@ -191,7 +250,10 @@ def _absolutize(href: str, base: str) -> str:
         # Relative to the list page directory
         return base.rsplit("/", 1)[0] + href[1:]
     if href.startswith("/"):
-        return PBC_BASE + href
+        # Host-rooted href: use the LIST PAGE's host, not PBC_BASE. This
+        # is the PE-2 fix that lets gov.cn and pbc.gov.cn coexist in the
+        # same script without cross-host URL corruption.
+        return _host_base_from(base) + href
     return base.rsplit("/", 1)[0] + "/" + href
 
 
@@ -216,18 +278,26 @@ def parse_list_page(html: str, base_url: str) -> list[PolicyLink]:
             # Skip nav anchors / external (e.g. mailto:, http://www.pbc.gov.cn/index.html nav)
             if href.startswith(("javascript:", "mailto:", "#")):
                 continue
-            # PBOC detail pages live under TWO patterns:
+            # Article detail pages live under several patterns:
             #   (a) /zhengcehuobisi/.../<YYYYMMDDhhmmssNNN>/index.html
-            #       (current live pattern — single timestamp string in path)
-            #   (b) /YYYY/MM/DD/...html (legacy slash-separated pattern)
+            #       (PBOC current live pattern — single timestamp string)
+            #   (b) /YYYY/MM/DD/...html (PBOC legacy slash-separated pattern)
+            #   (c) ..._<digits>.html  (PBOC legacy numbered suffix)
+            #   (d) /YYYY-MM/DD/content_<digits>.html  (gov.cn State
+            #       Council pattern — YYYY and MM joined by dash)
+            #   (e) /content_<digits>.html  (gov.cn fallback when no
+            #       date appears in the URL — date hint must come from
+            #       sibling span / parent text)
             # 2026-06-06 fix: original parser only matched (b) so the live
-            # OMO page (which uses (a)) returned 0 candidates. Match both.
+            # OMO page (which uses (a)) returned 0 candidates. Match all.
             looks_like_article = (
                 href.endswith(".html")
                 and (
                     re.search(r"/\d{14,}/index\.html$", href) is not None
                     or re.search(r"/\d{4}/\d{1,2}/\d{1,2}/", href) is not None
-                    or re.search(r"_\d{4}\.html$", href) is not None
+                    or re.search(r"_\d{4,}\.html$", href) is not None
+                    or re.search(r"/\d{4}-\d{1,2}/\d{1,2}/", href) is not None
+                    or re.search(r"/content_\d+\.html$", href) is not None
                 )
             )
             if not looks_like_article:
@@ -245,6 +315,12 @@ def parse_list_page(html: str, base_url: str) -> list[PolicyLink]:
                     y, mo, d = (int(g) for g in m_ts.groups())
                     date_hint = f"{y:04d}-{mo:02d}-{d:02d}"
             if not date_hint:
+                # Pattern (d): /YYYY-MM/DD/content_*.html (gov.cn).
+                m_gov = re.search(r"/(\d{4})-(\d{1,2})/(\d{1,2})/", href)
+                if m_gov:
+                    y, mo, d = (int(g) for g in m_gov.groups())
+                    date_hint = f"{y:04d}-{mo:02d}-{d:02d}"
+            if not date_hint:
                 # Pattern (b): slash-separated /YYYY/MM/DD/.
                 m = re.search(r"/(\d{4})/(\d{1,2})/(\d{1,2})/", href)
                 if m:
@@ -260,12 +336,16 @@ def parse_list_page(html: str, base_url: str) -> list[PolicyLink]:
             href, title = m.group(1).strip(), m.group(2).strip()
             ts_m = re.search(r"/(\d{4})(\d{2})(\d{2})\d{6,}/index\.html$", href)
             slash_m = re.search(r"/(\d{4})/(\d{1,2})/(\d{1,2})/", href)
-            if not (ts_m or slash_m):
+            dash_m = re.search(r"/(\d{4})-(\d{1,2})/(\d{1,2})/", href)
+            if not (ts_m or slash_m or dash_m):
                 continue
             url = _absolutize(href, base_url)
             date_hint = ""
             if ts_m:
                 y, mo, d = (int(g) for g in ts_m.groups())
+                date_hint = f"{y:04d}-{mo:02d}-{d:02d}"
+            elif dash_m:
+                y, mo, d = (int(g) for g in dash_m.groups())
                 date_hint = f"{y:04d}-{mo:02d}-{d:02d}"
             elif slash_m:
                 y, mo, d = (int(g) for g in slash_m.groups())
@@ -286,18 +366,22 @@ def parse_list_page(html: str, base_url: str) -> list[PolicyLink]:
 # Parsing — article detail page → plain-text content
 # ─────────────────────────────────────────────────────────────────────
 def parse_article_page(html: str) -> tuple[str, str]:
-    """Return (content_text, publish_date_hint) for a single PBOC article.
+    """Return (content_text, publish_date_hint) for one article.
 
     PBOC detail pages use ``<div id="zoom">`` (legacy) or
     ``<div class="detail_zoom">`` for the body, plus a header line
-    like ``发布时间：2026-06-05``.
+    like ``发布时间：2026-06-05``. Gov.cn State Council / ministry
+    detail pages use ``<div id="UCAP-CONTENT">`` or
+    ``<div class="pages_content">``; we try those first when present.
     """
     try:
         from bs4 import BeautifulSoup
 
         soup = BeautifulSoup(html, "html.parser")
         body_div = (
-            soup.find("div", id="zoom")
+            soup.find("div", id="UCAP-CONTENT")
+            or soup.find("div", class_="pages_content")
+            or soup.find("div", id="zoom")
             or soup.find("div", class_="detail_zoom")
             or soup.find("div", class_="content")
         )
@@ -349,11 +433,22 @@ def _date_range(start: str, end: str) -> list[str]:
     return out
 
 
-def _save_raw_html_on_failure(url: str, html: str, target_date: str) -> Path:
-    """Persist raw HTML so extract_policy_events.py can re-run the parser."""
-    RAW_HTML_DIR.mkdir(parents=True, exist_ok=True)
+def _save_raw_html_on_failure(
+    url: str,
+    html: str,
+    target_date: str,
+    raw_html_dir: Path | None = None,
+) -> Path:
+    """Persist raw HTML so extract_policy_events.py can re-run the parser.
+
+    ``raw_html_dir`` defaults to the PBC pool but PE-2 callers pass
+    ``RAW_HTML_DIR_SC`` to keep State Council failures from polluting
+    the PBC re-parse queue.
+    """
+    target_dir = raw_html_dir or RAW_HTML_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
     fname = f"{target_date}_{_slug(url)}.html"
-    path = RAW_HTML_DIR / fname
+    path = target_dir / fname
     try:
         path.write_text(html, encoding="utf-8")
     except Exception as e:  # pragma: no cover — disk error
@@ -512,14 +607,170 @@ def collect_pbc(
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Phase E.2 (PE-2) — State Council + ministry collector.
+#
+# Mirrors collect_pbc() exactly but pulls from STATE_COUNCIL_LIST_URLS,
+# sets ``source="gov.cn"``, and writes under POLICY_DIR_SC. The list /
+# article parsers are shared with PBC; the per-host base fix in
+# ``_absolutize`` keeps gov.cn /-rooted hrefs from being absolutized
+# onto pbc.gov.cn.
+# ─────────────────────────────────────────────────────────────────────
+def collect_state_council(
+    *,
+    start: str,
+    end: str,
+    policy_types: Iterable[str] = (
+        "state_council_doc", "state_council_meeting",
+        "miit_policy", "ndrc_policy", "mof_policy",
+    ),
+    bonus_types: Iterable[str] = (),
+    http_get_fn: Callable[..., requests.Response] = http_get,
+    output_dir: Path | None = None,
+) -> dict:
+    """Collect State Council + ministry policy texts for [start, end].
+
+    Shape-identical to ``collect_pbc`` — same summary dict, same JSONL
+    schema, same atomic-write per-day discipline. The only differences:
+
+      - LIST URL registry is STATE_COUNCIL_LIST_URLS
+      - source field is ``"gov.cn"``
+      - raw-html-on-failure dump goes to RAW_HTML_DIR_SC
+      - policy_type values are in STATE_COUNCIL_POLICY_TYPES
+        (state_council_doc / state_council_meeting / miit_policy /
+        ndrc_policy / mof_policy)
+
+    A single list-page 5xx does not kill the run — errors accumulate
+    in summary["errors"] and the per-day file is still written.
+    """
+    output_root = output_dir or POLICY_DIR_SC
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    dates = _date_range(start, end)
+    date_set: set[str] = set(dates)
+
+    summary: dict = {
+        "rows_by_date": {d: 0 for d in dates},
+        "errors": [],
+        "files_written": [],
+        "policy_types_seen": {},
+        "n_total": 0,
+    }
+
+    by_date_rows: dict[str, list[dict]] = {d: [] for d in dates}
+    seen_urls: set[str] = set()
+    session = requests.Session()
+
+    for pt in list(policy_types) + list(bonus_types):
+        list_url = STATE_COUNCIL_LIST_URLS.get(pt)
+        if not list_url:
+            continue
+        try:
+            resp = http_get_fn(list_url, session=session)
+            list_html = resp.content.decode("utf-8", errors="replace")
+        except Exception as e:
+            logger.warning("State Council list page failed for %s: %s", pt, e)
+            summary["errors"].append(
+                {"url": list_url, "stage": "list", "msg": str(e)}
+            )
+            continue
+
+        links = parse_list_page(list_html, list_url)
+        logger.info("gov.cn %s list page: %d candidate links", pt, len(links))
+
+        for ln in links:
+            if ln.url in seen_urls:
+                continue
+            if ln.publish_date and ln.publish_date not in date_set:
+                continue
+            seen_urls.add(ln.url)
+            time.sleep(INTER_REQUEST_DELAY)
+            try:
+                art_resp = http_get_fn(ln.url, session=session)
+                art_html = art_resp.content.decode("utf-8", errors="replace")
+            except Exception as e:
+                logger.warning("State Council article fetch failed %s: %s", ln.url, e)
+                summary["errors"].append(
+                    {"url": ln.url, "stage": "article", "msg": str(e)}
+                )
+                continue
+            try:
+                content, article_date = parse_article_page(art_html)
+            except Exception as e:
+                logger.warning("State Council article parse failed %s: %s", ln.url, e)
+                summary["errors"].append(
+                    {"url": ln.url, "stage": "parse", "msg": str(e)}
+                )
+                _save_raw_html_on_failure(
+                    ln.url, art_html, ln.publish_date or start,
+                    raw_html_dir=RAW_HTML_DIR_SC,
+                )
+                continue
+
+            publish_date = ln.publish_date or article_date
+            if not publish_date:
+                _save_raw_html_on_failure(
+                    ln.url, art_html, start, raw_html_dir=RAW_HTML_DIR_SC,
+                )
+                summary["errors"].append(
+                    {"url": ln.url, "stage": "no_date", "msg": "no publish_date"}
+                )
+                continue
+            if publish_date not in date_set:
+                continue
+            if not content or len(content) < 20:
+                _save_raw_html_on_failure(
+                    ln.url, art_html, publish_date,
+                    raw_html_dir=RAW_HTML_DIR_SC,
+                )
+                summary["errors"].append(
+                    {"url": ln.url, "stage": "empty_body", "msg": "len(content)<20"}
+                )
+                continue
+
+            row = {
+                "publish_date": publish_date,
+                "policy_type": pt,
+                "title": ln.title,
+                "url": ln.url,
+                "content": content,
+                "source": "gov.cn",
+                "fetch_time": _now_utc_iso(),
+            }
+            by_date_rows[publish_date].append(row)
+            summary["policy_types_seen"][pt] = (
+                summary["policy_types_seen"].get(pt, 0) + 1
+            )
+
+    for d in dates:
+        rows = by_date_rows[d]
+        rows.sort(key=lambda r: (r["policy_type"], r["url"]))
+        out_path = output_root / f"{d}.jsonl"
+        _atomic_write_jsonl(rows, out_path)
+        summary["rows_by_date"][d] = len(rows)
+        summary["files_written"].append(out_path)
+        summary["n_total"] += len(rows)
+        logger.info("Wrote %d row(s) -> %s", len(rows), out_path)
+
+    return summary
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Health publishing
 # ─────────────────────────────────────────────────────────────────────
-def publish_health(summary: dict, *, target_date: str) -> None:
+def publish_health(
+    summary: dict,
+    *,
+    target_date: str,
+    health_source: str = HEALTH_SOURCE_NAME,
+) -> None:
     """Write a HealthStatus record via the standard scheduler interface.
 
     ``partial`` is True when any error rows were recorded but at least
     one item was successfully written. ``success`` is True iff at least
     one item was written (i.e. the day is on file).
+
+    ``health_source`` defaults to the PBC source name; PE-2 callers
+    pass ``HEALTH_SOURCE_NAME_SC`` so the SLA gate sees a separate row.
     """
     try:
         from scheduler.data_health import HealthStatus, write_health
@@ -554,7 +805,7 @@ def publish_health(summary: dict, *, target_date: str) -> None:
             "n_errors": n_errors,
         },
     )
-    write_health(HEALTH_SOURCE_NAME, status, date=target_date)
+    write_health(health_source, status, date=target_date)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -571,11 +822,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--source",
         default="pbc",
-        choices=["pbc"],
+        choices=["pbc", "state_council"],
         help=(
-            "Policy source. Only 'pbc' is implemented today; 'gov_cn' "
-            "(State Council) and 'nbs' (statistics bureau) are reserved "
-            "for Phase E.2 / E.3."
+            "Policy source. 'pbc' = People's Bank monetary policy texts "
+            "(Phase E.1). 'state_council' = State Council + 3 ministry "
+            "policy docs from gov.cn (Phase E.2). 'nbs' (statistics "
+            "bureau) reserved for Phase E.3."
         ),
     )
     parser.add_argument(
@@ -611,25 +863,40 @@ def main(argv: list[str] | None = None) -> int:
     start = args.start or today
     end = args.end or args.start or today
 
-    if args.source != "pbc":
-        # Re-raise as a hard error rather than silently no-op. The
-        # argparse choices=["pbc"] already prevents this, but defend.
-        logger.error("Unsupported --source %s", args.source)
-        return 2
-
-    bonus = ("mlf", "rrr", "quarterly_report") if args.include_bonus else ()
-    try:
-        summary = collect_pbc(
+    if args.source == "pbc":
+        bonus = ("mlf", "rrr", "quarterly_report") if args.include_bonus else ()
+        collector = lambda: collect_pbc(
             start=start, end=end,
             policy_types=("omo", "lpr"),
             bonus_types=bonus,
         )
+        health_source = HEALTH_SOURCE_NAME
+    elif args.source == "state_council":
+        # PE-2: all 5 list sources at once. include-bonus is a no-op
+        # since gov.cn doesn't have a bonus tier — all five are required
+        # (the SLA budget is 3 days, so an occasional empty pull is OK).
+        collector = lambda: collect_state_council(
+            start=start, end=end,
+            policy_types=(
+                "state_council_doc", "state_council_meeting",
+                "miit_policy", "ndrc_policy", "mof_policy",
+            ),
+        )
+        health_source = HEALTH_SOURCE_NAME_SC
+    else:
+        # Re-raise as a hard error rather than silently no-op. The
+        # argparse choices= already prevents this, but defend.
+        logger.error("Unsupported --source %s", args.source)
+        return 2
+
+    try:
+        summary = collector()
     except Exception as e:
-        logger.error("collect_pbc raised: %s", e)
+        logger.error("collector raised (source=%s): %s", args.source, e)
         try:
             from scheduler.data_health import HealthStatus, write_health
             write_health(
-                HEALTH_SOURCE_NAME,
+                health_source,
                 HealthStatus(
                     success=False,
                     error_type=type(e).__name__,
@@ -644,7 +911,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Publish health using the LATEST day as the date key so the SLA
     # gate sees today's record on today's run.
-    publish_health(summary, target_date=end)
+    publish_health(summary, target_date=end, health_source=health_source)
 
     logger.info(
         "Done. n_total=%d, files=%d, errors=%d, rows_by_date=%s",

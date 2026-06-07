@@ -177,6 +177,29 @@ SLA_BY_SOURCE: dict[str, SourceSLA] = {
         "Daily PBC liquidity factor build from extracted policy events. "
         "Feeds the xgb_209_pbc candidate profile via the FeatureMerger.",
     ),
+    # ── PE-2 State Council + ministry industry policy chain (Phase E.2) ──
+    # State Council and ministry policy docs publish less frequently
+    # than PBOC daily OMO/LPR, so the budget is 3 trading days rather
+    # than 2 — a long weekend + Tuesday silent day must not paint the
+    # gate red and disable the downstream industry-policy overlay.
+    "state_council_policy_texts": SourceSLA(
+        "daily", 3,
+        "State Council + 3 ministry policy doc collection from gov.cn. "
+        "3-day budget tolerates the sparse publish cadence (some days "
+        "have zero relevant policy docs; the gate must not flip red).",
+    ),
+    "state_council_policy_events": SourceSLA(
+        "daily", 3,
+        "Daily LLM extraction of State Council / ministry policy texts "
+        "→ structured industry-policy events. 3-day budget matches the "
+        "upstream collector.",
+    ),
+    "state_council_policy_factors": SourceSLA(
+        "daily", 3,
+        "Daily State Council industry-policy factor build. Emits per-"
+        "(industry, date) rows; FeatureMerger maps stocks to industries "
+        "at execution time. 3-day budget tolerates sparse publish days.",
+    ),
     # ── Auxiliary ───────────────────────────────────────────────────
     "weekly_mask_rebuild": SourceSLA(
         "weekly", 7,
