@@ -286,8 +286,16 @@ class DailyPipeline:
 
                 cache_preds, payload = load_prediction_cache()
                 self._lgb_predictions = cache_preds
+                # 2026-06-07 cx P1 #1 fix: pre-fix this set status="ok"
+                # which made the downstream candidate builder (line
+                # 1434 ``status == "ok"``) and the push label ("短线
+                # 模型：正常") treat cache fallback as the steady-state
+                # signal. Now status="degraded" + source="cache" so the
+                # operator can distinguish live signal from cache and
+                # the push template can surface "使用缓存信号" instead
+                # of hiding the degradation.
                 self._lgb_status = {
-                    "status": "ok",
+                    "status": "degraded",
                     "count": len(cache_preds),
                     "min_required": LGB_MIN_PREDICTIONS,
                     "source": "cache",
@@ -555,12 +563,28 @@ class DailyPipeline:
                 f"{date_text}"
             )
         elif lgb_status.get("status") == "degraded":
-            model_line = (
-                "短线模型：降级，"
-                f"有效覆盖{lgb_status.get('count', 0)}/"
-                f"{lgb_status.get('min_required', LGB_MIN_PREDICTIONS)}，"
-                "已改用全A因子量化分作为备选"
-            )
+            # 2026-06-07 cx P1 #1 fix: distinguish cache-fallback
+            # (model still gives predictions, just stale) from
+            # low-coverage (model failed; using factor proxy). The
+            # operator should see WHY the status is degraded so they
+            # can decide whether to act on the signal at all.
+            if lgb_status.get("source") == "cache":
+                date_text = (
+                    f"，数据日期{lgb_status.get('latest_date')}"
+                    if lgb_status.get('latest_date') else ""
+                )
+                model_line = (
+                    f"短线模型：使用缓存信号（live 推理失败），"
+                    f"覆盖{lgb_status.get('count', 0)}只标的"
+                    f"{date_text}"
+                )
+            else:
+                model_line = (
+                    "短线模型：降级，"
+                    f"有效覆盖{lgb_status.get('count', 0)}/"
+                    f"{lgb_status.get('min_required', LGB_MIN_PREDICTIONS)}，"
+                    "已改用全A因子量化分作为备选"
+                )
         else:
             model_line = "短线模型：状态待确认，必要时使用全A因子量化分作为备选"
         return f"【数据状态】\n{model_line}"
@@ -1150,15 +1174,30 @@ class DailyPipeline:
                 target_date, lgb_latest_date,
             )
             return None
-        # Allow up to 5 calendar days slack — covers weekends + the
-        # 1-day-behind nature of after-close inference. Anything older
-        # is treated as a stale-signal snapshot.
-        signal_age_days = (target_dt - lgb_dt).days
-        if signal_age_days < 0 or signal_age_days > 5:
+        # 2026-06-07 cx P1 #2 fix: pre-fix this allowed 5 CALENDAR
+        # days, which let a Friday-22:00 snapshot with a 3-day-stale
+        # LGB signal leak into Tuesday morning and bypass the
+        # 1-trading-day freshness gate the LGB cache itself enforces.
+        # Now: budget is 1 TRADING day. A Friday signal is fresh on
+        # Monday morning (Friday → Monday is 1 trading-day gap).
+        # Anything older is rejected so the snapshot path matches the
+        # cache path's freshness contract.
+        try:
+            import pandas as _pd
+            from pandas.tseries.offsets import BDay as _BDay
+            target_bday = _pd.Timestamp(target_dt)
+            lgb_bday = _pd.Timestamp(lgb_dt)
+            signal_age_bdays = int(((target_bday - lgb_bday) / _BDay(1)))
+        except Exception:
+            # Fall back to calendar-day calculation if pandas import
+            # fails — should never happen in production.
+            signal_age_bdays = (target_dt - lgb_dt).days
+        if signal_age_bdays < 0 or signal_age_bdays > 1:
             logger.warning(
                 "Ignoring overnight snapshot target_date=%s with "
-                "lgb_status.latest_date=%s (%d-day gap outside [0,5])",
-                target_date, lgb_latest_date, signal_age_days,
+                "lgb_status.latest_date=%s (%d-trading-day gap "
+                "outside [0, 1])",
+                target_date, lgb_latest_date, signal_age_bdays,
             )
             return None
 
@@ -1383,7 +1422,14 @@ class DailyPipeline:
             )
             return []
         candidates = []
-        sanitizer = self._make_sanitizer(require_quote=False)
+        # 2026-06-07 cx P2 #3 fix: snapshot candidates are about to
+        # enter the morning buy pool. They MUST pass the same actionable
+        # gate (require_quote=True + actionable_required=True) the live
+        # _build_stock_candidates path enforces at line 1438. Without
+        # this an overnight one-zb-line / suspended stock could ride
+        # the snapshot into the morning push.
+        sanitizer = self._make_sanitizer(require_quote=True,
+                                           actionable_required=True)
         for item in snapshot.get("items", []):
             if not isinstance(item, dict):
                 continue
@@ -1431,7 +1477,13 @@ class DailyPipeline:
         sanitizer = self._make_sanitizer(require_quote=True, actionable_required=True)
         self.market_collector._load_spot_cache()
         spot = self.market_collector._spot_cache
-        lgb_available = bool(lgb_preds) and getattr(self, "_lgb_status", {}).get("status") == "ok"
+        # 2026-06-07 cx P1 #1 fix: cache fallback now records
+        # status="degraded" instead of "ok" so the push template can
+        # surface "缓存信号" honestly. Both states are usable for
+        # candidate building — the operator-visible label is what
+        # changes, not the consumption path.
+        _lgb_state = getattr(self, "_lgb_status", {}).get("status")
+        lgb_available = bool(lgb_preds) and _lgb_state in ("ok", "degraded")
 
         if spot is None or spot.empty:
             logger.warning("Spot cache empty, falling back to watchlist")
