@@ -53,6 +53,13 @@ JOB_DEPS: dict[str, list[str]] = {
     "state_council_policy_texts": [],
     "state_council_policy_events": ["state_council_policy_texts"],
     "state_council_policy_factors": ["state_council_policy_events"],
+    # Phase E.3 PE-3 chain — 15:40 → 16:00 → 16:20 strict sequence.
+    # NBS publishes MONTHLY (CPI/PPI/PMI/社零) so a 0-row weekday is
+    # the steady-state expectation; the SLA gate uses a 35-day budget
+    # (one monthly release cycle). Same gating discipline as PE-1/PE-2.
+    "nbs_policy_texts": [],
+    "nbs_policy_events": ["nbs_policy_texts"],
+    "nbs_macro_factors": ["nbs_policy_events"],
     # ---- Post-data-update processing -------------------------------------
     "fund_flow_update": ["qlib_data_update"],
     "st_daily_factors_update": ["qlib_data_update"],
@@ -80,6 +87,14 @@ JOB_DEPS: dict[str, list[str]] = {
         "valuation_update",
         "shareholder_update",
         "regime_daily_update",
+    ],
+    # 2026-06-07 cx P1 #1+#2 fix: daily refresh of the 209-family
+    # caches the production champion + shadow candidate read.
+    # Gates on qlib + LLM event pipeline so a failed upstream
+    # blocks downstream rather than producing a stale "fresh" cache.
+    "champion_cache_rebuild": [
+        "qlib_data_update",
+        "llm_event_pipeline",
     ],
     # ---- Training and inference depend on fresh cache --------------------
     "midweek_train": ["feature_cache_rebuild"],

@@ -80,10 +80,27 @@ def main():
         from config.production_features import PROFILE_EXPECTED_COUNTS
         exp_242 = PROFILE_EXPECTED_COUNTS.get("xgb_242", {}).get("total")
         exp_209 = PROFILE_EXPECTED_COUNTS.get("xgb_209", {}).get("total")
-        # Cache typically has total = features + label + a few aux cols.
-        # Empirically xgb_242 cache = 244 cols (242 + label + 1 aux).
-        # The relationship we can enforce is: dropped_cols count = 33
-        # (matches the Bucket A trio) and output ratio = input - 33.
+        # 2026-06-07 cx P2 #3 fix: previously the gate only checked the
+        # delta (dropped=33, out width = in width - 33). That meant a
+        # 242 cache with extra aux cols silently produced a 211-feat
+        # cache labelled "209" because both the in-242 and out-209
+        # contract counts went unchecked. Now assert the actual feature
+        # counts using the contract.
+        EXPECTED_AUX = 2  # __label_5d + __pnl_return_1d (verified 2026-06-07)
+        if exp_242 and df.shape[1] != exp_242 + EXPECTED_AUX:
+            raise SystemExit(
+                f"contract gate: input cache has {df.shape[1]} cols but "
+                f"xgb_242 contract expects {exp_242} features + ~{EXPECTED_AUX} "
+                f"aux = {exp_242 + EXPECTED_AUX}. Input parquet is NOT a "
+                f"242-shaped cache; refusing to derive a 209 from it."
+            )
+        if exp_209 and df_out.shape[1] != exp_209 + EXPECTED_AUX:
+            raise SystemExit(
+                f"contract gate: output cache has {df_out.shape[1]} cols but "
+                f"xgb_209 contract expects {exp_209} features + ~{EXPECTED_AUX} "
+                f"aux = {exp_209 + EXPECTED_AUX}. Output is the wrong shape "
+                f"despite passing the delta check — manifest may have drifted."
+            )
         expected_drop = 33  # cross_market_regime 27 + capital_flow 3 + shareholder 3
         if len(actually_dropped) != expected_drop:
             raise SystemExit(
@@ -91,13 +108,9 @@ def main():
                 f"but expected {expected_drop} (cross_market_regime 27 + "
                 f"capital_flow 3 + shareholder 3). Manifest may have drifted."
             )
-        if df_out.shape[1] != df.shape[1] - expected_drop:
-            raise SystemExit(
-                f"contract gate: output width mismatch. in={df.shape[1]} "
-                f"out={df_out.shape[1]} delta={df.shape[1] - df_out.shape[1]} "
-                f"expected delta={expected_drop}"
-            )
-        print(f"[build_209] contract gate OK: 242→209 via 33-col drop")
+        print(f"[build_209] contract gate OK: 242→209 via 33-col drop, "
+              f"in={df.shape[1]} (= {exp_242}+{EXPECTED_AUX}) → "
+              f"out={df_out.shape[1]} (= {exp_209}+{EXPECTED_AUX})")
     except ImportError:
         print(f"[build_209] WARN: production_features not importable, skipping contract gate")
 

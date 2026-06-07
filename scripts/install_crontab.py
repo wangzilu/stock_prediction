@@ -183,6 +183,29 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                 "state_council_policy_factors.log",
                 network="none", timeout_sec=300,
                 enforce_deps=True),
+        # Phase E.3 (PE-3) — NBS macro statistics chain (CPI / PPI /
+        # PMI / 社零). 2026-06-07 cron registration. 5-minute stagger
+        # from PE-2 to avoid stacking MiniMax RPM calls within a single
+        # minute window. NBS publishes MONTHLY so a 0-row weekday is
+        # the steady-state expectation; the SLA budget is 35 days for
+        # that reason. Same shape as PE-1/PE-2: collect → extract → build.
+        CronJob("nbs_policy_texts", "40 15 * * 1-5",
+                [py, str(scripts / "collect_policy_texts.py"),
+                 "--source", "nbs", "--fail-on-empty"],
+                "nbs_policy_texts.log",
+                network="domestic", timeout_sec=600),
+        CronJob("nbs_policy_events", "00 16 * * 1-5",
+                [py, str(scripts / "extract_policy_events.py"),
+                 "--source", "nbs"],
+                "nbs_policy_events.log",
+                network="llm", timeout_sec=1800,
+                enforce_deps=True),
+        CronJob("nbs_macro_factors", "20 16 * * 1-5",
+                [py, str(scripts / "build_policy_factors.py"),
+                 "--source", "nbs"],
+                "nbs_macro_factors.log",
+                network="none", timeout_sec=300,
+                enforce_deps=True),
         # Shadow paper-trade for xgb_209_llm promotion gate.
         # 2026-06-07 (cx P2 #3 fix): originally manual; now cron so the
         # 5-day shadow window auto-accumulates without operator drift.
@@ -272,6 +295,22 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("feature_cache_rebuild", "25 18 * * 1-5",
                 [py, str(scripts / "build_feature_cache.py"), "--all"], "feature_cache_rebuild.log",
                 network="domestic", timeout_sec=1800, critical=True, enforce_deps=True),
+        # 2026-06-07 cx P1 #1 + #2 fix: feature_cache_rebuild only
+        # touches the legacy 174-family cache. The xgb_209 production
+        # champion + xgb_209_llm shadow candidate read separate
+        # parquets that had NO automation. shadow_paper_trade.py
+        # would have consumed a stale snapshot for the entire 5-day
+        # promotion window. champion_cache_rebuild chains
+        # build_feature_cache_242 → 209 filter → 209_llm join into
+        # the *_latest.parquet filenames the shadow harness reads.
+        # 18:30 = 5 min after feature_cache_rebuild + after qlib data
+        # + after LLM event pipeline. enforce_deps so a failed
+        # llm_event_pipeline or qlib_data_update blocks this chain.
+        CronJob("champion_cache_rebuild", "30 18 * * 1-5",
+                [py, str(scripts / "build_champion_cache.py")],
+                "champion_cache_rebuild.log",
+                network="none", timeout_sec=1200,
+                enforce_deps=True),
         # --- Prediction + Paper (none, critical) ---
         # Smoke depends on feature_cache_rebuild; downstream paper/shadow
         # opt into --enforce-deps so stale upstream blocks rather than

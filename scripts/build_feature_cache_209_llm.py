@@ -1,22 +1,32 @@
 """Build the xgb_209_llm CANDIDATE feature cache.
 
-xgb_209_llm = xgb_209 (158 Alpha158 + 51 supp) + 5 LLM event factor cols.
+2026-06-07 schema (post-L1 fact-count rebuild):
+  xgb_209_llm = xgb_209 (158 Alpha158 + 51 supp) + 12 LLM event factor cols
+                = 221 trained features total.
+The 12 LLM cols are 5 legacy (impact_1d/5d_decayed, sentiment_score,
+event_count_5d, avg_confidence) + 7 fact-count cols
+(positive_event_count_3d, negative_event_count_3d,
+price_sensitive_count_3d, official_event_count_3d, event_count_3d,
+repeated_ratio_3d, event_intensity).
+
 This script joins:
-  - data/storage/feature_cache_209_production.parquet  (rows × 211 cols)
-  - data/storage/llm_event_factors.parquet              (5 LLM cols)
+  - feature_cache_209_production.parquet  (rows × 211 = 209 feat + label + aux)
+  - llm_event_factors.parquet              (12 LLM cols + signal_date + qlib_code)
+giving a 223-col output (209 + 12 + label + aux). The contract gate
+asserts the LLM col count matches PROFILE_EXPECTED_COUNTS — if a
+future schema change adds more cols, update the count there and
+re-run.
 
 LLM rows that don't match a (datetime, instrument) key default to 0.0
-(= no recent events), so the join is left-join with zero-fill. The
-resulting parquet has 211 + 5 = 216 cols (including label + aux),
-which corresponds to the 214 trained features expected by the
-xgb_209_llm profile in config/production_features.py.
+(= no recent events). Real LLM coverage is ~3% of cache rows (logged
+honestly post-fix in commit 211741b after the misleading "non-null"
+report was corrected).
 
-Also updates ``data/storage/supp_col_manifest.json`` to include an
-``llm_event`` group entry, so the 24-split runner's --drop-group
-flag can ablate it for the Phase B LOO comparison
-``xgb_209_llm vs xgb_209``.
+Also updates ``data/storage/supp_col_manifest.json`` so the 24-split
+runner's ``--drop-group llm_event`` can find the 12 columns.
 
-Output: ``data/storage/feature_cache_209_llm.parquet``
+Output: ``data/storage/feature_cache_209_llm.parquet`` (overridable
+via --out for the cron-driven _latest path).
 """
 from __future__ import annotations
 
