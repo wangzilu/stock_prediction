@@ -100,8 +100,23 @@ JOB_DEPS: dict[str, list[str]] = {
     # caches the production champion + shadow candidate read.
     # Gates on qlib + LLM event pipeline so a failed upstream
     # blocks downstream rather than producing a stale "fresh" cache.
+    #
+    # 2026-06-07 cx batch D P1 #3: dep set expanded to the union of
+    # every upstream the build_feature_cache_242 builder reads through
+    # FeatureMerger for the production / shadow profiles. Pre-fix the
+    # gate only required qlib + LLM, so a stale fund_flow / valuation /
+    # st_daily_factors / shareholder / regime_daily would silently land
+    # in the 242 -> 209 -> 209_llm chain (the same class of silent
+    # mixed-vintage bug the feature_cache_rebuild dep expansion fixed
+    # in cx round 6 P1-7). Mirror the feature_cache_rebuild dep set +
+    # add the LLM pipeline.
     "champion_cache_rebuild": [
         "qlib_data_update",
+        "fund_flow_update",
+        "st_daily_factors_update",
+        "valuation_update",
+        "shareholder_update",
+        "regime_daily_update",
         "llm_event_pipeline",
     ],
     # ---- Training and inference depend on fresh cache --------------------
