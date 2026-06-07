@@ -145,10 +145,17 @@ class RiskGuard:
         try:
             st_path = DATA_DIR / "st_stock_list.json"
             if st_path.exists():
-                st_set = set(json.loads(st_path.read_text()))
+                # cx batch B P1 #3 (same-exam): normalise to uppercase at
+                # load time, mirroring factors/candidate_sanitizer.py:163-164.
+                # Pre-fix the JSON was loaded raw and looked up via
+                # code.lower(); when the JSON stored codes uppercase
+                # (which candidate_sanitizer enforces), every ST
+                # membership check missed and ST positions were NOT
+                # force-sold. The same mismatch broke the 5% limit-down
+                # threshold in _check_limit_down below.
+                st_set = {str(s).upper() for s in json.loads(st_path.read_text())}
                 for code in positions:
-                    code_lower = code.lower()
-                    if code_lower in st_set:
+                    if code.upper() in st_set:
                         constraints.force_sell.append(code)
                         constraints.risk_reasons[code] = "ST/退市风险"
                         # ST cooldown: until removed from ST list
@@ -348,11 +355,16 @@ class RiskGuard:
         TOLERANCE = 0.001  # 0.1% tolerance for floating-point / tick rounding
 
         # Also detect ST via the st_stock_list
+        # cx batch B P1 #3 (same-exam): uppercase-normalised set so the
+        # ST 5% limit-down threshold actually applies. Pre-fix the raw
+        # load + lowercase lookup let ST stocks fall into the default
+        # 10% (or 20% on 创业板/科创板) branch, marking them cannot_sell
+        # only at the wrong threshold.
         st_set: set = set()
         try:
             st_path = DATA_DIR / "st_stock_list.json"
             if st_path.exists():
-                st_set = set(json.loads(st_path.read_text()))
+                st_set = {str(s).upper() for s in json.loads(st_path.read_text())}
         except Exception:
             pass
 
@@ -374,8 +386,7 @@ class RiskGuard:
                 continue
 
             # Determine limit percentage
-            code_lower = code.lower()
-            if code_lower in st_set:
+            if code.upper() in st_set:
                 limit_pct = 0.05  # ST stocks: 5%
             else:
                 limit_pct = self._limit_pct_for_code(code)
