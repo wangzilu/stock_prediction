@@ -361,3 +361,115 @@ def test_excess_return_market_keyed_uses_benchmark_for_self():
     # itself (study answers "did the market move"). The smooth 1%/day
     # series gives offset_0 ≈ 0.01.
     assert abs(panel["offset_+0"].iloc[0] - 0.01) < 1e-6
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Step 6/7 — aggregation + stat test
+# ─────────────────────────────────────────────────────────────────────
+def test_summarize_panel_per_event_type():
+    panel = pd.DataFrame([
+        {"event_id": "a", "event_date": pd.Timestamp("2026-05-20"),
+         "instrument": "SH600519", "event_type": "earnings_beat",
+         "offset_-1": 0.001, "offset_+0": 0.010, "offset_+1": 0.020},
+        {"event_id": "b", "event_date": pd.Timestamp("2026-05-21"),
+         "instrument": "SZ000858", "event_type": "earnings_beat",
+         "offset_-1": -0.001, "offset_+0": 0.020, "offset_+1": 0.022},
+        {"event_id": "c", "event_date": pd.Timestamp("2026-05-22"),
+         "instrument": "SH000300", "event_type": "macro_shock",
+         "offset_-1": 0.005, "offset_+0": -0.030, "offset_+1": -0.010},
+    ])
+    summary = es.summarize_panel(panel, window_lo=-1, window_hi=1)
+    # Two event types in summary
+    assert set(summary["event_type"]) == {"earnings_beat", "macro_shock"}
+    # n=2 for earnings_beat, n=1 for macro_shock
+    eb = summary[summary["event_type"] == "earnings_beat"].iloc[0]
+    assert eb["n"] == 2
+    # mean offset_+0 = 0.015 ; mean offset_+1 = 0.021
+    assert abs(eb["mean_offset_0"] - 0.015) < 1e-9
+    assert abs(eb["mean_offset_+1"] - 0.021) < 1e-9
+    # n=1 → t-stat / p-value must be NaN (no variance)
+    ms = summary[summary["event_type"] == "macro_shock"].iloc[0]
+    assert ms["n"] == 1
+    assert pd.isna(ms["p_value_offset_+1"]) or ms["p_value_offset_+1"] == 1.0
+
+
+def test_summarize_panel_empty():
+    panel = pd.DataFrame(columns=[
+        "event_id", "event_date", "instrument", "event_type",
+        "offset_-1", "offset_+0", "offset_+1",
+    ])
+    summary = es.summarize_panel(panel, window_lo=-1, window_hi=1)
+    assert summary.empty
+
+
+def test_run_event_study_end_to_end_pe1(tmp_path, monkeypatch):
+    """Driver: load → panel → write, no qlib (close_loader injected)."""
+    # Stage PE-1 events in a temp dir + monkeypatch DATA_DIR so
+    # load_events finds them.
+    events_root = tmp_path / "policy_events" / "pbc"
+    _write_jsonl(
+        events_root / "2024-02-20.jsonl",
+        [{"publish_date": "2024-02-20", "policy_stance": "easing"}],
+    )
+    _write_jsonl(
+        events_root / "2024-02-21.jsonl",
+        [{"publish_date": "2024-02-21", "policy_stance": "easing"}],
+    )
+    monkeypatch.setattr(es, "DATA_DIR", tmp_path)
+    # Update SOURCE_SPEC's pe1 subdir to point under tmp_path
+    # (load_events resolves events_root from DATA_DIR + spec["subdir"]).
+
+    # Benchmark prices: smooth +1%/day for 30 days.
+    dates = pd.bdate_range("2024-02-01", periods=30)
+    bench = pd.Series((1.0 + pd.Series([0.01] * 30, index=dates)).cumprod() * 1000.0)
+    bench.index = dates
+    close_loader = _flat_close_loader({"SH000300": bench})
+
+    cfg = es.EventStudyConfig(
+        source="pe1", start="2024-02-01", end="2024-02-28",
+        window_lo=-1, window_hi=2,
+        benchmark="SH000300", top_n=None,
+        out_dir=tmp_path / "out",
+    )
+    paths = es.run_event_study(cfg, close_loader=close_loader)
+    assert "csv" in paths and paths["csv"].exists()
+    assert "summary" in paths and paths["summary"].exists()
+    summary = json.loads(paths["summary"].read_text(encoding="utf-8"))
+    assert summary["source"] == "pe1"
+    # 2 easing events; with smooth +1%/day series both yield benchmark
+    # return ≈ 0.01 at every offset.
+    assert summary["n_events"] == 2
+    eb = [r for r in summary["per_event_type"] if r["event_type"] == "easing"][0]
+    assert eb["n"] == 2
+    assert abs(eb["mean_offset_+1"] - 0.01) < 1e-9
+
+
+def test_write_outputs_writes_csv_and_summary_json(tmp_path):
+    panel = pd.DataFrame([
+        {"event_id": "a", "event_date": pd.Timestamp("2026-05-20"),
+         "instrument": "SH600519", "event_type": "earnings_beat",
+         "offset_-1": 0.001, "offset_+0": 0.010, "offset_+1": 0.020},
+        {"event_id": "b", "event_date": pd.Timestamp("2026-05-21"),
+         "instrument": "SZ000858", "event_type": "earnings_beat",
+         "offset_-1": -0.001, "offset_+0": 0.020, "offset_+1": 0.022},
+    ])
+    paths = es.write_outputs(
+        panel=panel,
+        source="llm",
+        start="2026-05-01",
+        end="2026-05-31",
+        window_lo=-1, window_hi=1,
+        out_dir=tmp_path,
+        emit_plot=False,
+    )
+    csv_path = paths["csv"]
+    json_path = paths["summary"]
+    assert csv_path.exists()
+    assert json_path.exists()
+    summary = json.loads(json_path.read_text(encoding="utf-8"))
+    assert summary["source"] == "llm"
+    assert summary["n_events"] == 2
+    # Per-event-type aggregate
+    by_type = {row["event_type"]: row for row in summary["per_event_type"]}
+    assert "earnings_beat" in by_type
+    assert by_type["earnings_beat"]["n"] == 2

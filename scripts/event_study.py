@@ -593,6 +593,206 @@ def load_events(
     return df.sort_values(["event_date", "instrument"]).reset_index(drop=True)
 
 
+def _t_test_one_sample(values: pd.Series) -> tuple[float, float]:
+    """Two-sided one-sample t-test of H0: mean=0.
+
+    Returns (t_statistic, p_value). For n<2 or zero variance returns
+    (nan, nan) — the caller is expected to record the abstain rather
+    than treat as significant.
+    """
+    vals = pd.Series(values).dropna()
+    n = int(len(vals))
+    if n < 2:
+        return float("nan"), float("nan")
+    mean = float(vals.mean())
+    std = float(vals.std(ddof=1))
+    if std < 1e-12:
+        return float("nan"), float("nan")
+    t = mean / (std / (n ** 0.5))
+    # Defer scipy import — only needed for the p-value side
+    try:
+        from scipy import stats  # heavy import
+        # two-sided p-value
+        p = float(2.0 * (1.0 - stats.t.cdf(abs(t), df=n - 1)))
+    except Exception:  # pragma: no cover — scipy missing
+        p = float("nan")
+    return float(t), p
+
+
+def summarize_panel(
+    panel: pd.DataFrame,
+    *,
+    window_lo: int,
+    window_hi: int,
+) -> pd.DataFrame:
+    """Aggregate the panel by ``event_type``.
+
+    Returns one row per event_type with:
+      - n: number of events
+      - mean_offset_<k> + std_offset_<k> for every offset in [lo, hi]
+      - t_stat_offset_0, p_value_offset_0 (H0: mean abnormal ret = 0)
+      - t_stat_offset_+1, p_value_offset_+1 (next-day reaction)
+
+    Column-name format follows ``offset_column_name`` for the per-offset
+    aggregates; the stat-test columns are renamed without the ``+0``
+    sign because that's the conventional academic notation.
+    """
+    if panel is None or panel.empty:
+        return pd.DataFrame(
+            columns=["event_type", "n"]
+        )
+    offsets = list(range(window_lo, window_hi + 1))
+    rows: list[dict] = []
+    for etype, sub in panel.groupby("event_type"):
+        row: dict = {"event_type": str(etype), "n": int(len(sub))}
+        for off in offsets:
+            col = offset_column_name(off)
+            if col not in sub.columns:
+                continue
+            ser = sub[col].dropna()
+            # display name aligns "+0" → "0" for the academic stat keys
+            disp = f"+{off}" if off > 0 else (str(off) if off < 0 else "0")
+            row[f"mean_offset_{disp}"] = (
+                float(ser.mean()) if not ser.empty else float("nan")
+            )
+            row[f"std_offset_{disp}"] = (
+                float(ser.std(ddof=1)) if len(ser) > 1 else float("nan")
+            )
+            if off in (0, 1):
+                t, p = _t_test_one_sample(sub[col])
+                row[f"t_stat_offset_{disp}"] = t
+                row[f"p_value_offset_{disp}"] = p
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def write_outputs(
+    *,
+    panel: pd.DataFrame,
+    source: str,
+    start: str,
+    end: str,
+    window_lo: int,
+    window_hi: int,
+    out_dir: Path,
+    emit_plot: bool = True,
+) -> dict[str, Path]:
+    """Write CSV / summary.json / (optional) PNG for one event study.
+
+    Returns dict mapping ``{"csv", "summary", "png"}`` → ``Path``. The
+    PNG entry is present only if ``emit_plot`` is True and the panel
+    is non-empty.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"{source}_{start}_{end}"
+
+    # CSV
+    csv_path = out_dir / f"{stem}.csv"
+    tmp = csv_path.with_suffix(csv_path.suffix + ".tmp")
+    if panel is None or panel.empty:
+        pd.DataFrame(
+            columns=list(EVENT_OUTPUT_COLUMNS)
+            + [offset_column_name(k) for k in range(window_lo, window_hi + 1)]
+        ).to_csv(tmp, index=False)
+    else:
+        panel.to_csv(tmp, index=False)
+    tmp.replace(csv_path)
+
+    # Summary JSON
+    summary_df = summarize_panel(panel, window_lo=window_lo, window_hi=window_hi)
+    summary_payload = {
+        "source": source,
+        "start": start,
+        "end": end,
+        "window": [window_lo, window_hi],
+        "n_events": int(len(panel)) if panel is not None else 0,
+        "per_event_type": summary_df.to_dict(orient="records"),
+    }
+    summary_path = out_dir / f"{stem}.summary.json"
+    summary_path.write_text(
+        json.dumps(summary_payload, ensure_ascii=False, indent=2,
+                   default=_json_default),
+        encoding="utf-8",
+    )
+
+    paths: dict[str, Path] = {"csv": csv_path, "summary": summary_path}
+
+    if emit_plot and panel is not None and not panel.empty:
+        png_path = _plot_event_curves(
+            panel=panel, summary=summary_df,
+            window_lo=window_lo, window_hi=window_hi,
+            out_path=out_dir / f"{stem}.png",
+            title=f"{source} {start} → {end}",
+        )
+        if png_path is not None:
+            paths["png"] = png_path
+    return paths
+
+
+def _json_default(obj):
+    if isinstance(obj, (pd.Timestamp,)):
+        return obj.strftime("%Y-%m-%d")
+    if pd.isna(obj):
+        return None
+    raise TypeError(f"unserializable {type(obj)}")
+
+
+def _plot_event_curves(
+    *,
+    panel: pd.DataFrame,
+    summary: pd.DataFrame,
+    window_lo: int,
+    window_hi: int,
+    out_path: Path,
+    title: str,
+) -> Path | None:
+    """Matplotlib figure: mean ± std band per event_type across offsets.
+
+    Returns the written path, or None if matplotlib is unavailable.
+    """
+    try:
+        import matplotlib  # noqa: F401
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover — matplotlib missing
+        logger.warning("event_study: matplotlib unavailable (%s); PNG skipped.",
+                       exc)
+        return None
+    offsets = list(range(window_lo, window_hi + 1))
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for _, row in summary.iterrows():
+        etype = row["event_type"]
+        means = []
+        stds = []
+        for off in offsets:
+            disp = f"+{off}" if off > 0 else (str(off) if off < 0 else "0")
+            means.append(row.get(f"mean_offset_{disp}", float("nan")))
+            stds.append(row.get(f"std_offset_{disp}", 0.0) or 0.0)
+        ax.plot(offsets, means, marker="o", label=f"{etype} (n={int(row['n'])})")
+        # Fill ±1 std band (when n > 1 only — single events have NaN std)
+        if any(pd.notna(s) and s > 0 for s in stds):
+            import numpy as np
+            arr_m = np.array(means, dtype=float)
+            arr_s = np.array([s if pd.notna(s) else 0.0 for s in stds], dtype=float)
+            ax.fill_between(offsets, arr_m - arr_s, arr_m + arr_s, alpha=0.15)
+    ax.axhline(0.0, color="grey", linewidth=0.5)
+    ax.axvline(0, color="grey", linewidth=0.5, linestyle=":")
+    ax.set_xlabel("trading-day offset relative to event_date")
+    ax.set_ylabel("mean excess return")
+    ax.set_title(f"PE-6 event study — {title}")
+    ax.legend(loc="best", fontsize=8)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    # matplotlib infers the file format from the suffix, so a .png.tmp
+    # tmpfile would fail. Pass format= explicitly.
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    fig.savefig(tmp, dpi=120, format=out_path.suffix.lstrip(".") or "png")
+    plt.close(fig)
+    tmp.replace(out_path)
+    return out_path
+
+
 def parse_args(argv: list[str] | None = None) -> EventStudyConfig:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -609,19 +809,88 @@ def parse_args(argv: list[str] | None = None) -> EventStudyConfig:
     )
 
 
+def run_event_study(
+    cfg: EventStudyConfig,
+    *,
+    close_loader=None,
+    theme_to_basket: dict[str, list[str]] | None = None,
+) -> dict[str, Path]:
+    """Top-level driver used by ``main()`` and integration tests.
+
+    Steps: load_events → (optional) broadcast_theme_events →
+    build_excess_return_panel → write_outputs (CSV + summary.json + PNG).
+    """
+    events = load_events(
+        source=cfg.source, start=cfg.start, end=cfg.end,
+    )
+    logger.info(
+        "event_study: loaded %d events from %s (%s..%s)",
+        len(events), cfg.source, cfg.start, cfg.end,
+    )
+
+    # PE-4 / theme broadcast — at the event-loader step a THEME_X row is
+    # one row; broadcast to basket members BEFORE the return panel so
+    # per-stock excess returns are well-defined.
+    if cfg.source == "pe4":
+        events = broadcast_theme_events(events, theme_to_basket=theme_to_basket)
+        logger.info("event_study: post-broadcast event rows = %d", len(events))
+
+    # Optional per-event-type cap (very dense LLM streams).
+    if cfg.top_n is not None and not events.empty:
+        # Keep the first top_n per event_type by event_date.
+        events = (
+            events.sort_values(["event_type", "event_date"])
+                  .groupby("event_type", as_index=False)
+                  .head(cfg.top_n)
+                  .reset_index(drop=True)
+        )
+        logger.info("event_study: capped to %d events after --top-n=%d",
+                    len(events), cfg.top_n)
+
+    if events.empty:
+        logger.warning("event_study: no events to study — empty outputs.")
+        return write_outputs(
+            panel=events,
+            source=cfg.source, start=cfg.start, end=cfg.end,
+            window_lo=cfg.window_lo, window_hi=cfg.window_hi,
+            out_dir=cfg.out_dir,
+            emit_plot=False,
+        )
+
+    if close_loader is None:
+        from config.qlib_runtime import init_qlib
+        init_qlib(str(DATA_DIR / "qlib_data" / "cn_data"))
+        close_loader = qlib_close_loader
+
+    panel = build_excess_return_panel(
+        events=events,
+        benchmark=cfg.benchmark,
+        window_lo=cfg.window_lo, window_hi=cfg.window_hi,
+        close_loader=close_loader,
+    )
+    logger.info(
+        "event_study: panel rows = %d (covered) / %d (loaded)",
+        len(panel), len(events),
+    )
+    return write_outputs(
+        panel=panel,
+        source=cfg.source, start=cfg.start, end=cfg.end,
+        window_lo=cfg.window_lo, window_hi=cfg.window_hi,
+        out_dir=cfg.out_dir,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     cfg = parse_args(argv)
-    # Step 1: only the CLI shape is implemented; later steps fill in
-    # event loading, return alignment, aggregation, plotting.
     logger.info("PE-6 event_study config: %s", cfg)
-    raise NotImplementedError(
-        "PE-6 step 1 stub — event loader + return alignment land in "
-        "subsequent commits."
-    )
+    paths = run_event_study(cfg)
+    for k, p in paths.items():
+        logger.info("event_study: wrote %s → %s", k, p)
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover
