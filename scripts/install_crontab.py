@@ -286,15 +286,23 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         # (after-close, using __label_1d). Two jobs not one so the
         # morning generation is never blocked by yesterday's realised
         # data being late.
+        # cx batch G P2 #6 (2026-06-07): enforce_deps wired up — both
+        # gate on YESTERDAY's lgb_after_close_smoke + champion_cache_rebuild
+        # via JOB_DEPS_PREV_BDAY (these run at 09:00 / 16:30 before
+        # today's 18:30 cache rebuild). Short dep_wait_seconds because
+        # the prior business day's status is either present or never
+        # coming — polling is pointless.
         CronJob("shadow_paper_trade_generate", "00 09 * * 1-5",
                 [py, str(scripts / "shadow_paper_trade.py")],
                 "shadow_paper_trade_generate.log",
-                network="none", timeout_sec=600),
+                network="none", timeout_sec=600,
+                enforce_deps=True, dep_wait_seconds=120),
         CronJob("shadow_paper_trade_backfill", "30 16 * * 1-5",
                 [py, str(scripts / "shadow_paper_trade.py"),
                  "--backfill"],
                 "shadow_paper_trade_backfill.log",
-                network="none", timeout_sec=300),
+                network="none", timeout_sec=300,
+                enforce_deps=True, dep_wait_seconds=120),
         # NOTE: The 17:30 llm_event_retry full-rerun was REMOVED 2026-05-31.
         # Reason (cx code review): factors/llm_event_extractor_v2.py:332-335
         # deletes any existing jsonl with <500 lines before re-running. So a

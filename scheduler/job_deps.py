@@ -164,6 +164,22 @@ JOB_DEPS: dict[str, list[str]] = {
     "sell_check": [],
     "daily_summary": [],
     "evening_outlook": ["qlib_data_update"],
+    # ---- Shadow paper-trade (xgb_209_llm promotion gate) ---------------
+    # cx batch G P2 #6 (2026-06-07): added to JOB_DEPS so daily_status
+    # reports these jobs and the 5-day shadow window appears in the
+    # DAG dashboard. The real upstreams are CROSS-DAY and live in
+    # JOB_DEPS_PREV_BDAY:
+    #   - generate (09:00) consumes the *_latest.parquet that
+    #     champion_cache_rebuild produced YESTERDAY at 18:30 and the
+    #     lgb_after_close_smoke that ran YESTERDAY at 18:35.
+    #   - backfill (16:30) reads YESTERDAY's picks JSON and the
+    #     YESTERDAY's *_latest.parquet for __label_1d; today's
+    #     champion_cache_rebuild hasn't fired yet at 16:30.
+    # Therefore same-day deps are EMPTY here (the right answer is
+    # "nothing same-day blocks this"), prev-bday lives in
+    # JOB_DEPS_PREV_BDAY below.
+    "shadow_paper_trade_generate": [],
+    "shadow_paper_trade_backfill": [],
     # ---- Ancillary ------------------------------------------------------
     "risk_check": [],
     "daily_health_check": ["qlib_data_update"],
@@ -190,6 +206,16 @@ JOB_DEPS_PREV_BDAY: dict[str, list[str]] = {
     # Saturday 04:00 weekly_full_retrain wants Friday's 18:25 cache —
     # not Saturday's, which never ran.
     "weekly_full_retrain": ["feature_cache_rebuild"],
+    # cx batch G P2 #6 (2026-06-07): shadow paper-trade reads the
+    # *_latest.parquet produced by yesterday's 18:30
+    # champion_cache_rebuild. generate at 09:00 and backfill at 16:30
+    # both run BEFORE today's champion_cache_rebuild (18:30) so the
+    # real upstream is always the prior business day.
+    "shadow_paper_trade_generate": [
+        "lgb_after_close_smoke",
+        "champion_cache_rebuild",
+    ],
+    "shadow_paper_trade_backfill": ["lgb_after_close_smoke"],
 }
 
 
