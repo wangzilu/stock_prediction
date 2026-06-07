@@ -870,6 +870,11 @@ def _append_to_event_store(
 
     publish_time = source_row.get("publish_date", "")
     summary_text = (source_row.get("title") or "")[:200]
+    # PE-5 (task #144): we pass publish_time only; EventStore.add_event's
+    # strict PIT contract derives available_time / signal_date /
+    # execution_date for us. If publish_time is empty the write will be
+    # rejected with PITContractError, surfaced as a warning below — a
+    # missing publish_date upstream is itself a data-quality bug.
     try:
         store.add_event({
             "date": publish_time,
@@ -880,6 +885,7 @@ def _append_to_event_store(
             "confidence": confidence,
             "summary": summary_text,
             "publish_time": publish_time,
+            "event_time": publish_time,
             "topic": row.get("tool_type", "other"),
             "is_policy": True,
         })
@@ -939,6 +945,8 @@ def _append_to_event_store_sc(
             "MARKET" if industry == "__market__"
             else f"INDUSTRY_{industry.upper()}"
         )
+        # PE-5: publish_time is required by the strict PIT contract;
+        # EventStore derives the other 3 time fields.
         try:
             store.add_event({
                 "date": publish_time,
@@ -949,6 +957,7 @@ def _append_to_event_store_sc(
                 "confidence": confidence,
                 "summary": summary_text,
                 "publish_time": publish_time,
+                "event_time": publish_time,
                 "topic": industry,
                 "is_policy": True,
             })
@@ -991,6 +1000,7 @@ def _append_to_event_store_nbs(
 
     publish_time = source_row.get("publish_date", "")
     summary_text = (source_row.get("title") or "")[:200]
+    # PE-5: only publish_time is supplied; EventStore derives the rest.
     try:
         store.add_event({
             "date": publish_time,
@@ -1001,6 +1011,7 @@ def _append_to_event_store_nbs(
             "confidence": confidence,
             "summary": summary_text,
             "publish_time": publish_time,
+            "event_time": publish_time,
             "topic": series,
             "is_policy": True,
         })
