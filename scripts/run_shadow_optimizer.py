@@ -190,6 +190,16 @@ def main():
         logger.info(f"\n  Orders generated, awaiting T+1 open for reconciliation.")
         return
 
+    # cx batch B P2 #4: shadow must NOT auto-compare on a no-decision day
+    # — daily_compare would otherwise log a fake 0 excess vs champion.
+    if isinstance(pnl, dict) and pnl.get("status") == "no_decision":
+        logger.warning(
+            "\n  No decision for %s — reason=%s. Skipping daily_compare "
+            "(no comparable PnL to log).",
+            date, pnl.get("reason", "no_predictions"),
+        )
+        return
+
     logger.info(f"\nDaily summary:")
     logger.info(f"  Value: {pnl.get('total_value', 0):,.2f}")
     logger.info(f"  Return: {pnl.get('daily_return', 0):+.4f}")

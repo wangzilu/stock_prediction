@@ -200,6 +200,23 @@ def main():
         logger.info(f"  Run again tomorrow after 10:00 to reconcile.")
         return
 
+    # cx batch B P2 #4: distinguish "no decision today" from a real PnL
+    # day. Pre-fix the daily summary would print Return: +0.0000 making
+    # this look like a flat trading day; downstream daily_compare would
+    # then average a 0 against a real shadow return.
+    if isinstance(pnl, dict) and pnl.get("status") == "no_decision":
+        logger.warning(
+            "\n  No decision for %s — reason=%s. Daily ledger NOT updated "
+            "(would otherwise appear as a real flat-PnL day).",
+            date, pnl.get("reason", "no_predictions"),
+        )
+        logger.info(
+            "  Positions held unchanged: %d, total value: %s",
+            pnl.get("n_positions", 0),
+            f"{pnl.get('total_value'):,.2f}" if pnl.get("total_value") else "n/a",
+        )
+        return
+
     logger.info(f"\nDaily summary:")
     logger.info(f"  Value: {pnl.get('total_value', 0):,.2f}")
     logger.info(f"  Return: {pnl.get('daily_return', 0):+.4f}")

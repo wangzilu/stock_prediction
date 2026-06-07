@@ -1287,11 +1287,38 @@ class PaperOMS:
 
             gen = self.generate_orders(date)
             if gen.get("status") in ("no_predictions",):
-                # Still update holding days and PnL
-                self.update_holding_days()
-                pnl = self.compute_daily_pnl(date)
-                self._save_state()
-                return pnl
+                # cx batch B P2 #4 (same-exam): previously this still
+                # called update_holding_days() + compute_daily_pnl() +
+                # _save_state(), which appended a daily_pnl_history
+                # entry indistinguishable from a real trading day. The
+                # daily_summary downstream would then plot a flat PnL
+                # line for what was actually a NON-DECISION day (no
+                # signals, sanitizer rejected everything, or feed was
+                # empty). Short-circuit instead: do not advance holding
+                # counters, do not compute PnL, do not persist state.
+                # Surface a distinct status so daily_summary can render
+                # this as "no decision today" rather than a normal day.
+                logger.warning(
+                    "  No predictions / all rejected for %s — short-circuiting: "
+                    "holding-day counters NOT advanced, PnL NOT recorded, "
+                    "state NOT persisted (would otherwise look like a real "
+                    "trading day in daily_summary).",
+                    date,
+                )
+                return {
+                    "status": "no_decision",
+                    "signal_date": date,
+                    "reason": gen.get("status"),
+                    "message": (
+                        "No actionable predictions for this signal date. "
+                        "Holding-day counters and PnL ledger left unchanged."
+                    ),
+                    # surface current portfolio summary so callers can
+                    # still show position counts without it being mistaken
+                    # for a fresh PnL record.
+                    "n_positions": len(self.state.get("positions", {})),
+                    "total_value": self.state.get("total_value"),
+                }
             rec = self.reconcile(date)
             if rec.get("status") == "pending":
                 logger.info("  Reconciliation deferred (T+1 data not available)")
