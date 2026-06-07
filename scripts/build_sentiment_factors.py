@@ -63,11 +63,20 @@ MAX_RANK = 50  # heat_score uses MAX_RANK + 1 − rank so 1 → 50 points
 
 
 def _stock_code_to_qlib_code(stock_code: str) -> str:
-    """Convert 6-digit stock_code to qlib instrument key (sh600519)."""
+    """Convert 6-digit stock_code to qlib instrument key (SH600519).
+
+    cx F.P1 #4 (2026-06-07): qlib_code MUST be UPPERCASE so the
+    eventual FeatureMerger reindex (case-sensitive against the
+    UPPERCASE training index) hits. Pre-fix the prefix was lowercase
+    (``sh`` / ``sz``) — sentiment_factors.parquet isn't yet consumed
+    by FeatureMerger, but fixing the producer now stops the same
+    silent-zero-column class of bug seen on guba_factors.parquet
+    from ever landing once a sentiment loader is wired.
+    """
     sc = (stock_code or "").strip().upper()
     if len(sc) != 6 or not sc.isdigit():
         return ""
-    prefix = "sh" if sc.startswith("6") else "sz"
+    prefix = "SH" if sc.startswith("6") else "SZ"
     return f"{prefix}{sc}"
 
 
@@ -112,10 +121,44 @@ def per_day_factors(rows: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
+def _migrate_lowercase_parquet_to_uppercase(output_path: Path) -> None:
+    """One-shot in-place migration for cx F.P1 #4.
+
+    Before the 2026-06-07 case fix, ``sentiment_factors.parquet`` was
+    written with lowercase qlib instruments (``sh600519``). Reads the
+    existing parquet, uppercases the instrument level of the
+    MultiIndex, rewrites the file. Logs
+    ``[sentiment-case-migration] N rows uppercased``. Second run is a
+    no-op (sees already-uppercase index).
+    """
+    if not output_path.exists():
+        return
+    try:
+        existing = pd.read_parquet(str(output_path))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[sentiment-case-migration] read failed, skipping: %s", exc)
+        return
+    if not isinstance(existing.index, pd.MultiIndex) or existing.index.nlevels < 2:
+        return
+    inst_level_vals = existing.index.get_level_values(1).astype(str)
+    upper_vals = inst_level_vals.str.upper()
+    n_changed = int((inst_level_vals != upper_vals).sum())
+    if n_changed == 0:
+        return
+    existing.index = existing.index.set_levels(
+        existing.index.levels[1].astype(str).str.upper(), level=1,
+    )
+    existing.to_parquet(str(output_path))
+    logger.info("[sentiment-case-migration] %d rows uppercased", n_changed)
+
+
 def build_factors(
     sentiment_dir: Path = SENTIMENT_DIR,
     output_path: Path = OUTPUT_PATH,
 ) -> pd.DataFrame:
+    # cx F.P1 #4: one-shot migration of pre-fix lowercase parquet.
+    _migrate_lowercase_parquet_to_uppercase(output_path)
+
     if not sentiment_dir.exists():
         raise FileNotFoundError(
             f"sentiment dir missing: {sentiment_dir}. "
