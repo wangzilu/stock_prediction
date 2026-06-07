@@ -215,6 +215,8 @@ def _load_pre_extracted_events(
                     e.setdefault("date", d)
                     if source == "llm_v2":
                         events.extend(_v2_event_to_v1_shape(e))
+                    elif source == "llm":
+                        events.append(_llm_v1_to_propagation_shape(e))
                     else:
                         events.append(e)
     if events:
@@ -313,6 +315,39 @@ def _v2_event_to_v1_shape(v2_event: dict) -> list[dict]:
                 "source": "llm_v2",
             })
     return out
+
+
+# Evidence-level → confidence floor for v1-LLM events. The LLM extractor
+# emits a categorical evidence_level instead of a numeric confidence, so
+# we map it to a [0,1] floor that combines with chain_relevance_score
+# (0-10) for the final confidence used by propagate_scores.
+_LLM_V1_EVIDENCE_FLOOR = {
+    "major_media": 0.7,
+    "trade_press": 0.55,
+    "company_pr":  0.5,
+    "rumor":       0.3,
+}
+
+
+def _llm_v1_to_propagation_shape(e: dict) -> dict:
+    """Translate one v1-LLM event (``global_entity`` + ``chain_relevance_score``)
+    into the shape ``propagate_scores`` consumes (``source_entity`` +
+    numeric ``confidence``). Returns the event in-place with extra keys
+    so unaffected downstream readers keep working.
+
+    Without this, B.7-LLM ablation produced 0 propagation pairs because
+    ``_match_event_to_edges`` looked up ``source_entity`` but the LLM
+    pipeline only ever wrote ``global_entity``.
+    """
+    if "source_entity" not in e and "global_entity" in e:
+        e["source_entity"] = e["global_entity"]
+    if "confidence" not in e:
+        rel = float(e.get("chain_relevance_score", 0.0) or 0.0) / 10.0
+        floor = _LLM_V1_EVIDENCE_FLOOR.get(
+            (e.get("evidence_level") or "").lower(), 0.4,
+        )
+        e["confidence"] = max(0.0, min(1.0, max(floor, rel)))
+    return e
 
 
 def load_events_from_news(
