@@ -254,19 +254,25 @@ PRODUCTION_SUPPLEMENTARY_GROUPS: tuple[str, ...] = (
 # xgb_209_* profile, minus what's already in PRODUCTION_SUPPLEMENTARY_GROUPS.
 # Sorted for stable diffs in code review. xgb_174 / xgb_242 are
 # grandfathered productions, not candidates, so excluded from the union.
-_CANDIDATE_209_PROFILES: tuple[str, ...] = (
-    "xgb_209_chain",
-    "xgb_209_chain_llm",
-    "xgb_209_pbc",
-    "xgb_209_guba",
-    "xgb_209_llm",
-)
-
-
 def _derive_shadow_supplementary_groups() -> tuple[str, ...]:
-    """Union of candidate-profile supp groups minus production groups."""
+    """Union of candidate-profile supp groups minus production groups.
+
+    2026-06-07 follow-up: pre-fix this iterated a HARDCODED tuple of
+    candidate profile names. The F+C subagent then added xgb_209_xwlb
+    in the same review wave, and the hardcoded list missed it — the
+    new xinwen_lianbo loader silently fell outside the staging pool
+    even though it WAS in a candidate profile. The drift would have
+    repeated for every future candidate. Now: discover candidate
+    profiles dynamically — any SUPPLEMENTARY_GROUPS_BY_PROFILE key
+    that's an xgb_209_* variant (other than the live production
+    ``xgb_209``) counts as a candidate.
+    """
+    candidate_profiles = tuple(
+        p for p in SUPPLEMENTARY_GROUPS_BY_PROFILE
+        if p.startswith("xgb_209_") and p != "xgb_209"
+    )
     union: set[str] = set()
-    for profile in _CANDIDATE_209_PROFILES:
+    for profile in candidate_profiles:
         for group in SUPPLEMENTARY_GROUPS_BY_PROFILE.get(profile, ()):
             union.add(group)
     return tuple(sorted(union - set(PRODUCTION_SUPPLEMENTARY_GROUPS)))
