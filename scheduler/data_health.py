@@ -603,6 +603,40 @@ OPTIONAL_SOURCES = [
 ]
 
 
+def _resolve_profile_critical_sources() -> list[str]:
+    """Derive the critical-source list from the live PRODUCTION_MODEL_PROFILE.
+
+    cx batch D P1 #2 (2026-06-07): pre-fix CRITICAL_SOURCES was a
+    hand-maintained list that drifted from the production profile's
+    supplementary groups. When the default profile flipped from
+    xgb_242 → xgb_209 on 2026-06-06 the hardcoded list was not
+    updated, so a stale ``st_daily_basic_update`` (now critical to
+    xgb_209) would slip past the gate as "OPTIONAL/OVERLAY-only".
+
+    The right list is: every loader-group the LIVE profile reads,
+    mapped through ``PRODUCTION_GROUP_TO_HEALTH_SOURCE``, unioned
+    with the hardcoded CRITICAL_SOURCES floor (qlib_data_update +
+    legacy supp sources stay critical regardless of profile). Groups
+    without a health source (e.g. macro_zero_baseline, which maps to
+    qlib_data_update; or research-only groups not in the table) are
+    skipped silently — the explicit map is the contract.
+    """
+    from config.production_features import (
+        PRODUCTION_MODEL_PROFILE,
+        SUPPLEMENTARY_GROUPS_BY_PROFILE,
+    )
+
+    sources: list[str] = list(CRITICAL_SOURCES)  # hard floor
+    supp_groups = SUPPLEMENTARY_GROUPS_BY_PROFILE.get(
+        PRODUCTION_MODEL_PROFILE, ()
+    )
+    for group in supp_groups:
+        health_source = PRODUCTION_GROUP_TO_HEALTH_SOURCE.get(group)
+        if health_source and health_source not in sources:
+            sources.append(health_source)
+    return sources
+
+
 def check_training_gate(date: str = None) -> dict:
     """Check if it's safe to train/predict today.
 
@@ -612,8 +646,13 @@ def check_training_gate(date: str = None) -> dict:
     expected latest-trading-date too, not just success=True. A
     "qlib_data_update success=True latest_date=yesterday" record is
     no longer treated as fresh enough to train on.
+
+    cx batch D P1 #2 (2026-06-07): critical list is derived from
+    the LIVE PRODUCTION_MODEL_PROFILE in addition to the hardcoded
+    CRITICAL_SOURCES floor. See ``_resolve_profile_critical_sources``.
     """
-    result = check_freshness(CRITICAL_SOURCES, date, require_latest_date=True)
+    critical_sources = _resolve_profile_critical_sources()
+    result = check_freshness(critical_sources, date, require_latest_date=True)
     if not result["all_fresh"]:
         return {
             "gate": "fail",
