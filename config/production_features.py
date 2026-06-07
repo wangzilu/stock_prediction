@@ -219,10 +219,45 @@ PRODUCTION_SUPPLEMENTARY_GROUPS: tuple[str, ...] = (
 # "frozen-and-grandfathered", not "validated".
 
 
-SHADOW_SUPPLEMENTARY_GROUPS: tuple[str, ...] = ()
-# Loader groups that exist on FeatureMerger but have NOT yet earned
-# a slot in production. Empty today — every existing loader is
-# grandfathered into PRODUCTION_SUPPLEMENTARY_GROUPS pending #102.
+# cx batch D P2 #6 (2026-06-07): SHADOW_SUPPLEMENTARY_GROUPS is the
+# explicit pool for loaders wired through FeatureMerger that are
+# CURRENTLY consumed by one or more candidate xgb_209_* profiles but
+# have NOT yet earned promotion into PRODUCTION_SUPPLEMENTARY_GROUPS.
+# Pre-fix this was hardcoded ``()`` while six candidate profiles
+# (xgb_209_chain / _chain_llm / _pbc / _guba / _llm) already consumed
+# loader groups beyond the production tuple — the staging pool was
+# effectively undocumented. New loaders MUST land here first;
+# promotion to PRODUCTION_SUPPLEMENTARY_GROUPS only after ablation
+# evidence (Phase B-style 24-split or hold-out LOO, ΔRankIC ≥ +0.005
+# or net-positive cost-adjusted backtest).
+#
+# Derived programmatically: union of supp groups across every candidate
+# xgb_209_* profile, minus what's already in PRODUCTION_SUPPLEMENTARY_GROUPS.
+# Sorted for stable diffs in code review. xgb_174 / xgb_242 are
+# grandfathered productions, not candidates, so excluded from the union.
+_CANDIDATE_209_PROFILES: tuple[str, ...] = (
+    "xgb_209_chain",
+    "xgb_209_chain_llm",
+    "xgb_209_pbc",
+    "xgb_209_guba",
+    "xgb_209_llm",
+)
+
+
+def _derive_shadow_supplementary_groups() -> tuple[str, ...]:
+    """Union of candidate-profile supp groups minus production groups."""
+    union: set[str] = set()
+    for profile in _CANDIDATE_209_PROFILES:
+        for group in SUPPLEMENTARY_GROUPS_BY_PROFILE.get(profile, ()):
+            union.add(group)
+    return tuple(sorted(union - set(PRODUCTION_SUPPLEMENTARY_GROUPS)))
+
+
+SHADOW_SUPPLEMENTARY_GROUPS: tuple[str, ...] = _derive_shadow_supplementary_groups()
+# Loader groups that exist on FeatureMerger and are consumed by at least
+# one candidate xgb_209_* profile but have NOT yet earned a slot in
+# production. New loaders MUST land here first; promotion to
+# PRODUCTION_SUPPLEMENTARY_GROUPS only after ablation evidence.
 
 
 # Explicit sentinel for research scripts that legitimately want every
