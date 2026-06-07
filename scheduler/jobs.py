@@ -1504,7 +1504,20 @@ class DailyPipeline:
                     volume=volume,
                     macro_score=stock_macro,
                 )
-                # 2026-06-03 P0: do NOT filter on `short_score <= 0`. Per cx code review of the 22:00 0-recommendation incident, the trained model (242 features) is fed only 158 features at inference (no merge_for_inference call in models/short_term.py), so XGBoost follows the missing-value default branch on 84 cols, producing a narrow leaf-set whose sign on any given day is roughly coin-flip. Filtering `<= 0` silently swallows half the days. Rank order is the right signal; let the sort downstream pick top-K.
+                # 2026-06-03 P0: do NOT filter on `short_score <= 0`.
+                # Original context: the 22:00 0-recommendation incident
+                # was caused by feature-count mismatch (model trained on
+                # 242 features, inference fed only 158). That underlying
+                # bug is fixed (ShortTermModel.load_from_pickle now does
+                # contract + dim gate at models/short_term.py:357 and
+                # injects supplementary features via FeatureMerger). But
+                # the no-negative-filter convention was validated as the
+                # right ranking strategy independently — rank order on
+                # the full distribution beats a one-sided <=0 cut on
+                # several backtests. So this conservative choice stays
+                # by sorting policy, not by dim-mismatch necessity.
+                # cx P3 #5 2026-06-07: comment rewritten so future readers
+                # don't think the dim bug is still live.
                 candidate = {
                     "code": code, "name": name, "market": market,
                     "short_score": short_score,
@@ -1546,7 +1559,20 @@ class DailyPipeline:
                     volume=_finite_float(row.get("成交量")),
                     macro_score=stock_macro,
                 )
-                # 2026-06-03 P0: do NOT filter on `short_score <= 0`. Per cx code review of the 22:00 0-recommendation incident, the trained model (242 features) is fed only 158 features at inference (no merge_for_inference call in models/short_term.py), so XGBoost follows the missing-value default branch on 84 cols, producing a narrow leaf-set whose sign on any given day is roughly coin-flip. Filtering `<= 0` silently swallows half the days. Rank order is the right signal; let the sort downstream pick top-K.
+                # 2026-06-03 P0: do NOT filter on `short_score <= 0`.
+                # Original context: the 22:00 0-recommendation incident
+                # was caused by feature-count mismatch (model trained on
+                # 242 features, inference fed only 158). That underlying
+                # bug is fixed (ShortTermModel.load_from_pickle now does
+                # contract + dim gate at models/short_term.py:357 and
+                # injects supplementary features via FeatureMerger). But
+                # the no-negative-filter convention was validated as the
+                # right ranking strategy independently — rank order on
+                # the full distribution beats a one-sided <=0 cut on
+                # several backtests. So this conservative choice stays
+                # by sorting policy, not by dim-mismatch necessity.
+                # cx P3 #5 2026-06-07: comment rewritten so future readers
+                # don't think the dim bug is still live.
 
                 flow_score = self._capital_flow_score(qlib_code)
                 candidate = {
