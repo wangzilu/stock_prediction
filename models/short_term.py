@@ -157,8 +157,13 @@ class ShortTermModel:
         # health gate can surface the gap explicitly.
         latest_ts = pd.Timestamp(latest_date)
         stale_mask = selected_dates < latest_ts
-        n_stale = int(stale_mask.sum())
-        if n_stale:
+        # cx round 23 E.P1 #2: capture the pre-filter stale count. The
+        # subsequent filter drops stale rows, so recomputing from the
+        # filtered selected_dates would always yield 0 and the yellow-gate
+        # in scheduler/jobs.py would never fire even when stale rows
+        # existed before the drop.
+        pre_filter_stale_count = int(stale_mask.sum())
+        if pre_filter_stale_count:
             latest = latest.loc[~stale_mask]
             selected_dates = selected_dates.loc[~stale_mask]
 
@@ -169,12 +174,9 @@ class ShortTermModel:
             latest.attrs["latest_date"] = pd.Timestamp(latest_date).strftime("%Y-%m-%d")
         except Exception:
             latest.attrs["latest_date"] = str(latest_date)
-        try:
-            latest.attrs["stale_prediction_count"] = int(
-                (selected_dates < pd.Timestamp(latest_date)).sum()
-            )
-        except Exception:
-            latest.attrs["stale_prediction_count"] = 0
+        # Surface the PRE-filter stale count so the distribution-health
+        # yellow-gate (scheduler/jobs.py:350) actually sees the gap.
+        latest.attrs["stale_prediction_count"] = pre_filter_stale_count
         return latest
 
     def initialize(self):
