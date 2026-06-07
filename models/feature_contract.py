@@ -208,10 +208,19 @@ def update_legacy_contract_alias(data_dir: Path, profile: str | None = None) -> 
 
 def load_contract(data_dir: Path, profile: str | None = None) -> dict | None:
     """Return the parsed contract dict, or None if the artifact does
-    not exist. Callers should treat None as "no gate yet — log and
-    continue" rather than as a fatal error, because there is a
-    bootstrap window between the first deploy of this module and the
-    first retrain that writes a contract."""
+    not exist.
+
+    cx round 23 E.P2 #5: callers MUST treat missing contract as fatal;
+    the bootstrap-warning path is decommissioned (cx round 22 P0-1). See
+    ``models/short_term.py`` line ~432 (``raise FeatureContractViolation``
+    when ``load_contract`` returns None) and
+    ``models/production_inference.py`` line ~167 (same fatal raise) —
+    both inference entry points refuse to serve without a contract.
+    Returning None here is a signal to the caller, NOT permission to fall
+    through to a count-only gate (which cannot catch loader reorder or
+    silent column swap — the exact failure modes this artifact pins).
+    The legacy "bootstrap window" language predates the round-22 lockdown
+    and is retained ONLY in the call-graph audit, not as live guidance."""
     from config.production_features import PRODUCTION_MODEL_PROFILE
     resolved_profile = (profile or PRODUCTION_MODEL_PROFILE).strip().lower()
 
