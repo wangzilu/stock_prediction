@@ -61,7 +61,21 @@ class RiskGuard:
                  # CX: drawdown recovery needs 5 consecutive days
                  drawdown_recovery_days: int = 5,
                  # State isolation: champion/shadow/backtest use separate dirs
-                 state_dir: str = None):
+                 state_dir: str = None,
+                 # cx batch B P2 #5 (same-exam): parameterise the STD20
+                 # source cache so RiskGuard's dynamic stop reads the
+                 # SAME feature cache the champion model trains/scores
+                 # on. Hard-coding feature_cache_174_holder_regime_ma
+                 # meant the stop threshold derived from a stale
+                 # 174-factor cache while the champion ran on the
+                 # 209-factor cache — risk-side vol and model-side vol
+                 # could disagree silently, and once the legacy 174
+                 # cache stops being maintained the dynamic stop
+                 # vanishes without alarm. Default to the live champion
+                 # cache; _get_dynamic_stop falls back to a Qlib-computed
+                 # STD20 if the cache or column is missing so the
+                 # dynamic stop never silently disappears.
+                 std20_cache: str = "feature_cache_209_latest.parquet"):
         self.hard_stop_pct = hard_stop_pct
         self.vol_stop_multiplier = vol_stop_multiplier
         self.vol_stop_min = vol_stop_min
@@ -70,6 +84,7 @@ class RiskGuard:
         self.cooldown_event_days = cooldown_event_days
         self.cooldown_st_until_clear = cooldown_st_until_clear
         self.drawdown_recovery_days = drawdown_recovery_days
+        self.std20_cache = std20_cache
 
         # Cached RL stop-loss agent (lazy-loaded on first use)
         self._rl_agent: Optional[object] = None
@@ -166,12 +181,20 @@ class RiskGuard:
     def _get_dynamic_stop(self, code: str, date: str = None) -> float:
         """CX: ATR/vol dynamic threshold with clip(0.12, 0.25).
 
-        Uses vol20 from feature cache as-of `date` (PIT-safe).
-        Falls back to hard_stop_pct if data unavailable.
+        Uses vol20 from the configured feature cache (default the live
+        champion cache, parameterised via __init__'s std20_cache arg)
+        as-of `date` (PIT-safe). If the cache or its STD20 column is
+        missing, falls back to a Qlib-computed STD20 so the dynamic
+        stop never silently disappears. Final fallback: hard_stop_pct.
+
+        same-exam (cx batch B P2 #5): risk-side and model-side vol must
+        come from the same feature source; pre-fix this read the
+        legacy 174 cache which was at risk of going stale or being
+        retired while the model ran on the 209 cache.
         """
         try:
             cache = pd.read_parquet(
-                DATA_DIR / "feature_cache_174_holder_regime_ma.parquet",
+                DATA_DIR / self.std20_cache,
                 columns=["STD20"],
             )
             code_lower = code.lower()
@@ -191,9 +214,41 @@ class RiskGuard:
                 vol20 = float(cache.loc[(use_date, code_lower), "STD20"])
                 if np.isfinite(vol20) and vol20 > 0:
                     return -max(0.12, min(0.25, self.vol_stop_multiplier * vol20))
-        except Exception:
-            pass
-        return self.hard_stop_pct  # fallback: -0.20
+        except Exception as e:
+            logger.debug(
+                "RiskGuard STD20 cache read failed for %s (%s) — "
+                "falling back to Qlib-computed STD20",
+                self.std20_cache, e,
+            )
+
+        # cx batch B P2 #5: Qlib fallback so the dynamic stop never
+        # silently disappears even when the cache is missing the column
+        # or the file altogether.
+        try:
+            from qlib.data import D
+            try:
+                D.calendar(freq="day", start_time="2020-01-01",
+                           end_time="2020-01-02")
+            except Exception:
+                from config.qlib_runtime import init_qlib
+                init_qlib(str(DATA_DIR / "qlib_data" / "cn_data"))
+            end_dt = pd.Timestamp(date) if date else pd.Timestamp.today()
+            start_dt = end_dt - pd.Timedelta(days=60)
+            df = D.features(
+                [code.lower()],
+                ["Std($close/Ref($close, 1) - 1, 20)"],
+                start_time=start_dt.strftime("%Y-%m-%d"),
+                end_time=end_dt.strftime("%Y-%m-%d"),
+            )
+            if df is not None and not df.empty:
+                last = df.iloc[-1, 0]
+                if np.isfinite(last) and float(last) > 0:
+                    return -max(0.12, min(0.25,
+                                          self.vol_stop_multiplier * float(last)))
+        except Exception as e:
+            logger.debug("RiskGuard Qlib STD20 fallback failed: %s", e)
+
+        return self.hard_stop_pct  # final fallback: -0.20
 
     def _check_hard_stop(self, positions, prices, constraints, date, xgb_ranks):
         """Check individual stock hard stop loss with dynamic threshold."""
