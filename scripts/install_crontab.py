@@ -29,24 +29,51 @@ END_MARKER = "# END STOCK_PREDICTION_CX"
 
 @dataclass(frozen=True)
 class CronJob:
+    """One cron entry the install_crontab renderer manages.
+
+    Contract for ``critical`` (cx batch G P2 #5, 2026-06-07):
+        Setting ``critical=True`` means "downstream consumers will hard-fail
+        or silently regress if this job didn't produce fresh output". The
+        renderer treats critical=True as IMPLYING enforce_deps=True even if
+        the caller forgot to set it — there is no scenario where a critical
+        job should fire against missing upstreams. Use ``enforce_deps=False``
+        explicitly only if you have a documented reason (none exist today).
+
+    Callers should still set ``dep_wait_seconds`` when they want a longer
+    poll budget than the 1800s default; critical doesn't change it.
+    """
+
     job_id: str
     schedule: str
     target: list[str]
     log_name: str
     network: str = "none"       # domestic/global/none/llm/push
     timeout_sec: int = 0        # 0 = no limit
-    critical: bool = False      # True = downstream depends on this
+    critical: bool = False      # True = downstream depends on this; auto-implies enforce_deps
     # When True, run_with_status is invoked with --enforce-deps so cron will
     # short-circuit (exit 75) if any upstream from scheduler.job_deps hasn't
     # successfully completed today. Opt-in per job so the first cycle after
     # rollout doesn't brick jobs whose upstream hasn't written its status
     # file yet.
+    # cx batch G P2 #5 (2026-06-07): the renderer treats this as True
+    # whenever critical=True, so this field is the "additional non-critical
+    # gating" knob.
     enforce_deps: bool = False
     # When enforce_deps is True, max wall-clock seconds the downstream waits
     # for upstreams to complete. Must cover the WORST-case upstream chain
     # completion time from this job's start. Default 1800s (30 min) only
     # works for jobs whose upstreams are guaranteed done by start time.
     dep_wait_seconds: int = 1800
+
+    def effective_enforce_deps(self) -> bool:
+        """Return enforce_deps OR critical — critical jobs always gate.
+
+        cx batch G P2 #5: a critical job by definition has downstream
+        consumers that break on stale output. Making critical imply
+        enforce_deps removes the bug class where a critical=True entry
+        forgets enforce_deps and the gate is silently rubber-stamped.
+        """
+        return self.enforce_deps or self.critical
 
 
 def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_ROOT) -> list[CronJob]:
@@ -544,7 +571,9 @@ def render_job(job: CronJob, python_bin: str = DEFAULT_PYTHON, project_root: Pat
         "--job-id", job.job_id,
         "--cwd", str(project_root),
     ]
-    if job.enforce_deps:
+    # cx batch G P2 #5 (2026-06-07): critical jobs implicitly enforce
+    # deps even when the caller forgot the flag. See CronJob docstring.
+    if job.effective_enforce_deps():
         status_args.append("--enforce-deps")
         if job.dep_wait_seconds != 1800:
             status_args.extend(["--dep-wait-seconds", str(job.dep_wait_seconds)])
