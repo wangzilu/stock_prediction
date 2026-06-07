@@ -115,10 +115,17 @@ def main():
     llm = llm[~llm.index.duplicated(keep="last")]
     print(f"[209_llm] llm deduped: {llm.shape}")
 
-    # Left-join on the base index; missing rows get 0.0 (no LLM signal).
-    llm_aligned = llm.reindex(base.index).fillna(0.0)
-    print(f"[209_llm] llm aligned non-null: "
-          f"{llm_aligned.notna().any(axis=1).sum()} / {len(llm_aligned)}")
+    # 2026-06-07 (cx P2 #5 fix): pre-fix this fillna(0.0)'d FIRST and
+    # then printed notna().any().sum() so the count was always == len(),
+    # giving the false impression that LLM signal covered the whole
+    # universe. Compute the TRUE coverage (rows where the reindex
+    # actually found a matching LLM event) BEFORE filling.
+    llm_raw = llm.reindex(base.index)
+    rows_with_real_llm = int(llm_raw.notna().any(axis=1).sum())
+    print(f"[209_llm] LLM coverage (real, pre-fillna): "
+          f"{rows_with_real_llm} / {len(llm_raw)} rows = "
+          f"{100.0 * rows_with_real_llm / max(1, len(llm_raw)):.3f}%")
+    llm_aligned = llm_raw.fillna(0.0)
 
     # Concatenate horizontally.
     out_df = pd.concat([base, llm_aligned], axis=1)
