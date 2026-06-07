@@ -120,6 +120,15 @@ def main():
         "qlib_code": "instrument",
         "signal_date": "datetime",
     })
+    # 2026-06-07 phase B.8 finding: build_llm_event_factors.py emits
+    # UPPERCASE qlib codes ('SH603536') while feature_cache_209_production
+    # uses LOWERCASE ('sh600000'). Pre-fix the reindex silently produced
+    # 0% coverage so prior LLM caches contained constant-zero columns
+    # for every row — phase B.6.3's reported +0.0044 RankIC was therefore
+    # pure stochastic noise, not LLM signal. Lowercase here mirrors the
+    # F.P1 #3 belt-and-braces normalization in
+    # FeatureMerger._load_guba.
+    llm["instrument"] = llm["instrument"].astype(str).str.lower()
     llm = llm.set_index(["datetime", "instrument"])[llm_cols]
     # Drop duplicate (date, code) rows — keep most recent.
     llm = llm[~llm.index.duplicated(keep="last")]
