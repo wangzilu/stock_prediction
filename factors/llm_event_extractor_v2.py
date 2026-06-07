@@ -155,8 +155,16 @@ class LLMEventExtractorV2:
                     time.sleep(wait)
             self._call_timestamps.append(time.time())
 
-    def _call_llm(self, user_prompt: str) -> tuple[str, dict]:
+    def _call_llm(self, user_prompt: str,
+                    system_prompt: str | None = None) -> tuple[str, dict]:
         """Returns (text, usage). usage has http_ok + token counts.
+
+        2026-06-07 (cx review P1 #2 fix): caller can override the
+        system prompt per call via ``system_prompt``. Previously
+        extract_policy_events.py monkey-patched the module-global
+        SYSTEM_PROMPT_V2 to inject the PBC prompt, which is unsafe
+        under any concurrent caller (per-stock LLM pipeline + PBC
+        in the same process would scramble each other's prompts).
 
         Retry policy: 4 attempts. 429 (RPM exceeded) gets exponential backoff
         with jitter (5s, 15s, 45s, +/- 30% random); other transient errors
@@ -166,6 +174,7 @@ class LLMEventExtractorV2:
         only waited 3s before giving up.
         """
         import random
+        sys_prompt = system_prompt if system_prompt is not None else SYSTEM_PROMPT_V2
         self._rate_limit()
         last_err = None
         last_was_429 = False
@@ -177,7 +186,7 @@ class LLMEventExtractorV2:
                     headers={"Authorization": f"Bearer {self.api_key}",
                              "Content-Type": "application/json"},
                     json={"model": self.model,
-                          "messages": [{"role": "system", "content": SYSTEM_PROMPT_V2},
+                          "messages": [{"role": "system", "content": sys_prompt},
                                        {"role": "user", "content": user_prompt}],
                           "max_tokens": 512},
                     timeout=(5, 20),

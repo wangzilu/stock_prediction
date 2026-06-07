@@ -163,13 +163,17 @@ SUPPLEMENTARY_GROUPS_BY_PROFILE: dict[str, tuple[str, ...]] = {
         "st_holder_number",
         "guba",
     ),
-    # xgb_209_llm — CANDIDATE profile, NOT YET PRODUCTION.
-    # xgb_209 plus the LLM event factor group (5 cols today, will be
-    # 5+7 once L1 fact-count factors rebuild). Created so the Phase B
-    # LOO machinery can ablate xgb_209 vs xgb_209+llm and produce
-    # promotion evidence. cx-style discipline: a new loader doesn't
-    # join any production profile until LOO + 24-split shows it
-    # actually helps IC. Until then, keep xgb_209 as the default.
+    # xgb_209_llm — CANDIDATE profile, next-champion under shadow.
+    # xgb_209 plus the LLM event factor group (12 cols after the
+    # 2026-06-07 L1 fact-count rebuild: 5 legacy impact/sentiment
+    # + 7 fact-count positive_3d/negative_3d/price_sensitive_3d/
+    # official_3d/count_3d/repeated_ratio_3d/event_intensity).
+    # B.6.3 24-split verdict 2026-06-07: ΔRankIC +0.0044 (88% of
+    # +0.005 gate), ΔSp20 +17.62 bps (+24%), ΔICIR +0.031. Below
+    # strict RankIC gate but massive on Spread20 — operator chose
+    # conservative path: shadow paper-trade 5+ trading days starting
+    # Monday before flipping production default. See
+    # docs/phase_b6_3_llm_24split_verdict_20260607.md.
     "xgb_209_llm": (
         "fundamental",
         "macro_zero_baseline",

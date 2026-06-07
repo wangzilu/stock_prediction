@@ -292,16 +292,31 @@ def publish_health(
     latest_event_date: str,
     target_date: str,
 ) -> None:
+    """Publish PE-1 factor build health.
+
+    2026-06-07 cx P1 #3 fix: previously a window with ZERO extracted
+    PBC events still wrote one zero-valued row per date and reported
+    success=True (since n_rows>0). That painted the freshness gate
+    green on a day when the LLM pipeline silently produced nothing
+    of value. Now success requires BOTH non-zero factor rows AND at
+    least one underlying event — so an LLM extraction outage / parser
+    regression surfaces as a failure on the day it happens.
+    """
     try:
         from scheduler.data_health import HealthStatus, write_health
     except Exception as e:  # pragma: no cover — broken install
         logger.warning("Cannot import scheduler.data_health (%s)", e)
         return
+    has_real_signal = n_rows > 0 and n_events > 0
     status = HealthStatus(
-        success=n_rows > 0,
+        success=has_real_signal,
         n_items=n_rows,
         latest_date=latest_event_date or target_date,
-        error_type="" if n_rows > 0 else "no_factor_rows",
+        error_type=(
+            "" if has_real_signal
+            else ("no_events" if n_rows > 0 and n_events == 0
+                  else "no_factor_rows")
+        ),
         network_profile="ashare",
         extra={
             "n_events_used": n_events,

@@ -235,18 +235,24 @@ def validate_event(raw: dict[str, Any]) -> dict[str, Any]:
 # PBOC-specific system prompt; the network plumbing (auth header,
 # retry policy, rate limiter) is reused from the V2 extractor.
 # ─────────────────────────────────────────────────────────────────────
-def _llm_extract_via_minimax(content: str) -> dict[str, Any] | None:
-    """Call MiniMax with the PBC system prompt; return parsed JSON.
+def _llm_extract_via_minimax(content: str,
+                              system_prompt: str | None = None) -> dict[str, Any] | None:
+    """Call MiniMax with an explicit system prompt; return parsed JSON.
+
+    2026-06-07 (cx P1 #2 fix): the caller passes ``system_prompt``
+    explicitly so we no longer rely on monkey-patching the V2 module's
+    global. The V2 extractor's internal retry/backoff applies inside
+    ``_call_llm``.
 
     Raises on hard failure (network down, auth invalid after retries)
-    so the caller's ``n_failed`` counter records it correctly. The V2
-    extractor's internal retry/backoff applies inside ``_call_llm``.
+    so the caller's ``n_failed`` counter records it correctly.
     """
     from factors.llm_event_extractor_v2 import LLMEventExtractorV2
 
     # Construct on first use so test mocks can bypass entirely.
     ext = LLMEventExtractorV2()
-    text, usage = ext._call_llm(content[:3000])  # cap to keep tokens sane
+    text, usage = ext._call_llm(content[:3000],
+                                  system_prompt=system_prompt)
     if not usage.get("http_ok"):
         raise RuntimeError(
             f"MiniMax call failed (rate_limited={usage.get('rate_limited')})"
@@ -270,21 +276,18 @@ def _llm_extract_via_minimax(content: str) -> dict[str, Any] | None:
 
 
 def _llm_extract_with_pbc_prompt(content: str) -> dict[str, Any] | None:
-    """Production LLM call with the PBC system prompt baked in.
+    """Production LLM call with the PBC system prompt passed explicitly.
 
-    Wraps ``_llm_extract_via_minimax`` by swapping the V2 system prompt
-    for ours via monkey-patching the module attribute. Done inline (not
-    a class) so test mocks can replace the whole function via the
-    ``llm_extract_fn`` injection point.
+    2026-06-07 cx P1 #3 fix (round 2): the previous version monkey-
+    patched the V2 module-global SYSTEM_PROMPT_V2 which is unsafe
+    under concurrent callers — the per-stock LLM pipeline and the
+    PBC extraction can both run in-process and would scramble each
+    other's system prompts. The patched _call_llm now accepts a
+    per-call ``system_prompt`` arg; this wrapper threads SYSTEM_PROMPT_PBC
+    through ``_llm_extract_via_minimax(..., system_prompt=...)`` so the
+    PBC prompt never touches the module global.
     """
-    import factors.llm_event_extractor_v2 as _v2
-
-    original_prompt = _v2.SYSTEM_PROMPT_V2
-    _v2.SYSTEM_PROMPT_V2 = SYSTEM_PROMPT_PBC
-    try:
-        return _llm_extract_via_minimax(content)
-    finally:
-        _v2.SYSTEM_PROMPT_V2 = original_prompt
+    return _llm_extract_via_minimax(content, system_prompt=SYSTEM_PROMPT_PBC)
 
 
 # ─────────────────────────────────────────────────────────────────────
