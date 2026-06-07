@@ -148,11 +148,10 @@ JOB_DEPS: dict[str, list[str]] = {
     "factor_decay_monitor": ["lgb_after_close_smoke"],
     "brinson_attribution": ["lgb_after_close_smoke"],
     # ---- Push jobs ------------------------------------------------------
-    # Morning needs yesterday's after-close training cache — gated by
-    # lgb_after_close_smoke's success the previous evening, not today's.
-    # Without per-date "yesterday" support in check_upstream, we leave the
-    # morning push ungated and rely on the freshness gate in run_paper_trading
-    # and CandidateSanitizer to refuse stale predictions.
+    # Morning needs yesterday's after-close training cache. SAME-day deps
+    # stay empty (nothing to wait on inside the morning window); cross-day
+    # deps live in JOB_DEPS_PREV_BDAY below so check_upstream_full can
+    # gate on yesterday's after-close success. See cx batch G P1 #2.
     "morning_recommendation": [],
     "sell_check": [],
     "daily_summary": [],
@@ -160,6 +159,26 @@ JOB_DEPS: dict[str, list[str]] = {
     # ---- Ancillary ------------------------------------------------------
     "risk_check": [],
     "daily_health_check": ["qlib_data_update"],
+}
+
+
+# ---------------------------------------------------------------------------
+# Cross-trading-day dependencies (cx batch G P1 #2)
+# ---------------------------------------------------------------------------
+# Some jobs run before the same-day post-close pipeline has had a chance to
+# run, so their real upstream is YESTERDAY's lgb_after_close_smoke /
+# champion_cache_rebuild output. The DAG previously could not express this
+# — JOB_DEPS only checked today's status file, so morning_recommendation /
+# sell_check were ungated. Per check_upstream_full below, a job in this dict
+# is gated on `prev_business_day(date)` rather than `date`.
+JOB_DEPS_PREV_BDAY: dict[str, list[str]] = {
+    "morning_recommendation": [
+        "lgb_after_close_smoke",
+        "champion_cache_rebuild",
+    ],
+    "sell_check": [
+        "lgb_after_close_smoke",
+    ],
 }
 
 
@@ -201,8 +220,76 @@ def _read_status(job_name: str, date: str) -> dict | None:
         return None
 
 
+def _prev_business_day(date: str) -> str:
+    """Return the previous business day (YYYY-MM-DD) for ``date``.
+
+    Uses pandas BDay arithmetic when available (production case); falls
+    back to a Mon→Fri calendar walk if pandas is unavailable or the
+    parse fails.
+    """
+    try:
+        import pandas as _pd
+        from pandas.tseries.offsets import BDay as _BDay
+        return (_pd.Timestamp(date) - _BDay(1)).strftime("%Y-%m-%d")
+    except Exception:
+        # Fallback: skip weekends by walking back day-by-day until we
+        # land on Mon-Fri. Does NOT honour exchange holidays but that
+        # is fine for a dep gate — a false-fresh holiday entry only
+        # delays an alarm by 1 trading day.
+        try:
+            dt = datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            return date  # malformed input; do not crash callers
+        from datetime import timedelta as _td
+        for _ in range(7):  # at most 7 calendar days back
+            dt = dt - _td(days=1)
+            if dt.weekday() < 5:  # 0=Mon..4=Fri
+                return dt.strftime("%Y-%m-%d")
+        return dt.strftime("%Y-%m-%d")
+
+
+def check_upstream_full(job_name: str, date: str) -> dict:
+    """Check both same-day AND previous-business-day upstreams.
+
+    Returns::
+
+        {
+            "ready": True/False,
+            "missing": ["same-day deps still missing", ...],
+            "completed": ["same-day deps completed", ...],
+            "prev_bday_missing": ["prev-bday deps still missing", ...],
+            "prev_bday_completed": ["prev-bday deps completed", ...],
+            "prev_bday_date": "YYYY-MM-DD",
+        }
+
+    ``ready`` is True only when BOTH same-day and previous-bday
+    dependency sets are fully satisfied. Callers that need to
+    distinguish "today's pipeline not yet done" from "yesterday's
+    after-close failed" can inspect the separate fields.
+    """
+    same_day = check_upstream(job_name, date)
+    prev_deps = JOB_DEPS_PREV_BDAY.get(job_name, [])
+    prev_bday = _prev_business_day(date) if prev_deps else date
+    prev_completed: list[str] = []
+    prev_missing: list[str] = []
+    for dep in prev_deps:
+        status = _read_status(dep, prev_bday)
+        if status is not None and status.get("success"):
+            prev_completed.append(dep)
+        else:
+            prev_missing.append(dep)
+    return {
+        "ready": same_day["ready"] and not prev_missing,
+        "missing": same_day["missing"],
+        "completed": same_day["completed"],
+        "prev_bday_missing": prev_missing,
+        "prev_bday_completed": prev_completed,
+        "prev_bday_date": prev_bday,
+    }
+
+
 def check_upstream(job_name: str, date: str) -> dict:
-    """Check whether all upstream dependencies of *job_name* completed on *date*.
+    """Check whether all SAME-DAY upstream dependencies of *job_name* completed on *date*.
 
     Returns::
 
@@ -211,6 +298,13 @@ def check_upstream(job_name: str, date: str) -> dict:
             "missing": ["job_a", ...],
             "completed": ["job_b", ...],
         }
+
+    Note: this function only inspects JOB_DEPS (same-day). For jobs
+    with cross-trading-day dependencies (e.g. morning_recommendation
+    needing yesterday's lgb_after_close_smoke), use
+    ``check_upstream_full`` which also walks JOB_DEPS_PREV_BDAY.
+    Existing callers that don't care about prev-bday continue to work
+    unchanged.
     """
     deps = JOB_DEPS.get(job_name, [])
     completed: list[str] = []
