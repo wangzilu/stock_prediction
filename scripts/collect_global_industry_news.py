@@ -111,8 +111,16 @@ def _load_queries() -> dict:
         return yaml.safe_load(f)
 
 
-def _fetch_gdelt(query: str, topic: str, max_records: int = 50) -> list[dict]:
+def _fetch_gdelt(query: str, topic: str, max_records: int = 50,
+                  target_date: str | None = None) -> list[dict]:
     """Fetch articles from GDELT DOC API for a query string.
+
+    2026-06-07 (P1 backfill enabling): added optional ``target_date``
+    so historical backfill of missing days actually returns the news
+    from THAT day, not today. GDELT 2.0 DOC API supports
+    ``startdatetime`` / ``enddatetime`` (UTC, YYYYMMDDHHMMSS). When
+    omitted the API returns the most-recent matching docs, which is
+    the live-cron behaviour.
 
     Returns list of news item dicts.
     """
@@ -124,6 +132,14 @@ def _fetch_gdelt(query: str, topic: str, max_records: int = 50) -> list[dict]:
             "maxrecords": max_records,
             "format": "json",
         }
+        if target_date:
+            try:
+                from datetime import datetime as _dt
+                d = _dt.strptime(target_date, "%Y-%m-%d")
+                params["startdatetime"] = d.strftime("%Y%m%d") + "000000"
+                params["enddatetime"] = d.strftime("%Y%m%d") + "235959"
+            except ValueError:
+                pass
         resp = requests.get(
             GDELT_DOC_URL,
             params=params,
@@ -301,9 +317,15 @@ def collect_global_industry_news(
         gdelt_max = cfg.get("gdelt_max", 50)
         rss_max = cfg.get("rss_max", 20)
 
+        # 2026-06-07: thread target_date through so historical backfill
+        # actually pulls news from THAT day. RSS still has no historical
+        # API so it returns current items — that's an acceptable hybrid
+        # for the LLM chain backfill where GDELT carries the weight.
+        gdelt_backfill_date = target_date if target_date != datetime.now().strftime("%Y-%m-%d") else None
         for query_str in cfg.get("queries", []):
             # GDELT
-            gdelt_items = _fetch_gdelt(query_str, topic, max_records=gdelt_max)
+            gdelt_items = _fetch_gdelt(query_str, topic, max_records=gdelt_max,
+                                         target_date=gdelt_backfill_date)
             gdelt_count += len(gdelt_items)
             topic_items.extend(gdelt_items)
             time.sleep(INTER_REQUEST_DELAY)
