@@ -185,6 +185,25 @@ SUPPLEMENTARY_GROUPS_BY_PROFILE: dict[str, tuple[str, ...]] = {
         "st_holder_number",
         "llm_event",
     ),
+    # xgb_209_xwlb — CANDIDATE profile for cx C.P1 #2 (2026-06-07).
+    # xgb_209 + XWLB (新闻联播) theme factors broadcast to stock
+    # baskets via config/xwlb_theme_baskets.yaml (C.P1 #3 mapper).
+    # 4 supp cols: xwlb_theme_mention_count_1d /
+    # xwlb_theme_mention_count_5d / xwlb_theme_consecutive_days /
+    # xwlb_theme_priority_5d_max. Profile gated by candidate basket
+    # coverage — production stays on xgb_209 until ablation evidence
+    # confirms lift over the (partial) basket map.
+    "xgb_209_xwlb": (
+        "fundamental",
+        "macro_zero_baseline",
+        "valuation",
+        "northbound",
+        "quality",
+        "st_daily_basic",
+        "st_moneyflow",
+        "st_holder_number",
+        "xinwen_lianbo",
+    ),
     # xgb_174 — Alpha158 (158) + capital_flow (3) + qlib-custom (13) =
     # 174 features. Both injection paths (FeatureMerger supplementary
     # for capital_flow + FeatureMerger.inject_qlib_custom_factors_into_handler
@@ -400,6 +419,14 @@ PROFILE_EXPECTED_COUNTS: dict[str, dict[str, int]] = {
         "supplementary": 63,    # 51 base + 12 LLM
         "qlib_custom": 0,
         "total": 221,
+    },
+    # xgb_209_xwlb — xgb_209 (51 base supp) + 4 XWLB theme factors
+    # broadcast to stock baskets. cx C.P1 #2.
+    "xgb_209_xwlb": {
+        "alpha158": 158,
+        "supplementary": 55,    # 51 base + 4 XWLB
+        "qlib_custom": 0,
+        "total": 213,
     },
     "xgb_174": {
         "alpha158": 158,

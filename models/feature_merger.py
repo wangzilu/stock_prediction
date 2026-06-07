@@ -787,6 +787,21 @@ class FeatureMerger:
             if pbc is not None:
                 frames.append(pbc)
 
+        # cx C.P1 #2 (2026-06-07): XWLB (新闻联播) theme factors. The
+        # underlying parquet is keyed by (datetime, THEME_<NAME>); per
+        # C.P1 #3 it gets broadcast onto stock-keyed training samples
+        # via a separate theme→basket mapper. The loader itself just
+        # surfaces the THEME-keyed rows reindexed onto the training
+        # MultiIndex; rows whose instrument is a stock get NaN, which
+        # the downstream NaN handler zeros. The broadcast lives in the
+        # mapper added by C.P1 #3 — it injects rows whose instrument is
+        # a stock from each theme's basket. Profile gating is via
+        # ``xinwen_lianbo`` group, only present in xgb_209_xwlb.
+        if allowed is None or "xinwen_lianbo" in allowed:
+            xwlb = _run("xinwen_lianbo", self._load_xinwen_lianbo)
+            if xwlb is not None:
+                frames.append(xwlb)
+
         # Cross-market regime signals (恒生/纳指 - broadcast to all stocks per date)
         if allowed is None or "cross_market_regime" in allowed:
             cross_mkt = _run("cross_market_regime", self._load_cross_market_regime)
@@ -1647,6 +1662,98 @@ class FeatureMerger:
             return aligned
         except Exception as e:
             logger.warning(f"PBC liquidity load failed: {e}")
+            return None
+
+    def _load_xinwen_lianbo(self, index: pd.MultiIndex) -> pd.DataFrame | None:
+        """Load XWLB (新闻联播) theme factors and broadcast to baskets.
+
+        cx C.P1 #2 (2026-06-07): scripts/build_policy_factors.py emits
+        ``xinwen_lianbo_theme_factors.parquet`` keyed by
+        ``(datetime, instrument="THEME_<UPPER>")`` with cols::
+
+            theme_mention_count_1d, theme_mention_count_5d,
+            theme_consecutive_days, theme_priority_5d_max
+
+        Stock-level training samples never match a ``THEME_<NAME>``
+        instrument code directly, so a naïve reindex onto the
+        production (datetime, stock) MultiIndex would yield 100% NaN.
+        cx C.P1 #3 wires the broadcast: each (date, THEME_X) row's
+        factor values are replicated onto every (date, STOCK_K) row
+        where STOCK_K is in the theme's basket per
+        ``config/xwlb_theme_baskets.yaml``.
+
+        Gating: only the candidate profile ``xgb_209_xwlb`` lists
+        ``xinwen_lianbo`` in its supplementary groups — the live
+        ``xgb_209`` champion is unaffected.
+
+        Returns:
+            A frame indexed by the caller's MultiIndex with the four
+            ``xwlb_*`` factor columns (zeros where no theme in the
+            basket map covers the stock × date).
+        """
+        path = self.data_dir / "xinwen_lianbo_theme_factors.parquet"
+        if not path.exists():
+            logger.warning("XWLB parquet not found: %s", path)
+            return None
+        try:
+            df = pd.read_parquet(path)
+            if df.empty:
+                logger.warning("XWLB parquet empty")
+                return None
+            if "datetime" not in df.columns or "instrument" not in df.columns:
+                logger.warning(
+                    "XWLB parquet missing keys (have %s); skipping",
+                    df.columns.tolist(),
+                )
+                return None
+            factor_cols = [
+                c for c in df.columns
+                if c not in ("datetime", "instrument")
+                and pd.api.types.is_numeric_dtype(df[c])
+            ]
+            if not factor_cols:
+                return None
+            df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+            df = df.dropna(subset=["datetime"])
+
+            # Broadcast to basket stocks via C.P1 #3 mapper.
+            try:
+                from factors.xwlb_theme_baskets import broadcast_theme_to_stocks
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "XWLB basket broadcast helper unavailable (%s); "
+                    "returning THEME-keyed frame as-is — stock-level "
+                    "training samples will see NaN everywhere",
+                    exc,
+                )
+                broadcast_theme_to_stocks = None  # type: ignore[assignment]
+
+            if broadcast_theme_to_stocks is not None:
+                broadcast = broadcast_theme_to_stocks(
+                    df, factor_cols=factor_cols, prefix="xwlb_",
+                )
+                if broadcast is None or broadcast.empty:
+                    logger.warning("XWLB broadcast produced empty frame")
+                    return None
+                result = broadcast.reindex(index)
+            else:
+                # Fall back to keeping the THEME-keyed rows; reindexing
+                # onto a stock-keyed training index will produce all-NaN
+                # but the downstream zero-fill keeps the dim contract.
+                renamed = {c: f"xwlb_{c}" for c in factor_cols}
+                tmp = df.rename(columns=renamed).set_index(
+                    ["datetime", "instrument"]
+                )[list(renamed.values())]
+                result = tmp.reindex(index)
+
+            non_null = int(result.notna().any(axis=1).sum())
+            logger.info(
+                "XWLB factors: %d cols, %d rows non-null after broadcast",
+                len(factor_cols), non_null,
+            )
+            return result
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"XWLB factors load failed: {e}")
             return None
 
     def _load_guba(self, index: pd.MultiIndex) -> pd.DataFrame | None:
