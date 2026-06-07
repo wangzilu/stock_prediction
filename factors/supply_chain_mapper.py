@@ -33,6 +33,15 @@ EDGES_PATH = PROJECT_ROOT / "data" / "config" / "supply_chain_edges.yaml"
 
 # When a global event affects a topic, ALL stocks in these industries get a signal
 # weight is lower than company-level edges (0.2-0.4 vs 0.6-0.9)
+#
+# 2026-06-07 (#174 step 1): topic keys are matched case-insensitively now —
+# the rule extractor emits lowercase ``ai_server`` / ``apple_chain`` / etc.
+# but the original dict used mixed-case ``AI_server`` / ``Apple_chain`` keys,
+# so 4 of the 7 most common topics silently returned an empty industry map
+# (verified by tracing 2026-06-04 events: ai_server, apple_chain, ev_battery,
+# tesla_robot all NO MATCH while only semiconductor, commodity,
+# strategic_material went through). That was the dominant cause of the
+# <0.01 % chain-factor density flagged in docs/phase_b7_verdict_20260607.md.
 TOPIC_TO_INDUSTRY = {
     "AI_server": {
         "电子I": 0.4,        # 半导体/光模块/PCB
@@ -82,6 +91,42 @@ TOPIC_TO_INDUSTRY = {
         "国防军工I": 0.5,    # 军工主机厂/零部件
     },
 }
+
+
+# 2026-06-07 (#174 step 1): aliases for upstream topic strings that
+# don't map 1:1 to TOPIC_TO_INDUSTRY keys. The lookup falls through
+# this table BEFORE giving up. Keep lowercase keys here — the matcher
+# normalises both sides to lower().
+_TOPIC_ALIAS = {
+    "ev_battery": "EV",       # rule extractor's split-out battery topic → EV
+    "tesla_robot": "robot",   # specific entity → generic robot topic
+    "apple": "Apple_chain",
+    "ai": "AI_server",
+}
+
+
+def _resolve_topic(topic: str) -> dict:
+    """Look up TOPIC_TO_INDUSTRY case-insensitively, with alias fallback.
+
+    Returns ``{}`` when no mapping is found so callers can keep the
+    ``industry_map.items()`` zero-row iteration without a None check.
+    """
+    if not topic:
+        return {}
+    # 1) exact (legacy) match
+    direct = TOPIC_TO_INDUSTRY.get(topic)
+    if direct:
+        return direct
+    # 2) case-insensitive match against canonical keys
+    tl = topic.lower()
+    for canonical, mapping in TOPIC_TO_INDUSTRY.items():
+        if canonical.lower() == tl:
+            return mapping
+    # 3) alias table
+    alias = _TOPIC_ALIAS.get(tl)
+    if alias:
+        return TOPIC_TO_INDUSTRY.get(alias, {})
+    return {}
 
 
 class SupplyChainMapper:
@@ -267,7 +312,9 @@ class SupplyChainMapper:
                 seen_stocks.add(stock)
 
         # Level 2: Industry-level mapping (lower weight)
-        industry_map = TOPIC_TO_INDUSTRY.get(topic, {})
+        # 2026-06-07 (#174 step 1): use _resolve_topic so case-mismatched
+        # topics (ai_server vs AI_server, etc) still hit the industry map.
+        industry_map = _resolve_topic(topic)
         for industry_name, industry_weight in industry_map.items():
             stocks_in_industry = self._industry_stocks.get(industry_name, [])
             for stock in stocks_in_industry:
