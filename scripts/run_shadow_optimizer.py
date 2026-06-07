@@ -145,7 +145,10 @@ def main():
         return
 
     if args.compare:
-        _compare_with_champion(oms)
+        # cx batch B P3 #6: manual --compare honours --date too (used
+        # for backfill / replay), falling back to today only when no
+        # date was supplied.
+        _compare_with_champion(oms, args.date or datetime.now().strftime("%Y-%m-%d"))
         return
 
     # Run daily
@@ -205,8 +208,9 @@ def main():
     logger.info(f"  Return: {pnl.get('daily_return', 0):+.4f}")
     logger.info(f"  Positions: {pnl.get('n_positions', 0)}")
 
-    # Auto-compare
-    _compare_with_champion(oms)
+    # Auto-compare — pass the signal date so daily_compare lands in the
+    # right ledger slot (cx batch B P3 #6).
+    _compare_with_champion(oms, date)
 
     # Push notification
     try:
@@ -224,8 +228,16 @@ def main():
     logger.info("Done!")
 
 
-def _compare_with_champion(shadow_oms):
-    """Compare shadow vs champion."""
+def _compare_with_champion(shadow_oms, signal_date: str):
+    """Compare shadow vs champion.
+
+    cx batch B P3 #6 (same-exam): `signal_date` is the date the shadow
+    optimizer was processing (from --date or the daily run argument),
+    NOT datetime.now(). Previously the daily_compare ledger stamped
+    each record with the run wall-clock day, which broke historical
+    replays (filled in wrong slot) and weekend backfills (recorded as
+    Sat/Sun against a Friday signal).
+    """
     champion_path = Path(CHAMPION_DIR) / "oms_state.json"
     if not champion_path.exists():
         logger.warning("Champion state not found")
@@ -249,7 +261,7 @@ def _compare_with_champion(shadow_oms):
     # Log comparison
     compare_path = Path(SHADOW_DIR) / "daily_compare.jsonl"
     record = {
-        "date": datetime.now().strftime("%Y-%m-%d"),
+        "date": signal_date,
         "shadow_value": shadow_state.get("total_value"),
         "champion_value": champion_state.get("total_value"),
         "shadow_return": round(sh_ret, 6),
