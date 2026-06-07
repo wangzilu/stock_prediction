@@ -38,6 +38,7 @@ EDGES_PATH = PROJECT_ROOT / "data" / "config" / "supply_chain_edges.yaml"
 NEWS_DIR = PROJECT_ROOT / "data" / "storage" / "global_industry_news"
 EVENTS_DIR = PROJECT_ROOT / "data" / "storage" / "global_chain_events"
 EVENTS_DIR_LLM = PROJECT_ROOT / "data" / "storage" / "global_chain_events_llm"
+EVENTS_DIR_LLM_V2 = PROJECT_ROOT / "data" / "storage" / "global_chain_events_llm_v2"
 OUTPUT_PATH = PROJECT_ROOT / "data" / "storage" / "global_chain_factors.parquet"
 OUTPUT_PATH_LLM = PROJECT_ROOT / "data" / "storage" / "global_chain_factors_llm.parquet"
 
@@ -181,14 +182,26 @@ def _load_pre_extracted_events(
     from the rule-based extractor's output (production cron), ``"llm"``
     reads from the LLM extractor's output. Both share the downstream
     propagation logic so the LOO is comparing pipelines, not propagation.
+
+    2026-06-07 (SC-A2): ``source="llm_v2"`` reads the v2 relations
+    schema from ``global_chain_events_llm_v2/`` and rewrites each row
+    into the v1-shaped event dict ``propagate_scores`` already
+    understands. Direction is derived from ``relation_type`` (suppliers
+    co-move with their customer's polarity sign of +1; competitors
+    invert; theme_co_member dampens). This keeps the parquet schema
+    identical so FeatureMerger does not need to change.
     """
     import json
     if source == "llm":
         events_dir = EVENTS_DIR_LLM
+    elif source == "llm_v2":
+        events_dir = EVENTS_DIR_LLM_V2
     elif source == "rule":
         events_dir = EVENTS_DIR
     else:
-        raise ValueError(f"Unknown source {source!r}, must be 'rule' or 'llm'")
+        raise ValueError(
+            f"Unknown source {source!r}, must be 'rule', 'llm', or 'llm_v2'"
+        )
     target = pd.Timestamp(target_date)
     events = []
     for i in range(lookback_days):
@@ -200,10 +213,106 @@ def _load_pre_extracted_events(
                 if line:
                     e = json.loads(line)
                     e.setdefault("date", d)
-                    events.append(e)
+                    if source == "llm_v2":
+                        events.extend(_v2_event_to_v1_shape(e))
+                    else:
+                        events.append(e)
     if events:
         logger.info(f"Loaded {len(events)} pre-extracted events from {events_dir}")
     return events
+
+
+# ---------------------------------------------------------------------------
+# v2 schema adaptation
+# ---------------------------------------------------------------------------
+
+# Phase D / SC-A2: relation_type → direction sign + confidence-scale.
+#
+# The LLM emits only relations; this table is the downstream weighting
+# step (news polarity × relation type) the spec demands be separated
+# from extraction. Multiplied later by news polarity (currently
+# assumed +1 because the prefilter accepts both polarities; a follow-on
+# story will plumb sentiment into here).
+#
+# Values are deliberately small (≤ 0.7) so a v2 row carries the same
+# magnitude order as a v1 row whose confidence∈[0,1].
+_RELATION_SIGN = {
+    "supplier":          (+1, 0.7),   # X is supplier to news subject → moves with subject
+    "customer":          (+1, 0.6),   # X is customer of subject → moves with subject
+    "joint_venture":     (+1, 0.6),
+    "competitor":        (-1, 0.5),   # competitive readthrough — opposite sign
+    "regulatory_target": (-1, 0.6),
+    "theme_co_member":   (+1, 0.3),   # weakest tie — dampened
+}
+
+# Evidence-strength weighting. A=full weight; D=de-rated.
+_EVIDENCE_WEIGHT = {"A": 1.0, "B": 0.8, "C": 0.5, "D": 0.3}
+
+
+def _v2_event_to_v1_shape(v2_event: dict) -> list[dict]:
+    """Translate one v2 ``{src_entity, relations[]}`` event into the
+    list of v1-shaped event dicts ``propagate_scores`` consumes.
+
+    One v2 row with N relations expands to N v1 rows, each pointing
+    its ``source_entity`` at the relation's ``target_entity`` (so the
+    propagation graph can match against ``supply_chain_edges.yaml``'s
+    src_entity index in either direction).
+
+    Direction = sign(relation_type) — derived here, NOT extracted by
+    the LLM. Confidence = relation_sign_weight × evidence_weight.
+    """
+    src = (v2_event.get("src_entity") or "").strip()
+    relations = v2_event.get("relations") or []
+    if not src or not relations:
+        return []
+
+    factuality = (v2_event.get("factuality") or "").strip().lower()
+    # Confirmed facts get full strength; speculation/rumor dampen.
+    fact_scale = {"confirmed": 1.0, "speculation": 0.6, "rumor": 0.3}.get(
+        factuality, 0.5
+    )
+
+    out: list[dict] = []
+    for rel in relations:
+        target = (rel.get("target_entity") or "").strip()
+        rel_type = (rel.get("relation_type") or "").strip()
+        if not target or rel_type not in _RELATION_SIGN:
+            continue
+        ev = (rel.get("evidence_strength") or "D").strip().upper()
+        sign, base = _RELATION_SIGN[rel_type]
+        ev_w = _EVIDENCE_WEIGHT.get(ev, 0.3)
+        conf = base * ev_w * fact_scale
+
+        # SC-A3 tier filter: caller (propagate_scores) already drops
+        # to A/B by default via load_edges; passing evidence_strength
+        # through as ``source`` lets classify_edge_tier downstream
+        # see it should the propagation step ever filter on it.
+        # We emit TWO v1-shaped events per relation: one keyed on
+        # src_entity (Nvidia announces order with TSMC → look up
+        # Nvidia in YAML) and one keyed on target_entity (look up
+        # TSMC in YAML). The propagation step deduplicates by
+        # downstream dst_stock so this is safe.
+        for entity in (src, target):
+            out.append({
+                # propagate_scores indexes on source_entity
+                "source_entity": entity,
+                # legacy direction field — derived from relation, NOT
+                # extracted by the LLM.
+                "direction": sign,
+                "confidence": round(conf, 4),
+                "topic": v2_event.get("topic", ""),
+                "date": v2_event.get("date", ""),
+                "published_at": v2_event.get("published_at", ""),
+                "news_title": v2_event.get("news_title", ""),
+                "news_url": v2_event.get("news_url", ""),
+                "summary": v2_event.get("summary", ""),
+                # Tier — Phase D / SC-A3 reads this if it ever wires
+                # event-side tier filtering.
+                "evidence_strength": ev,
+                "schema_version": "v2",
+                "source": "llm_v2",
+            })
+    return out
 
 
 def load_events_from_news(
@@ -470,6 +579,7 @@ def build_factors(
     demo: bool = False,
     lookback_days: int = EVENT_LOOKBACK_DAYS,
     source: str = "rule",
+    schema: str = "v1",
 ) -> pd.DataFrame:
     """End-to-end: load edges + events, propagate, output parquet.
 
@@ -479,11 +589,20 @@ def build_factors(
         lookback_days: how many days of news to look back
         source: "rule" (default, production cron path) or "llm"
             (reads extract_global_chain_llm.py output for B.7 ablation).
+        schema: "v1" (default — legacy direction/confidence event shape)
+            or "v2" (SC-A2 relations schema; reads global_chain_events_llm_v2/
+            and adapts to v1-shaped propagation input). When schema="v2"
+            the ``source`` arg is overridden to "llm_v2" since v2 only
+            exists for the LLM path.
 
     Returns:
         DataFrame with factor values.
     """
     edges = load_edges()
+
+    # SC-A2: v2 schema is always the LLM v2 path.
+    if schema == "v2":
+        source = "llm_v2"
 
     if demo:
         events = generate_demo_events(target_date)
@@ -612,9 +731,11 @@ def build_factors(
         return df
 
     # Save to parquet (append if exists). 2026-06-07: route to
-    # OUTPUT_PATH_LLM when source="llm" so the B.7 ablation doesn't
-    # clobber the production rule-based parquet.
-    out_path = OUTPUT_PATH_LLM if source == "llm" else OUTPUT_PATH
+    # OUTPUT_PATH_LLM when source="llm" (or "llm_v2") so neither LLM
+    # ablation clobbers the production rule-based parquet. The v2
+    # path SHARES the same parquet schema as v1 by design (FeatureMerger
+    # loader does not change) so it lands on the same parquet file.
+    out_path = OUTPUT_PATH_LLM if source in ("llm", "llm_v2") else OUTPUT_PATH
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     if out_path.exists():
@@ -675,12 +796,20 @@ def main():
         help=f"Days of news to look back (default: {EVENT_LOOKBACK_DAYS})",
     )
     parser.add_argument(
-        "--source", choices=["rule", "llm"], default="rule",
-        help="Event source: 'rule' (default, production cron) or 'llm' "
+        "--source", choices=["rule", "llm", "llm_v2"], default="rule",
+        help="Event source: 'rule' (default, production cron), 'llm' "
              "(B.7 ablation — reads global_chain_events_llm/ from "
-             "extract_global_chain_llm.py output). LLM source writes "
-             "to global_chain_factors_llm.parquet so it doesn't "
+             "extract_global_chain_llm.py output), or 'llm_v2' "
+             "(SC-A2 — reads global_chain_events_llm_v2/ with the "
+             "relations schema). LLM sources write to "
+             "global_chain_factors_llm.parquet so they don't "
              "clobber the production parquet.",
+    )
+    parser.add_argument(
+        "--schema", choices=["v1", "v2"], default="v1",
+        help="Event JSONL schema: 'v1' (default, legacy direction/"
+             "confidence shape) or 'v2' (SC-A2 src_entity + relations). "
+             "Setting --schema v2 implicitly sets --source llm_v2.",
     )
     args = parser.parse_args()
 
@@ -688,7 +817,7 @@ def main():
 
     try:
         df = build_factors(target_date, demo=args.demo, lookback_days=args.lookback,
-                           source=args.source)
+                           source=args.source, schema=args.schema)
         if not df.empty:
             print(f"\n=== Global Chain Factors for {target_date} ===")
             print(f"Stocks affected: {len(df)}")
