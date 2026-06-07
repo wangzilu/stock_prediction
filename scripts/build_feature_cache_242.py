@@ -45,7 +45,7 @@ from config.settings import PREDICTION_HORIZON_DAYS, DATA_DIR
 from config.qlib_runtime import init_qlib
 from config.production_features import (
     PRODUCTION_SUPPLEMENTARY_GROUPS, PRODUCTION_MODEL_PROFILE,
-    PROFILE_EXPECTED_COUNTS,
+    PROFILE_EXPECTED_COUNTS, SUPPLEMENTARY_GROUPS_BY_PROFILE,
 )
 from models.feature_merger import FeatureMerger
 
@@ -77,7 +77,27 @@ def main():
     parser.add_argument("--out", default=str(DEFAULT_OUT_PATH),
                         help="Output parquet path (default: "
                              "data/storage/feature_cache_242_production.parquet)")
+    # 2026-06-07 cx batch D P0 fix: the filename says "242" so the
+    # profile MUST be xgb_242 by default — even when PRODUCTION_MODEL_PROFILE
+    # has been flipped to xgb_209. Pre-fix this script read the LIVE
+    # production profile, so after the 6-6 promotion the "242 builder"
+    # actually built a 209-shaped cache and named it feature_cache_242_*,
+    # which then made build_feature_cache_209.py's contract gate reject
+    # the input (244 expected, 211 received) and break the entire
+    # champion_cache_rebuild chain — silently — between 6-6 and the
+    # diagnostic that found this. Make the profile choice explicit so
+    # the filename and the actual shape can never drift apart again.
+    parser.add_argument(
+        "--profile", default="xgb_242",
+        choices=sorted(SUPPLEMENTARY_GROUPS_BY_PROFILE),
+        help="Feature contract profile to build for. The filename in --out "
+             "should match — DO NOT use --profile xgb_209 with --out "
+             "feature_cache_242_*.parquet, the downstream 209 filter will "
+             "reject it. (Default: xgb_242 regardless of PRODUCTION_MODEL_PROFILE.)",
+    )
     args = parser.parse_args()
+    profile = args.profile
+    supp_groups = SUPPLEMENTARY_GROUPS_BY_PROFILE[profile]
 
     # Refuse silently overwriting the legacy 174-cache.
     out_path = Path(args.out).expanduser().resolve()
@@ -94,9 +114,10 @@ def main():
     logger.info("=" * 70)
     logger.info("Period:        %s ~ %s", args.start, args.end)
     logger.info("Instruments:   %s", args.instruments)
-    logger.info("Profile:       %s", PRODUCTION_MODEL_PROFILE)
-    logger.info("Supp groups:   %s", PRODUCTION_SUPPLEMENTARY_GROUPS)
-    logger.info("Expected dim:  %s", PROFILE_EXPECTED_COUNTS.get(PRODUCTION_MODEL_PROFILE))
+    logger.info("Profile:       %s (live PRODUCTION_MODEL_PROFILE=%s)",
+                profile, PRODUCTION_MODEL_PROFILE)
+    logger.info("Supp groups:   %s", supp_groups)
+    logger.info("Expected dim:  %s", PROFILE_EXPECTED_COUNTS.get(profile))
     logger.info("Out path:      %s", out_path)
 
     init_qlib(QLIB_DATA)
@@ -128,12 +149,12 @@ def main():
 
     # ── 2. Inject the 84 production supplementary cols ──────────────
     logger.info("[2/4] Injecting supplementary loaders: %s",
-                list(PRODUCTION_SUPPLEMENTARY_GROUPS))
+                list(supp_groups))
     t_supp = time.time()
     n_supp = merger.inject_supplementary_into_handler(
         dataset.handler,
         preprocess=False,
-        groups=PRODUCTION_SUPPLEMENTARY_GROUPS,
+        groups=supp_groups,
     )
     logger.info("    Injected %d supp cols in %.1fs", n_supp, time.time() - t_supp)
 
@@ -154,15 +175,23 @@ def main():
     logger.info("    Feature frame: %s in %.1fs (label aligned to X.index)", X.shape, time.time() - t_prep)
 
     actual_dim = int(X.shape[1])
-    expected = PROFILE_EXPECTED_COUNTS.get(PRODUCTION_MODEL_PROFILE, {}).get("total")
+    expected = PROFILE_EXPECTED_COUNTS.get(profile, {}).get("total")
     if expected is not None and actual_dim != int(expected):
-        # Don't kill the cache, but loudly note that the production
-        # contract drift will surface before training.
-        logger.warning(
-            "[supp-dim] WARN: actual %d cols != PROFILE_EXPECTED_COUNTS total %d. "
-            "The cache is still saved; train_lgb's contract gate will refuse "
-            "to use it if the count is wrong at train time.",
-            actual_dim, expected,
+        # 2026-06-07 cx batch D P2 fix: pre-fix was a WARN that still
+        # saved the parquet. That meant feature_cache_242_latest.parquet
+        # could contain a 209-shaped (or other-profile) matrix and the
+        # filename would lie about the shape. Combined with the D.P0
+        # profile-leak bug, the warning was the only signal that
+        # anything was wrong — and the downstream 209 filter would
+        # SystemExit a few minutes later with a contract gate error
+        # whose connection to the silent 242 warning was non-obvious.
+        # Now: hard-fail, refuse to write a mislabelled cache.
+        raise SystemExit(
+            f"[supp-dim] FATAL: profile={profile} contract expects "
+            f"{expected} cols but FeatureMerger produced {actual_dim}. "
+            f"Refusing to write a mislabelled cache. Check "
+            f"PROFILE_EXPECTED_COUNTS[{profile!r}] against the actual "
+            f"supp groups in SUPPLEMENTARY_GROUPS_BY_PROFILE."
         )
 
     # Flatten the MultiIndex columns ((feature, name) → name) so the
