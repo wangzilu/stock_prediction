@@ -1,0 +1,97 @@
+# XWLB (新闻联播) theme → A-share stock basket map (starter set).
+#
+# cx C.P1 #3 (2026-06-07): scripts/extract_policy_events.py writes
+# XWLB events keyed by ``THEME_<UPPER>``. Stock-level training samples
+# never match that instrument code, so the broadcast helper in
+# factors/xwlb_theme_baskets.py replicates each (date, THEME_X) factor
+# row onto every (date, STOCK_K) row for STOCK_K in the theme's basket.
+#
+# Limitations (acknowledged):
+#   - This is a STARTER set of a dozen high-confidence themes —
+#     coverage is intentionally partial. Themes not listed here pass
+#     through as no-op (their factor rows simply don't broadcast).
+#   - Basket membership is a hand-curated heuristic, not an exhaustive
+#     industry classification. Expansion is a separate PR (likely with
+#     an automatic-mining step against industry classification +
+#     concept tags).
+#   - The mapping is STATIC. Companies that join / leave a theme do
+#     not move on a single XWLB event. Mid-term refresh cadence is
+#     OK (quarterly), real-time dynamic baskets are out of scope.
+#
+# Key: theme name as it appears in scripts/extract_policy_events.py
+#      (Chinese characters, lowercase canonical form). The mapper
+#      uppercases + ``THEME_`` prefixes internally to match the
+#      parquet's instrument codes.
+# Value: list of qlib instrument codes (UPPERCASE SH/SZ/BJ + 6-digit code).
+
+新能源汽车:
+  - SZ002594   # 比亚迪
+  - SH600104   # 上汽集团
+  - SZ300750   # 宁德时代
+  - SH601127   # 赛力斯
+
+光伏:
+  - SH601012   # 隆基绿能
+  - SZ002129   # TCL中环
+  - SH600438   # 通威股份
+  - SH601865   # 福莱特
+
+半导体:
+  - SH688981   # 中芯国际
+  - SH688041   # 海光信息
+  - SH688008   # 澜起科技
+  - SZ002371   # 北方华创
+
+人工智能:
+  - SH688256   # 寒武纪
+  - SZ300033   # 同花顺
+  - SH600588   # 用友网络
+  - SZ002230   # 科大讯飞
+
+5g:
+  - SH600050   # 中国联通
+  - SH600941   # 中国移动
+  - SH601728   # 中国电信
+  - SZ002415   # 海康威视
+
+数字经济:
+  - SZ000977   # 浪潮信息
+  - SZ300454   # 深信服
+  - SH600588   # 用友网络
+  - SH688111   # 金山办公
+
+医药:
+  - SH600276   # 恒瑞医药
+  - SZ300760   # 迈瑞医疗
+  - SH600196   # 复星医药
+  - SZ300015   # 爱尔眼科
+
+军工:
+  - SH600760   # 中航沈飞
+  - SH600893   # 航发动力
+  - SZ002025   # 航天电器
+  - SH601989   # 中国重工
+
+银行:
+  - SH601398   # 工商银行
+  - SH601288   # 农业银行
+  - SH601988   # 中国银行
+  - SH601939   # 建设银行
+
+房地产:
+  - SH600048   # 保利发展
+  - SZ000002   # 万科A
+  - SH600340   # 华夏幸福
+  - SH600606   # 绿地控股
+
+消费:
+  - SH600519   # 贵州茅台
+  - SZ000858   # 五粮液
+  - SH603288   # 海天味业
+  - SZ000333   # 美的集团
+
+新能源:
+  - SH601012   # 隆基绿能
+  - SZ300750   # 宁德时代
+  - SH600905   # 三峡能源
+  - SH601985   # 中国核电
