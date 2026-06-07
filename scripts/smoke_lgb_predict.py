@@ -20,7 +20,19 @@ from typing import Iterable
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
-DEFAULT_MODEL_PATH = PROJECT_ROOT / "data" / "storage" / "lgb_model.pkl"
+
+# cx round 23 E.P2 #4: do NOT hardcode the legacy ``lgb_model.pkl`` here.
+# The legacy symlink existed for back-compat but the active profile may
+# point at ``lgb_model_xgb_209.pkl`` / ``lgb_model_xgb_242.pkl`` directly.
+# Resolve to the active profile's binary via production_model_filename so
+# the smoke check exercises the same artifact the cron does.
+try:
+    from config.production_features import production_model_filename
+    DEFAULT_MODEL_PATH = (
+        PROJECT_ROOT / "data" / "storage" / production_model_filename()
+    )
+except Exception:
+    DEFAULT_MODEL_PATH = PROJECT_ROOT / "data" / "storage" / "lgb_model.pkl"
 try:
     from config.settings import LGB_MIN_PREDICTIONS, LGB_PREDICTION_CACHE_PATH
 except Exception:
@@ -52,7 +64,7 @@ def _override_qlib_provider(qlib_dir: Path | None) -> None:
 
 
 def run_smoke(
-    model_path: Path,
+    model_path: Path | None,
     min_predictions: int,
     qlib_dir: Path | None = None,
     output: Path | None = LGB_PREDICTION_CACHE_PATH,
@@ -62,14 +74,28 @@ def run_smoke(
     from models.short_term import ShortTermModel
     from models.lgb_cache import write_prediction_cache
 
-    if not model_path.exists():
-        return {
-            "ok": False,
-            "error": f"model file not found: {model_path}",
-            "model_path": str(model_path),
-        }
-
-    model = ShortTermModel.load_from_pickle(str(model_path))
+    # cx round 23 E.P2 #4: when --model-path is not explicitly passed
+    # (model_path is None), delegate resolution to
+    # ShortTermModel.load_from_pickle(None) — which loads the active
+    # profile's binary. Only when the caller hands a literal path do we
+    # exist-check it and pass it through.
+    if model_path is not None:
+        if not model_path.exists():
+            return {
+                "ok": False,
+                "error": f"model file not found: {model_path}",
+                "model_path": str(model_path),
+            }
+        model = ShortTermModel.load_from_pickle(str(model_path))
+    else:
+        # Resolve effective path for logging/cache metadata; mirror the
+        # active-profile resolution that load_from_pickle(None) performs.
+        from config.production_features import production_model_filename
+        from config.settings import DATA_DIR as _DATA_DIR
+        preferred = Path(_DATA_DIR) / production_model_filename()
+        effective_path = preferred if preferred.exists() else Path(_DATA_DIR) / "lgb_model.pkl"
+        model = ShortTermModel.load_from_pickle(None)
+        model_path = effective_path
     preds = model.predict_batch()
     finite_items = {
         code: score
@@ -113,7 +139,16 @@ def run_smoke(
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
+    # cx round 23 E.P2 #4: default is None so run_smoke delegates to
+    # ShortTermModel.load_from_pickle(None) → active-profile binary.
+    # DEFAULT_MODEL_PATH is shown only in --help epilog as a hint.
+    parser.add_argument(
+        "--model-path", type=Path, default=None,
+        help=(
+            f"Override the model binary. When omitted, use the active "
+            f"profile's binary (currently {DEFAULT_MODEL_PATH.name})."
+        ),
+    )
     parser.add_argument("--min-predictions", type=int, default=LGB_MIN_PREDICTIONS)
     parser.add_argument("--qlib-dir", type=Path, default=None)
     parser.add_argument(
@@ -160,7 +195,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     except Exception as exc:
         result = {
             "ok": False,
-            "model_path": str(args.model_path),
+            "model_path": str(args.model_path) if args.model_path is not None
+                          else f"<active-profile:{DEFAULT_MODEL_PATH.name}>",
             "error": f"{type(exc).__name__}: {exc}",
         }
 
