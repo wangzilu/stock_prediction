@@ -108,10 +108,14 @@ def _prediction_health(predictions, min_predictions: int) -> dict:
         latest_per_instrument = finite_frame.sort_values(
             ["_instrument", "_datetime"]
         ).groupby("_instrument", sort=False).tail(1)
-        latest_finite_count = int(len(latest_per_instrument))
-        stale_prediction_count = int(
-            (latest_per_instrument["_datetime"] < pd.Timestamp(latest_date)).sum()
-        )
+        stale_mask = latest_per_instrument["_datetime"] < pd.Timestamp(latest_date)
+        stale_prediction_count = int(stale_mask.sum())
+        # cx round 23 E.P1 #1: latest_finite_count must reflect coverage on the
+        # LATEST trading day only — not "last finite prediction per stock at any
+        # point". The save gate compares this against LGB_MIN_PREDICTIONS; if we
+        # let stale per-instrument rows pad the count, a model with insufficient
+        # latest-day coverage can slip through the floor.
+        latest_finite_count = int(len(latest_per_instrument) - stale_prediction_count)
 
     stats = {
         "prediction_count": int(len(scores)),
