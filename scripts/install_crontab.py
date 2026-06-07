@@ -144,7 +144,11 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         #   15:50 LLM-extract events from today's policy texts
         #   16:10 build per-date pbc_liquidity_factors.parquet
         # Network needs: domestic (pbc.gov.cn) → llm → none.
-        # --fail-on-empty surfaces parser/regex regressions on day 1.
+        # --fail-on-empty kept here because PBC publishes OMO/LPR at a
+        # near-daily cadence; a 0-row weekday is a real regression,
+        # not steady state. Contrast with State Council (3-day budget,
+        # sparse) and NBS (35-day budget, monthly) where the flag was
+        # removed in cx batch G P1 #1.
         CronJob("pbc_policy_texts", "30 15 * * 1-5",
                 [py, str(scripts / "collect_policy_texts.py"),
                  "--source", "pbc", "--fail-on-empty"],
@@ -166,9 +170,18 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         # 2026-06-07 cron registration. 5-minute stagger from PE-1 PBC
         # to avoid hammering gov.cn / pbc.gov.cn in the same minute.
         # Same shape: collect → extract → build.
+        # cx batch G P1 #1 (2026-06-07): --fail-on-empty REMOVED.
+        # State Council is sparse-by-design (see scheduler/job_deps.py
+        # :51). The downstream chain handles 0 events as steady-state
+        # via cx batch C P2 #4 (commit 767b1aa) — build_policy_factors
+        # returns 0 (success) when sparse_by_design and no events. The
+        # SLA gate enforces the 3-day budget for "absence of fresh
+        # data"; hard-failing on every non-publication day would be a
+        # false positive. Keep --fail-on-empty only on PBC (daily-rate
+        # source) where a 0-row day really is a regression.
         CronJob("state_council_policy_texts", "35 15 * * 1-5",
                 [py, str(scripts / "collect_policy_texts.py"),
-                 "--source", "state_council", "--fail-on-empty"],
+                 "--source", "state_council"],
                 "state_council_policy_texts.log",
                 network="domestic", timeout_sec=600),
         CronJob("state_council_policy_events", "55 15 * * 1-5",
@@ -189,9 +202,17 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         # minute window. NBS publishes MONTHLY so a 0-row weekday is
         # the steady-state expectation; the SLA budget is 35 days for
         # that reason. Same shape as PE-1/PE-2: collect → extract → build.
+        # cx batch G P1 #1 (2026-06-07): --fail-on-empty REMOVED.
+        # NBS releases CPI/PPI/PMI/社零 monthly. With ~20 trading days
+        # per month, ~95% of weekdays are 0-row by design — keeping
+        # --fail-on-empty meant the cron blocked every non-publication
+        # day (~19 of 20). The downstream chain (extract → build)
+        # handles 0 events as steady-state per cx batch C P2 #4. The
+        # 35-day SLA budget catches the real "no fresh data in a
+        # release cycle" case without false-failing daily runs.
         CronJob("nbs_policy_texts", "40 15 * * 1-5",
                 [py, str(scripts / "collect_policy_texts.py"),
-                 "--source", "nbs", "--fail-on-empty"],
+                 "--source", "nbs"],
                 "nbs_policy_texts.log",
                 network="domestic", timeout_sec=600),
         CronJob("nbs_policy_events", "00 16 * * 1-5",
