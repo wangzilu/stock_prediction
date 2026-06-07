@@ -120,35 +120,51 @@ def predict_top_n(profile: str, date: str, top_n: int = TOP_N) -> pd.DataFrame:
         logger.warning("No rows for profile=%s date=%s", profile, date)
         return pd.DataFrame()
 
-    # Strip label + auxiliary cols. cx P2 #4 fix: feature-count
-    # mismatch is now fail-loud, not warning, since the shadow gate
-    # decides production promotion.
-    from config.production_features import PROFILE_EXPECTED_COUNTS
-    expected_total = PROFILE_EXPECTED_COUNTS[profile]["total"]
-    feature_cols = [c for c in day_df.columns
-                    if c not in ("__label_1d", "__label_5d", "_close",
-                                  "_ma5", "_ma20", "ext_holder_decrease",
-                                  "__pnl_return_1d")
-                    and not c.startswith("_")
-                    and pd.api.types.is_numeric_dtype(day_df[c])]
-    if len(feature_cols) != expected_total:
-        raise RuntimeError(
-            f"Profile {profile} cache feature count mismatch: got "
-            f"{len(feature_cols)}, expected {expected_total}. "
-            f"Refusing to predict so the shadow gate does not consume "
-            f"an off-contract result."
+    # cx P1 #1 (round 2): production_feature_contract_<profile>.json
+    # already pins feature name + order for every binary the train
+    # script writes. Read it and use the canonical order — relying
+    # on cache column order risks silent name/order drift even when
+    # the count matches.
+    from config.production_features import (
+        PROFILE_EXPECTED_COUNTS,
+        production_contract_filename,
+    )
+    contract_path = DATA_DIR / production_contract_filename(profile)
+    if not contract_path.exists():
+        raise FileNotFoundError(
+            f"Profile {profile} contract artifact missing: "
+            f"{contract_path}. Retrain via PRODUCTION_MODEL_PROFILE="
+            f"{profile} python scripts/train_lgb.py."
         )
-    X = day_df[feature_cols].fillna(0.0)
+    import json as _json
+    contract = _json.loads(contract_path.read_text())
+    contract_feature_names = [f["name"] for f in contract["features"]]
+    expected_total = PROFILE_EXPECTED_COUNTS[profile]["total"]
+    if len(contract_feature_names) != expected_total:
+        raise RuntimeError(
+            f"Profile {profile} contract has {len(contract_feature_names)} "
+            f"features but PROFILE_EXPECTED_COUNTS expects {expected_total}. "
+            f"Production_features.py and contract artifact disagree."
+        )
+    missing = [n for n in contract_feature_names if n not in day_df.columns]
+    if missing:
+        raise RuntimeError(
+            f"Profile {profile} cache missing {len(missing)} contract "
+            f"columns (first 5: {missing[:5]}). Cache and trained "
+            f"binary are out of sync."
+        )
+    # Order strictly from the contract — this is what the booster expects.
+    X = day_df[contract_feature_names].fillna(0.0)
     # cx P1 #1 fix: production .pkl is qlib XGBModel wrapper whose
     # .predict() expects DatasetH. Use the inner xgb.Booster directly.
-    # Validate the booster's feature count matches our column set.
+    # Validate the booster's feature count matches our contract.
     try:
         booster_n = inner.num_features()
-        if booster_n != len(feature_cols):
+        if booster_n != len(contract_feature_names):
             raise RuntimeError(
                 f"Profile {profile} booster expects {booster_n} feats "
-                f"but cache supplies {len(feature_cols)}. Cache and "
-                f".pkl are out of sync."
+                f"but contract pins {len(contract_feature_names)}. "
+                f"Booster and contract are out of sync."
             )
     except AttributeError:
         # Older xgb versions expose attributes differently; tolerate
@@ -211,14 +227,18 @@ def load_next_day_returns(date: str) -> pd.Series:
             return pd.Series(dtype=float)
     else:
         return pd.Series(dtype=float)
-    # 2026-06-07: 1-day strictly preferred. If absent, return empty
-    # (don't silently substitute 5-day; the caller's gate is a daily
-    # metric).
+    # 2026-06-07 cx P1 #3 fix: daily Spread20 must use a 1-day return.
+    # The production caches expose ``__pnl_return_1d`` (the realized
+    # t→t+1 close-to-close return) as the canonical 1-day series.
+    # ``__label_5d`` is the model's training target, not a daily metric.
     if "__label_1d" in day_df.columns:
         label_col = "__label_1d"
+    elif "__pnl_return_1d" in day_df.columns:
+        label_col = "__pnl_return_1d"
     else:
-        logger.error("__label_1d missing from cache for %s; refusing to "
-                     "use __label_5d as a daily proxy.", date)
+        logger.error("Neither __label_1d nor __pnl_return_1d in cache "
+                     "for %s; refusing to use __label_5d as a daily "
+                     "proxy.", date)
         return pd.Series(dtype=float)
     if label_col not in day_df.columns:
         return pd.Series(dtype=float)
@@ -237,18 +257,22 @@ def run_one_day(date: str, *, backfill: bool = False) -> dict:
     """
     SHADOW_DIR.mkdir(parents=True, exist_ok=True)
     row = {"date": date, "profiles": {}}
+    failures: list[str] = []
     for profile in PROFILES:
         try:
             top, bot = predict_top_and_bottom(profile, date, TOP_N)
             row["profiles"][profile] = {
                 "top": top["instrument"].tolist(),
                 "top_scores": top["score"].tolist(),
+                "top_rank": top["rank"].tolist(),
                 "bottom": bot["instrument"].tolist(),
                 "bottom_scores": bot["score"].tolist(),
+                "bottom_rank": bot["rank"].tolist(),
             }
         except Exception as e:
             logger.error("Profile %s failed for %s: %s", profile, date, e)
             row["profiles"][profile] = {"error": str(e)}
+            failures.append(profile)
 
     # Realised Spread20 requires next-day (1-day) returns
     if backfill:
@@ -276,6 +300,14 @@ def run_one_day(date: str, *, backfill: bool = False) -> dict:
     out_path = SHADOW_DIR / f"{date}.json"
     out_path.write_text(json.dumps(row, indent=2, ensure_ascii=False))
     logger.info("Wrote shadow row: %s", out_path)
+    # cx P1 #2: ANY profile failure makes the day un-trustworthy for the
+    # 5-day promotion gate. Surface as non-zero exit instead of leaving
+    # a half-baked JSON that summary() would count as a no-op day.
+    if failures:
+        raise SystemExit(
+            f"Shadow {date}: profile(s) failed: {failures}. The day "
+            f"is recorded but not counted toward the 5-day shadow gate."
+        )
     return row
 
 

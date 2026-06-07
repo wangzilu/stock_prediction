@@ -270,3 +270,41 @@ def test_llm_call_failure_is_loud_not_silent(tmp_path: Path):
     assert summary["n_input"] == 2
     assert summary["n_extracted"] == 0
     assert summary["n_failed"] == 2
+
+
+# 2026-06-07 cx P2 #4 — pin the PBC system prompt at the call boundary
+# so a refactor cannot silently revert to the stock-news prompt.
+def test_pbc_system_prompt_threaded_through_call_llm(monkeypatch):
+    """``_llm_extract_with_pbc_prompt`` must pass SYSTEM_PROMPT_PBC to
+    LLMEventExtractorV2._call_llm. Previously this was achieved via a
+    module-global monkey patch, which is not thread-safe; the refactor
+    threads the prompt as a kwarg. This test fakes _call_llm and
+    asserts the kwarg arrives intact.
+    """
+    from scripts import extract_policy_events as epe
+    from factors import llm_event_extractor_v2 as v2
+
+    captured: dict[str, str] = {}
+
+    def fake_call_llm(self, user_prompt, system_prompt=None):
+        captured["user_prompt"] = user_prompt
+        captured["system_prompt"] = system_prompt
+        return ('{"policy_stance": "neutral", "tool_type": "omo",'
+                ' "unexpectedness": 0.5}', {"http_ok": True})
+
+    monkeypatch.setattr(v2.LLMEventExtractorV2, "_call_llm", fake_call_llm)
+    # Also stub the env-driven constructor so we don't need an API key.
+    monkeypatch.setenv("MINIMAX_API_KEY", "test")
+
+    out = epe._llm_extract_with_pbc_prompt("test content body")
+
+    assert out is not None
+    assert captured["system_prompt"] is epe.SYSTEM_PROMPT_PBC, (
+        "_llm_extract_with_pbc_prompt must pass SYSTEM_PROMPT_PBC; "
+        "got %r instead." % (captured.get("system_prompt"),)
+    )
+    # And the global must NOT have been mutated as a side effect.
+    assert v2.SYSTEM_PROMPT_V2 != epe.SYSTEM_PROMPT_PBC, (
+        "Module-global SYSTEM_PROMPT_V2 was mutated — monkey patch "
+        "regression."
+    )
