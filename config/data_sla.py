@@ -159,6 +159,24 @@ SLA_BY_SOURCE: dict[str, SourceSLA] = {
         "Daily global supply-chain factor build. Same 2-day budget so a "
         "single failed scrape does not immediately disable the overlay.",
     ),
+    # ── PE-1 PBOC monetary policy chain (Phase E.1) ─────────────────
+    "pbc_policy_texts": SourceSLA(
+        "daily", 2,
+        "PBOC OMO / LPR daily text collection. 2-day budget tolerates "
+        "the occasional weekend / holiday gap without disabling the "
+        "downstream LLM extraction.",
+    ),
+    "pbc_policy_events": SourceSLA(
+        "daily", 2,
+        "Daily LLM extraction of PBC policy texts → structured events. "
+        "Same 2-day budget so a 24-hour LLM API outage does not "
+        "immediately disable the factor build.",
+    ),
+    "pbc_liquidity_factors": SourceSLA(
+        "daily", 2,
+        "Daily PBC liquidity factor build from extracted policy events. "
+        "Feeds the xgb_209_pbc candidate profile via the FeatureMerger.",
+    ),
     # ── Auxiliary ───────────────────────────────────────────────────
     "weekly_mask_rebuild": SourceSLA(
         "weekly", 7,

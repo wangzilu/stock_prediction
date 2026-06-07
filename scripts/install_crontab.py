@@ -138,6 +138,30 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("guba_popularity", "35 16 * * 1-5",
                 [py, str(scripts / "collect_guba_sentiment.py")], "guba_popularity.log",
                 network="domestic", timeout_sec=600),
+        # Phase E.1 (PE-1) — PBOC monetary policy event chain.
+        # 2026-06-07 cron registration. Three serial steps:
+        #   15:30 collect (post-market, before LLM pipeline at 16:30)
+        #   15:50 LLM-extract events from today's policy texts
+        #   16:10 build per-date pbc_liquidity_factors.parquet
+        # Network needs: domestic (pbc.gov.cn) → llm → none.
+        # --fail-on-empty surfaces parser/regex regressions on day 1.
+        CronJob("pbc_policy_texts", "30 15 * * 1-5",
+                [py, str(scripts / "collect_policy_texts.py"),
+                 "--source", "pbc", "--fail-on-empty"],
+                "pbc_policy_texts.log",
+                network="domestic", timeout_sec=300),
+        CronJob("pbc_policy_events", "50 15 * * 1-5",
+                [py, str(scripts / "extract_policy_events.py"),
+                 "--source", "pbc"],
+                "pbc_policy_events.log",
+                network="llm", timeout_sec=1800,
+                enforce_deps=True),
+        CronJob("pbc_liquidity_factors", "10 16 * * 1-5",
+                [py, str(scripts / "build_policy_factors.py"),
+                 "--source", "pbc"],
+                "pbc_liquidity_factors.log",
+                network="none", timeout_sec=300,
+                enforce_deps=True),
         # NOTE: The 17:30 llm_event_retry full-rerun was REMOVED 2026-05-31.
         # Reason (cx code review): factors/llm_event_extractor_v2.py:332-335
         # deletes any existing jsonl with <500 lines before re-running. So a

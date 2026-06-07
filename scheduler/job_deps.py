@@ -40,6 +40,12 @@ JOB_DEPS: dict[str, list[str]] = {
     # row, and make every downstream freshness gate believe the
     # pipeline was fine.
     "llm_factor_quality": ["llm_event_pipeline"],
+    # Phase E.1 PE-1 chain — 15:30 → 15:50 → 16:10 strict sequence.
+    # extract gates on the collector (no text → no LLM call), build
+    # gates on extract (no events → no factor build).
+    "pbc_policy_texts": [],
+    "pbc_policy_events": ["pbc_policy_texts"],
+    "pbc_liquidity_factors": ["pbc_policy_events"],
     # ---- Post-data-update processing -------------------------------------
     "fund_flow_update": ["qlib_data_update"],
     "st_daily_factors_update": ["qlib_data_update"],
