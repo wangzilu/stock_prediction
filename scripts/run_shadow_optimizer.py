@@ -29,6 +29,47 @@ SHADOW_DIR = str(DATA_DIR / "paper_shadow")
 CHAMPION_DIR = str(DATA_DIR / "paper")
 
 
+def _build_cost_inputs(date: str | None,
+                        impact_model: str,
+                        impact_coefficient: float,
+                        lookback_days: int):
+    """Return (cost_model, vol_adv_snapshot) for PaperOMS.
+
+    same-exam: this mirrors scripts/run_paper_trading.py's _build_cost_inputs
+    exactly. Champion and shadow MUST construct CostModel + vol/ADV
+    snapshot identically — any divergence in cost inputs makes the
+    daily_compare lie (excess return would reflect cost-model drift, not
+    the execution-strategy difference we're trying to measure). Inlined
+    (instead of importing the champion helper) so a future refactor of
+    run_paper_trading.py cannot silently change shadow's cost model
+    without us noticing here.
+    """
+    if impact_model == "fixed":
+        return None, None
+
+    from backtest.cost_model import CostModel
+    cm = CostModel(impact_model="sqrt_adv",
+                    impact_coefficient=impact_coefficient)
+    try:
+        from paper.cost_inputs import load_or_build_snapshot
+        from config.qlib_runtime import init_qlib
+        from config.settings import QLIB_PROVIDER_URI
+        init_qlib(QLIB_PROVIDER_URI)
+        asof = date or datetime.now().strftime("%Y-%m-%d")
+        snapshot = load_or_build_snapshot(asof, lookback_days=lookback_days)
+        logger.info(
+            "Shadow cost inputs: sqrt_adv (coeff=%.3f), snapshot codes=%d",
+            impact_coefficient, len(snapshot),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "Shadow cost-input snapshot build failed (%s) — sqrt_adv path "
+            "will fall back to bare rate per-fill", e,
+        )
+        snapshot = None
+    return cm, snapshot
+
+
 def main():
     parser = argparse.ArgumentParser(description="Shadow paper trading with optimizer_v2")
     group = parser.add_mutually_exclusive_group()
@@ -44,6 +85,21 @@ def main():
 
     from paper.oms import PaperOMS
 
+    # same-exam: shadow vs champion comparison invalid without matching
+    # cost inputs. Champion (scripts/run_paper_trading.py around line 116)
+    # constructs a sqrt_adv CostModel + per-stock vol/ADV snapshot and
+    # passes both to PaperOMS so reported PnL reflects Almgren-Chriss
+    # market-impact costs. Without mirroring here, shadow would run on
+    # bare slippage_rate while champion runs on sqrt_adv — daily_compare's
+    # excess return would be contaminated by the cost-model mismatch, not
+    # just by the execution strategy we're actually trying to evaluate.
+    cost_model, vol_adv_snapshot = _build_cost_inputs(
+        date=args.date,
+        impact_model="sqrt_adv",
+        impact_coefficient=0.1,
+        lookback_days=20,
+    )
+
     # Shadow uses optimizer_v2 with opt_top100_to10 config
     oms = PaperOMS(
         initial_capital=1_000_000,
@@ -55,6 +111,8 @@ def main():
         min_hold_days=2,
         state_dir=SHADOW_DIR,
         mode="pending",
+        cost_model=cost_model,
+        vol_adv_snapshot=vol_adv_snapshot,
     )
 
     if args.reset:
