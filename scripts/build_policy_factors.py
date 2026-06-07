@@ -1044,17 +1044,40 @@ def main(argv: list[str] | None = None) -> int:
     df = build_fn(start_date=start, end_date=end)
     if df.empty:
         logger.warning("No factor rows built for [%s, %s]", start, end)
-        # PE-2 (state_council) is sparse by industry — an empty window
-        # at backfill bootstrap time is the steady-state expectation.
-        # Still publish health as no_events so the gate sees it.
+        # 2026-06-07 cx batch C P2 #4 fix: distinguish no_theme_signal
+        # (events exist, LLM judged none material → 0 factor rows by
+        # design) from pipeline_failed (no events at all → upstream
+        # break). XWLB and state_council are sparse-by-theme/industry,
+        # so a 0-row day with non-empty events is the steady state and
+        # MUST exit 0 to keep the cron health green and not confuse it
+        # with a real failure. NBS / PBC stay loud (exit 1) because
+        # their factor count != event count and empty downstream
+        # usually means a build error.
         events = load_fn(input_dir)
+        n_events = int(len(events)) if not events.empty else 0
+        latest_event_date = (
+            events["publish_date"].max().strftime("%Y-%m-%d")
+            if not events.empty else ""
+        )
+        sparse_by_design = args.source in ("xinwen_lianbo", "state_council")
+        if sparse_by_design and n_events > 0:
+            logger.info(
+                "[%s] no_theme_signal (%d events but 0 material themes) — "
+                "exit 0; this is the sparse-by-theme steady state.",
+                args.source, n_events,
+            )
+            publish_health(
+                n_rows=0,
+                n_events=n_events,
+                latest_event_date=latest_event_date,
+                target_date=end,
+                health_source=health_source,
+            )
+            return 0
         publish_health(
             n_rows=0,
-            n_events=int(len(events)) if not events.empty else 0,
-            latest_event_date=(
-                events["publish_date"].max().strftime("%Y-%m-%d")
-                if not events.empty else ""
-            ),
+            n_events=n_events,
+            latest_event_date=latest_event_date,
             target_date=end,
             health_source=health_source,
         )

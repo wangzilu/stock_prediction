@@ -317,15 +317,20 @@ def _v2_event_to_v1_shape(v2_event: dict) -> list[dict]:
     return out
 
 
-# Evidence-level → confidence floor for v1-LLM events. The LLM extractor
-# emits a categorical evidence_level instead of a numeric confidence, so
-# we map it to a [0,1] floor that combines with chain_relevance_score
-# (0-10) for the final confidence used by propagate_scores.
-_LLM_V1_EVIDENCE_FLOOR = {
-    "major_media": 0.7,
-    "trade_press": 0.55,
-    "company_pr":  0.5,
-    "rumor":       0.3,
+# Evidence-level weight for v1-LLM events. The LLM extractor emits a
+# categorical evidence_level instead of a numeric confidence; this is
+# the multiplicative weight applied to chain_relevance_score (NOT a
+# floor — cx batch C P2 #6 fix: the original max(floor, rel) shape let
+# a major_media event with chain_relevance_score=1 (very weak supply-
+# chain link) become confidence=0.7 because the media-level floor
+# dominated. That would have biased B.7-LLM toward "famous outlets win
+# over relevant outlets", the opposite of what the propagation model
+# needs. Now: confidence = evidence_weight × relevance, both ∈ [0,1].
+_LLM_V1_EVIDENCE_WEIGHT = {
+    "major_media": 1.0,
+    "trade_press": 0.85,
+    "company_pr":  0.75,
+    "rumor":       0.4,
 }
 
 
@@ -343,10 +348,16 @@ def _llm_v1_to_propagation_shape(e: dict) -> dict:
         e["source_entity"] = e["global_entity"]
     if "confidence" not in e:
         rel = float(e.get("chain_relevance_score", 0.0) or 0.0) / 10.0
-        floor = _LLM_V1_EVIDENCE_FLOOR.get(
-            (e.get("evidence_level") or "").lower(), 0.4,
+        rel = max(0.0, min(1.0, rel))
+        ev_weight = _LLM_V1_EVIDENCE_WEIGHT.get(
+            (e.get("evidence_level") or "").lower(), 0.6,
         )
-        e["confidence"] = max(0.0, min(1.0, max(floor, rel)))
+        # Multiplicative fusion: a weak supply-chain link CAN'T be
+        # rescued by a top-tier outlet. A high-relevance link from a
+        # rumor still passes through dampened (0.4×). The default
+        # 0.6 (unknown evidence_level) sits between trade_press and
+        # rumor — conservative but non-zero.
+        e["confidence"] = ev_weight * rel
     return e
 
 

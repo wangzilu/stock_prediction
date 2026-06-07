@@ -1122,8 +1122,30 @@ def collect_xinwen_lianbo(
                 continue
             if ln.url in seen_urls:
                 continue
-            if ln.publish_date and ln.publish_date not in date_set:
-                continue
+            # 2026-06-07 cx batch C P2 #5 fix: pre-fix this exact-match
+            # predfilter dropped articles when the list parser returned
+            # a wrong/offset publish_date (Sina column rolling-update
+            # time, neighbour-article date bleed, etc.). The detail
+            # page's article_date is reliable but never got a chance.
+            # Now: predfilter only against EGREGIOUS dates (more than
+            # 7 days outside the requested window). Borderline cases
+            # fall through to the detail-page fetch + the line ~1160
+            # post-fetch filter that compares article_date to date_set.
+            # Costs at most a couple extra HTTP fetches per run on the
+            # boundary; saves a real-article miss on every news site
+            # whose list page lies about dates (most of them).
+            if ln.publish_date:
+                try:
+                    ln_dt = datetime.strptime(ln.publish_date, "%Y-%m-%d")
+                    s_dt = datetime.strptime(start, "%Y-%m-%d")
+                    e_dt = datetime.strptime(end, "%Y-%m-%d")
+                    if ln_dt < s_dt - timedelta(days=7):
+                        continue
+                    if ln_dt > e_dt + timedelta(days=1):
+                        continue
+                except (ValueError, TypeError):
+                    # Garbage date string — let the detail page decide.
+                    pass
             seen_urls.add(ln.url)
             time.sleep(INTER_REQUEST_DELAY)
             try:
@@ -1306,8 +1328,25 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     today = datetime.now().strftime("%Y-%m-%d")
-    start = args.start or today
-    end = args.end or args.start or today
+    # 2026-06-07 cx batch C P1 #1 fix: XWLB airs DAILY incl. weekends
+    # but the cron only fires Mon-Fri. Pre-fix the default was
+    # start=end=today, so Saturday and Sunday transcripts were never
+    # scraped by the weekday cron, and the SLA's 2-trading-day budget
+    # only HID the gap (kept the health light green) — it didn't
+    # backfill anything. Now: when --source xinwen_lianbo and no
+    # explicit --start, default the start to today-3 (calendar days)
+    # so a Monday run sweeps Friday→Sunday, a Tuesday run double-
+    # checks Saturday, etc. Dedup is by URL so re-scrapes are cheap.
+    # Other sources keep start=today since their SLA budgets are
+    # tuned around weekday-only publication.
+    if args.source == "xinwen_lianbo" and not args.start:
+        weekend_lookback = (
+            datetime.now() - timedelta(days=3)
+        ).strftime("%Y-%m-%d")
+        start = weekend_lookback
+    else:
+        start = args.start or today
+    end = args.end or today
 
     if args.source == "pbc":
         bonus = ("mlf", "rrr", "quarterly_report") if args.include_bonus else ()
