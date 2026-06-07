@@ -228,8 +228,24 @@ def _status_path(job_name: str, date: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def mark_complete(job_name: str, date: str, success: bool, details: str = "") -> None:
-    """Write a status file for *job_name* on *date*."""
+def mark_complete(
+    job_name: str,
+    date: str,
+    success: bool,
+    details: str = "",
+    output_paths: list[str] | None = None,
+) -> None:
+    """Write a status file for *job_name* on *date*.
+
+    ``output_paths`` (cx batch G P2 #7, 2026-06-07): an OPTIONAL list of
+    absolute paths the job produced. ``check_upstream`` reads them back
+    to detect 'stale success' — the case where a manual re-run wrote a
+    fresh status row but the artifact on disk is stale, OR where the
+    success file from yesterday survived a tmp-cleanup gap and the job
+    never actually wrote a new artifact today. Pass [] (or omit) for
+    jobs that don't produce a parquet/JSON artifact — then check_upstream
+    only verifies completed_at ordering, not mtime.
+    """
     STATUS_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
         "job": job_name,
@@ -237,6 +253,7 @@ def mark_complete(job_name: str, date: str, success: bool, details: str = "") ->
         "success": success,
         "details": details,
         "completed_at": datetime.now().isoformat(timespec="seconds"),
+        "output_paths": list(output_paths) if output_paths else [],
     }
     path = _status_path(job_name, date)
     tmp = path.with_suffix(".tmp")
@@ -255,6 +272,73 @@ def _read_status(job_name: str, date: str) -> dict | None:
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("Corrupt status file %s: %s", path, exc)
         return None
+
+
+# Slack window for the output-mtime vs completed_at check. A file
+# typically lands a few seconds BEFORE the success row is written, but
+# we still want to flag a file whose mtime is more than this slack
+# EARLIER than the recorded completion. cx batch G P2 #7.
+_FRESHNESS_SLACK_SECONDS = 600  # 10 minutes
+
+
+def _is_status_fresh(status: dict, run_started_at: str | None = None) -> tuple[bool, str]:
+    """Conservative freshness check for an upstream status row.
+
+    Returns ``(fresh, reason)``. ``fresh=True`` means: either no
+    output_paths are recorded (so we only have the success flag to
+    go on — trust it), OR every recorded path exists and its mtime
+    is no more than _FRESHNESS_SLACK_SECONDS before completed_at.
+
+    ``fresh=False`` means: at least one recorded output path is
+    missing, OR its mtime is meaningfully older than completed_at
+    (a stale-success indicator).
+
+    cx batch G P2 #7: be conservative. When the status row is from
+    a pre-G era (no output_paths field), or when paths can't be
+    parsed, return ``(True, "")`` so we don't add false failures on
+    rollout. The check exists only to catch the obvious "yesterday's
+    success row survived a tmp-cleanup gap" case.
+    """
+    output_paths = status.get("output_paths") or []
+    completed_at = status.get("completed_at") or ""
+
+    # Note: the original P2 #7 spec mentioned a clock-ordering check
+    # (upstream completed_at BEFORE current run start). In the polling
+    # architecture we already wait for upstream to be ready before
+    # proceeding, so by construction completed_at < run_started_at
+    # plus a polling-interval slack. The check would either be a no-op
+    # (happy path) or false-fire on clock skew, so it's intentionally
+    # omitted. The mtime check below (b) is the real freshness guard.
+    _ = run_started_at  # reserved for future ordering work
+
+    # Output-mtime check (b) — only if output_paths are recorded and
+    # completed_at can be parsed.
+    if not output_paths:
+        return True, ""
+    try:
+        comp_dt = datetime.fromisoformat(completed_at[:19])
+    except (ValueError, TypeError):
+        # Status row predates G P2 #7 or is malformed — accept.
+        return True, ""
+
+    for p_str in output_paths:
+        try:
+            p = Path(p_str)
+        except TypeError:
+            continue
+        if not p.exists():
+            return False, f"recorded output_path missing: {p_str}"
+        try:
+            mtime_dt = datetime.fromtimestamp(p.stat().st_mtime)
+        except OSError:
+            continue
+        delta_sec = (comp_dt - mtime_dt).total_seconds()
+        if delta_sec > _FRESHNESS_SLACK_SECONDS:
+            return False, (
+                f"output_path {p_str} mtime is {delta_sec:.0f}s older "
+                f"than completed_at — stale success suspected"
+            )
+    return True, ""
 
 
 def _prev_business_day(date: str) -> str:
@@ -285,7 +369,11 @@ def _prev_business_day(date: str) -> str:
         return dt.strftime("%Y-%m-%d")
 
 
-def check_upstream_full(job_name: str, date: str) -> dict:
+def check_upstream_full(
+    job_name: str,
+    date: str,
+    run_started_at: str | None = None,
+) -> dict:
     """Check both same-day AND previous-business-day upstreams.
 
     Returns::
@@ -303,18 +391,33 @@ def check_upstream_full(job_name: str, date: str) -> dict:
     dependency sets are fully satisfied. Callers that need to
     distinguish "today's pipeline not yet done" from "yesterday's
     after-close failed" can inspect the separate fields.
+
+    ``run_started_at`` (cx batch G P2 #7): optional ISO timestamp of
+    the current job's run start. When passed, freshness validation
+    additionally checks that each upstream's recorded output paths
+    are newer than their completed_at (catches the stale-success
+    case where a manual rerun left the success file but the artifact
+    on disk is older). See ``_is_status_fresh`` for the contract.
     """
-    same_day = check_upstream(job_name, date)
+    same_day = check_upstream(job_name, date, run_started_at=run_started_at)
     prev_deps = JOB_DEPS_PREV_BDAY.get(job_name, [])
     prev_bday = _prev_business_day(date) if prev_deps else date
     prev_completed: list[str] = []
     prev_missing: list[str] = []
     for dep in prev_deps:
         status = _read_status(dep, prev_bday)
-        if status is not None and status.get("success"):
-            prev_completed.append(dep)
-        else:
+        if status is None or not status.get("success"):
             prev_missing.append(dep)
+            continue
+        fresh, reason = _is_status_fresh(status, run_started_at=run_started_at)
+        if not fresh:
+            logger.warning(
+                "Prev-bday upstream %s (date=%s) demoted to missing: %s",
+                dep, prev_bday, reason,
+            )
+            prev_missing.append(dep)
+        else:
+            prev_completed.append(dep)
     return {
         "ready": same_day["ready"] and not prev_missing,
         "missing": same_day["missing"],
@@ -325,7 +428,11 @@ def check_upstream_full(job_name: str, date: str) -> dict:
     }
 
 
-def check_upstream(job_name: str, date: str) -> dict:
+def check_upstream(
+    job_name: str,
+    date: str,
+    run_started_at: str | None = None,
+) -> dict:
     """Check whether all SAME-DAY upstream dependencies of *job_name* completed on *date*.
 
     Returns::
@@ -342,16 +449,28 @@ def check_upstream(job_name: str, date: str) -> dict:
     ``check_upstream_full`` which also walks JOB_DEPS_PREV_BDAY.
     Existing callers that don't care about prev-bday continue to work
     unchanged.
+
+    ``run_started_at`` (cx batch G P2 #7): optional ISO timestamp of
+    the current job's run start. When provided, freshness validation
+    also runs against each upstream's output_paths (when recorded).
     """
     deps = JOB_DEPS.get(job_name, [])
     completed: list[str] = []
     missing: list[str] = []
     for dep in deps:
         status = _read_status(dep, date)
-        if status is not None and status.get("success"):
-            completed.append(dep)
-        else:
+        if status is None or not status.get("success"):
             missing.append(dep)
+            continue
+        fresh, reason = _is_status_fresh(status, run_started_at=run_started_at)
+        if not fresh:
+            logger.warning(
+                "Upstream %s (date=%s) demoted to missing: %s",
+                dep, date, reason,
+            )
+            missing.append(dep)
+        else:
+            completed.append(dep)
     return {
         "ready": len(missing) == 0,
         "missing": missing,

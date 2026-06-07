@@ -86,7 +86,9 @@ def _push_dep_block_alert(job_id: str, date: str, details: str) -> None:
         logger.warning("Failed to push dep-block alert for %s: %s", job_id, e)
 
 
-def _wait_for_upstream(job_id: str, today: str, max_wait_sec: int) -> dict:
+def _wait_for_upstream(
+    job_id: str, today: str, max_wait_sec: int, run_started_at: str,
+) -> dict:
     """Poll upstream readiness up to max_wait_sec.
 
     Returns the LAST check_upstream_full payload. ``payload["ready"]``
@@ -94,12 +96,17 @@ def _wait_for_upstream(job_id: str, today: str, max_wait_sec: int) -> dict:
     satisfied; callers should inspect ``missing`` and
     ``prev_bday_missing`` separately to compose a useful failure
     message.
+
+    ``run_started_at`` (cx batch G P2 #7): passed through to
+    check_upstream_full so the freshness gate can flag stale
+    success files (success row present but artifact mtime is older
+    than completed_at).
     """
     deadline = time.time() + max_wait_sec
     poll_interval = 60
     last_logged: tuple = ()
     while True:
-        deps = check_upstream_full(job_id, today)
+        deps = check_upstream_full(job_id, today, run_started_at=run_started_at)
         if deps["ready"]:
             return deps
         same_missing = tuple(deps["missing"])
@@ -129,10 +136,15 @@ def _wait_for_upstream(job_id: str, today: str, max_wait_sec: int) -> dict:
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
-    today = datetime.now().strftime("%Y-%m-%d")
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    run_started_at = now.isoformat(timespec="seconds")
 
     if args.enforce_deps:
-        deps = _wait_for_upstream(args.job_id, today, args.dep_wait_seconds)
+        deps = _wait_for_upstream(
+            args.job_id, today, args.dep_wait_seconds,
+            run_started_at=run_started_at,
+        )
         if not deps["ready"]:
             # Compose a detailed reason so the daily health dashboard can
             # distinguish "today's upstream pending" from "yesterday's
