@@ -220,6 +220,171 @@ EVENT_OUTPUT_COLUMNS = (
 )
 
 
+def offset_column_name(offset: int) -> str:
+    """Stable column-name format for an offset: 'offset_+1', 'offset_-3'."""
+    sign = "+" if offset >= 0 else "-"
+    return f"offset_{sign}{abs(offset)}"
+
+
+# A CloseLoader is any callable with signature
+#   (instruments: Iterable[str], start: str, end: str) -> dict[str, Series]
+# returning, for each instrument it could resolve, a close-price Series
+# indexed by a tz-naive DatetimeIndex of trading days.
+#
+# Indirection lives here so:
+#   1. step 8's unit tests can synthesise prices without qlib
+#   2. production uses qlib.data.D.features (see qlib_close_loader below)
+
+
+def qlib_close_loader(
+    instruments,
+    start: str,
+    end: str,
+) -> dict:
+    """Production CloseLoader backed by qlib.data.D.
+
+    Reads daily close prices for each instrument in [start, end] inclusive.
+    Caller is responsible for ``init_qlib`` before invoking.
+
+    Returns dict[upper-case instrument code, close Series]. Instruments
+    qlib can't resolve are simply omitted from the dict.
+    """
+    from qlib.data import D  # heavy import; deferred
+
+    insts = [str(i).lower() for i in instruments]
+    if not insts:
+        return {}
+    raw = D.features(insts, ["$close"], start_time=start, end_time=end)
+    if raw is None or raw.empty:
+        return {}
+    raw.columns = ["close"]
+    out: dict[str, pd.Series] = {}
+    for inst, sub in raw.groupby(level=0):
+        sub = sub.droplevel(0)
+        sub.index = pd.to_datetime(sub.index)
+        sub = sub["close"].dropna().astype(float)
+        if not sub.empty:
+            out[str(inst).upper()] = sub.sort_index()
+    return out
+
+
+def build_excess_return_panel(
+    *,
+    events: pd.DataFrame,
+    benchmark: str,
+    window_lo: int,
+    window_hi: int,
+    close_loader,
+) -> pd.DataFrame:
+    """Build a (one-row-per-event) excess-return panel.
+
+    Output columns: event_id, event_date, instrument, event_type,
+    offset_<lo>, ..., offset_<hi> — each a float "excess return"
+    (stock pct_change - benchmark pct_change) at that offset relative
+    to the event date.
+
+    Excess-return convention
+    ------------------------
+    Offset 0 is the close-to-close return *into* the event date
+    (close[event_date] / close[event_date - 1] - 1). Offset +1 is the
+    next trading day's return. Offset -1 is the day before the event.
+
+    Market-keyed events
+    -------------------
+    For events with instrument = ``MARKET_INSTRUMENT`` we read the
+    benchmark's own return curve. The excess vs benchmark is 0 by
+    definition, so we return the benchmark return itself — the study
+    answers "did the market move around the event" rather than
+    "did this stock beat the market".
+
+    Events whose [event_date + lo, event_date + hi] window cannot be
+    fully covered by the price history are SKIPPED (not zero-padded).
+    """
+    if events is None or events.empty:
+        return pd.DataFrame(
+            columns=list(EVENT_OUTPUT_COLUMNS)
+            + [offset_column_name(k) for k in range(window_lo, window_hi + 1)]
+        )
+
+    # Pre-compute the global price window we need: event_min - extra
+    # to event_max + extra. We use 5 calendar-day padding around the
+    # window to absorb weekends near event boundaries.
+    pad_days = max(7, abs(window_lo) + abs(window_hi) + 5)
+    events = events.copy()
+    events["event_date"] = pd.to_datetime(events["event_date"])
+    price_start = (events["event_date"].min()
+                   - pd.Timedelta(days=pad_days)).strftime("%Y-%m-%d")
+    price_end = (events["event_date"].max()
+                 + pd.Timedelta(days=pad_days)).strftime("%Y-%m-%d")
+
+    instruments_needed = {
+        str(i).upper() for i in events["instrument"].unique()
+        if str(i).upper() != MARKET_INSTRUMENT
+    }
+    instruments_needed.add(str(benchmark).upper())
+
+    close_map = close_loader(sorted(instruments_needed), price_start, price_end)
+    bench_ser = close_map.get(str(benchmark).upper())
+    if bench_ser is None or bench_ser.empty:
+        logger.warning(
+            "event_study: benchmark %s returned no prices in [%s, %s]",
+            benchmark, price_start, price_end,
+        )
+        return pd.DataFrame(
+            columns=list(EVENT_OUTPUT_COLUMNS)
+            + [offset_column_name(k) for k in range(window_lo, window_hi + 1)]
+        )
+    bench_ret = bench_ser.pct_change()
+
+    offsets = list(range(window_lo, window_hi + 1))
+    offset_cols = [offset_column_name(k) for k in offsets]
+
+    rows: list[dict] = []
+    for _, ev in events.iterrows():
+        inst = str(ev["instrument"]).upper()
+        if inst == MARKET_INSTRUMENT:
+            stock_ret = bench_ret
+            excess = pd.Series(0.0, index=bench_ret.index) + bench_ret
+        else:
+            stock_ser = close_map.get(inst)
+            if stock_ser is None or stock_ser.empty:
+                continue
+            stock_ret = stock_ser.pct_change()
+            # Align on common trading-day index (intersection):
+            common = stock_ret.index.intersection(bench_ret.index)
+            stock_ret = stock_ret.loc[common]
+            excess = stock_ret - bench_ret.loc[common]
+
+        # Resolve the trading-day index position of the event_date.
+        # If the event date itself is not a trading day (weekend /
+        # holiday) we use the previous trading day's position.
+        idx = excess.index
+        pos = idx.searchsorted(pd.Timestamp(ev["event_date"]), side="right") - 1
+        if pos < 0:
+            continue
+        # Need pos + lo .. pos + hi all in [0, len(idx) - 1]
+        lo_pos = pos + window_lo
+        hi_pos = pos + window_hi
+        if lo_pos < 0 or hi_pos >= len(idx):
+            continue
+        row = {
+            "event_id": ev["event_id"],
+            "event_date": ev["event_date"],
+            "instrument": inst,
+            "event_type": ev["event_type"],
+        }
+        for off, col in zip(offsets, offset_cols):
+            val = excess.iloc[pos + off]
+            row[col] = float(val) if pd.notna(val) else float("nan")
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(
+            columns=list(EVENT_OUTPUT_COLUMNS) + offset_cols
+        )
+    return pd.DataFrame(rows)
+
+
 def _coerce_instrument_from_row(
     row: dict,
     instrument_kind: str,

@@ -218,3 +218,116 @@ def test_load_events_missing_dir_returns_empty(tmp_path):
     assert {"event_id", "event_date", "instrument", "event_type"}.issubset(
         out.columns
     )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Step 3 — excess return panel
+# ─────────────────────────────────────────────────────────────────────
+def _flat_close_loader(close_by_instrument: dict[str, pd.Series]):
+    """Build a CloseLoader callable from a dict of instrument→close series.
+
+    Each series must be indexed by tz-naive ``DatetimeIndex``.
+    """
+    def loader(insts, start, end):
+        out = {}
+        s = pd.Timestamp(start)
+        e = pd.Timestamp(end)
+        for inst in insts:
+            ser = close_by_instrument.get(inst.upper())
+            if ser is None:
+                continue
+            mask = (ser.index >= s) & (ser.index <= e)
+            out[inst.upper()] = ser.loc[mask].copy()
+        return out
+    return loader
+
+
+def test_excess_return_curve_matches_known_injection():
+    """Inject a +1d known abnormal return; mean curve must recover it."""
+    # 30 trading days; stock = benchmark + 0.02 on event date + 1
+    dates = pd.bdate_range("2026-01-05", periods=30)
+    bench = pd.Series(100.0 * (1.0 + pd.Series([0.001] * 30,
+                                               index=dates)).cumprod())
+    bench.index = dates
+    # stock identical to bench except offset +1d for two known events
+    stock1 = bench.copy()
+    stock2 = bench.copy()
+    # event 1 on dates[10] → stock close on dates[11] = bench * 1.02
+    # → stock pct_change[11] - bench pct_change[11] = +0.02
+    stock1.iloc[11] = stock1.iloc[11] * 1.02
+    # propagate the jump forward (otherwise day +2 would show -0.02)
+    stock1.iloc[12:] = stock1.iloc[12:] * 1.02
+    # event 2 on dates[20] → stock close on dates[21] = bench * 1.02
+    stock2.iloc[21] = stock2.iloc[21] * 1.02
+    stock2.iloc[22:] = stock2.iloc[22:] * 1.02
+
+    close_loader = _flat_close_loader({
+        "SH600519": stock1,
+        "SZ000858": stock2,
+        "SH000300": bench,
+    })
+
+    events = pd.DataFrame([
+        {"event_id": "e1", "event_date": dates[10],
+         "instrument": "SH600519", "event_type": "earnings_beat"},
+        {"event_id": "e2", "event_date": dates[20],
+         "instrument": "SZ000858", "event_type": "earnings_beat"},
+    ])
+
+    panel = es.build_excess_return_panel(
+        events=events,
+        benchmark="SH000300",
+        window_lo=-2, window_hi=3,
+        close_loader=close_loader,
+    )
+    # 2 events x 6 offsets (-2 -1 0 +1 +2 +3) = 12 rows
+    assert len(panel) == 2
+    assert "offset_+1" in panel.columns
+    # Mean abnormal return at offset +1 ≈ 0.02. Tolerance reflects the
+    # tiny benchmark-drift term in the synthetic series (0.001 / day);
+    # the injection itself is exactly 0.02 so 2e-4 is plenty tight.
+    mean_plus_1 = panel["offset_+1"].mean()
+    assert abs(mean_plus_1 - 0.02) < 2e-4
+
+
+def test_excess_return_skips_event_with_short_window():
+    """Event too close to end of price history → row dropped."""
+    dates = pd.bdate_range("2026-01-05", periods=10)
+    bench = pd.Series([100.0] * 10, index=dates)
+    stock = bench.copy()
+    close_loader = _flat_close_loader({
+        "SH600519": stock, "SH000300": bench,
+    })
+    events = pd.DataFrame([
+        # only 1 day after — but window_hi=3 needs 3 days after
+        {"event_id": "e1", "event_date": dates[8],
+         "instrument": "SH600519", "event_type": "x"},
+    ])
+    panel = es.build_excess_return_panel(
+        events=events, benchmark="SH000300",
+        window_lo=-2, window_hi=3,
+        close_loader=close_loader,
+    )
+    assert panel.empty
+
+
+def test_excess_return_market_keyed_uses_benchmark_for_self():
+    """MARKET instrument → 'excess return' is 0 by construction."""
+    dates = pd.bdate_range("2026-01-05", periods=20)
+    bench = pd.Series((1.0 + pd.Series([0.01] * 20, index=dates)).cumprod() * 100.0)
+    bench.index = dates
+    close_loader = _flat_close_loader({"SH000300": bench})
+    events = pd.DataFrame([
+        {"event_id": "e1", "event_date": dates[10],
+         "instrument": es.MARKET_INSTRUMENT, "event_type": "macro_shock"},
+    ])
+    panel = es.build_excess_return_panel(
+        events=events, benchmark="SH000300",
+        window_lo=-1, window_hi=1,
+        close_loader=close_loader,
+    )
+    assert len(panel) == 1
+    # For market-keyed events excess return is the benchmark return
+    # itself (study answers "did the market move"). The smooth 1%/day
+    # series gives offset_0 ≈ 0.01.
+    assert abs(panel["offset_+0"].iloc[0] - 0.01) < 1e-6
