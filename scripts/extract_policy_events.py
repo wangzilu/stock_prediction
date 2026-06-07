@@ -1,6 +1,8 @@
-"""Extract structured policy events from PBC + State Council + NBS texts —
+"""Extract structured policy events from PBC + State Council + NBS +
+Xinwen Lianbo texts —
 Phase E.1 step 2 (PBC) + Phase E.2 step 2 (State Council / ministry) +
-Phase E.3 step 2 (NBS macro surprise).
+Phase E.3 step 2 (NBS macro surprise) + Phase E.4 step 2 (Xinwen Lianbo
+theme attention).
 
 PE-1 (PBC) reads ``data/storage/policy_texts/pbc/<YYYY-MM-DD>.jsonl``
 and writes ``data/storage/policy_events/pbc/<YYYY-MM-DD>.jsonl`` —
@@ -96,10 +98,15 @@ OUTPUT_DIR_SC = DATA_DIR / "policy_events" / "state_council"
 INPUT_DIR_NBS = DATA_DIR / "policy_texts" / "nbs"
 OUTPUT_DIR_NBS = DATA_DIR / "policy_events" / "nbs"
 
+# Phase E.4 (PE-4) — Xinwen Lianbo (新闻联播) theme attention chain.
+INPUT_DIR_XWLB = DATA_DIR / "policy_texts" / "xinwen_lianbo"
+OUTPUT_DIR_XWLB = DATA_DIR / "policy_events" / "xinwen_lianbo"
+
 # Health source name matches the convention used by collect_policy_texts.
 HEALTH_SOURCE_NAME = "pbc_policy_events"
 HEALTH_SOURCE_NAME_SC = "state_council_policy_events"
 HEALTH_SOURCE_NAME_NBS = "nbs_policy_events"
+HEALTH_SOURCE_NAME_XWLB = "xinwen_lianbo_policy_events"
 
 # ─────────────────────────────────────────────────────────────────────
 # Schema enumerations — the validator gate.
@@ -138,6 +145,26 @@ NBS_SERIES_NAMES: frozenset[str] = frozenset({
 })
 NBS_SURPRISE_DIRECTIONS: frozenset[str] = frozenset({
     "upside", "downside", "inline", "unknown",
+})
+
+# Phase E.4 (PE-4) — Xinwen Lianbo theme attention. The phase plan
+# lists 9 canonical themes; we accept any lowercase_with_underscores
+# string from the LLM (themes evolve faster than we can re-prompt) but
+# anchor a "known set" so downgrades stay measurable. Themes outside
+# this set are KEPT (free-form vocab), just flagged via
+# ``n_unknown_themes`` for an operator review.
+XINWEN_LIANBO_KNOWN_THEMES: frozenset[str] = frozenset({
+    "semiconductor_self_reliance",
+    "domestic_consumption",
+    "real_estate",
+    "private_economy",
+    "capital_markets",
+    "robotics_ai",
+    "renewable_energy",
+    "military_security",
+    "belt_and_road",
+    "rural_revitalization",
+    "carbon_neutrality",
 })
 
 # Fact-only system prompt. Explicitly bans price prediction and trading
@@ -225,6 +252,54 @@ Schema:
   "mom_change": <float, month-on-month change in percentage points / %, or null>,
   "yoy_change": <float, year-on-year change in percentage points / %, or null>,
   "surprise_direction": "<one of: upside|downside|inline|unknown>"
+}"""
+
+
+# Phase E.4 (PE-4) Xinwen Lianbo theme attention prompt. The LLM scores
+# the MEDIA ATTENTION pattern of the daily broadcast — what themes were
+# covered, how many news items touched each, where the broadcast led.
+# It is critical that the prompt explicitly forbids price prediction:
+# theme strength is a fact about state-media attention, NOT a stock
+# direction forecast. This is the L1 "facts not predictions" lesson from
+# the 2026-06-06 LLM critique; without it the LLM cheerfully says
+# "carbon_neutrality strong → buy renewable stocks" which is exactly
+# what we forbid.
+SYSTEM_PROMPT_XINWEN_LIANBO = """You are a Chinese state-media attention
+analyst. Extract structured facts about which themes the CCTV 新闻联播
+broadcast covered today.
+
+Output ONLY one JSON object. No prose, no explanation, no preamble.
+The first character must be { .
+
+Strict rules:
+1. Do NOT predict stock direction. Theme strength is a FACT about
+   media attention, NOT a price prediction. Do NOT give trading
+   advice. Do NOT infer market reactions.
+2. Extract ONLY themes literally covered in the transcript. Do not
+   guess or add themes that "should" be present.
+3. Use lowercase_with_underscores for theme names. Prefer the
+   canonical set when applicable:
+     semiconductor_self_reliance / domestic_consumption / real_estate /
+     private_economy / capital_markets / robotics_ai / renewable_energy /
+     military_security / belt_and_road / rural_revitalization /
+     carbon_neutrality.
+   Themes outside this list ARE allowed — coin a new lowercase token
+   if the transcript covers something not in the canonical set.
+4. theme_mention_counts must be an integer count of DISTINCT news
+   items in the broadcast that touched the theme. 0 means the theme
+   was not mentioned and should NOT appear in either list.
+5. policy_priority_signal is a float in [0, 1]. 0 = filler / sports /
+   weather only. 1 = the lead story occupied 5+ minutes and the
+   anchor explicitly tied it to top-level political priority.
+6. If a field is genuinely absent from the broadcast, output null /
+   empty list. Do not invent.
+
+Schema:
+{
+  "themes": [<lowercase_with_underscores theme tokens>],
+  "theme_mention_counts": {<theme>: <int count>, ...},
+  "policy_priority_signal": <float in [0, 1]>,
+  "regions_mentioned": [<province / region names if a regional initiative was highlighted, lowercased>]
 }"""
 
 
@@ -517,6 +592,137 @@ def validate_event_nbs(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Phase E.4 (PE-4) — Xinwen Lianbo theme attention validator.
+#
+# Free-form theme vocabulary: unlike NBS series_name which has a closed
+# 5-element enum, XWLB themes are a moving target. The validator keeps
+# whatever the LLM emits (lowercased, underscored, non-empty) but
+# additionally counts how many themes fell outside the documented
+# XINWEN_LIANBO_KNOWN_THEMES set so an operator can spot taxonomy
+# drift in the summary.
+# ─────────────────────────────────────────────────────────────────────
+def _coerce_theme_token(value: Any) -> str | None:
+    """Coerce a single value into a lowercase_with_underscores theme.
+
+    Strips whitespace, lowercases, replaces internal spaces / dashes
+    with underscores, collapses repeated underscores. Returns None for
+    None / non-string / empty after coercion.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    s = value.strip().lower()
+    if not s or s in ("null", "none", "n/a"):
+        return None
+    s = re.sub(r"[\s\-]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or None
+
+
+def _coerce_theme_list(value: Any) -> list[str]:
+    """Coerce ``themes`` to a list of theme tokens.
+
+    Accepts list / single string / None. Returns a stable de-duplicated
+    list (preserves first-seen order). Empty / non-list inputs become
+    an empty list rather than failing the row.
+    """
+    if value is None:
+        return []
+    items: list[Any]
+    if isinstance(value, str):
+        items = [p for p in re.split(r"[,，;；/、]", value) if p.strip()]
+    elif isinstance(value, list):
+        items = list(value)
+    else:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for it in items:
+        tok = _coerce_theme_token(it)
+        if not tok or tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+    return out
+
+
+def _coerce_mention_counts(value: Any, *, valid_themes: set[str]) -> dict[str, int]:
+    """Coerce theme_mention_counts dict; drop entries whose theme is
+    not in ``valid_themes`` (so the count list cannot contradict the
+    themes list — keeps downstream tabulation consistent).
+    """
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, int] = {}
+    for k, v in value.items():
+        tok = _coerce_theme_token(k)
+        if not tok or tok not in valid_themes:
+            continue
+        n = _coerce_number(v, as_int=True)
+        if n is None or n < 0:
+            continue
+        out[tok] = int(n)
+    return out
+
+
+def _coerce_region_list(value: Any) -> list[str]:
+    """Coerce ``regions_mentioned`` to a list of lowercase region names.
+
+    Identical discipline as theme list but does NOT collapse hyphens /
+    spaces (region names tend to be 2-3 char Chinese tokens).
+    """
+    if value is None:
+        return []
+    items: list[Any]
+    if isinstance(value, str):
+        items = [p for p in re.split(r"[,，;；/、]", value) if p.strip()]
+    elif isinstance(value, list):
+        items = list(value)
+    else:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for it in items:
+        if not isinstance(it, str):
+            continue
+        s = it.strip().lower()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def validate_event_xinwen_lianbo(raw: dict[str, Any]) -> dict[str, Any]:
+    """Validate XWLB LLM output, downgrading on miss; never drop a row.
+
+    Mirrors validate_event / validate_event_state_council / validate_event_nbs
+    discipline. Returns a fresh dict with every documented field present.
+    Numeric fields outside [0,1] clamp; missing → 0.0 for the priority
+    signal (so the factor build does not have to .fillna).
+    """
+    themes = _coerce_theme_list(raw.get("themes"))
+    valid_set = set(themes)
+    counts = _coerce_mention_counts(
+        raw.get("theme_mention_counts"), valid_themes=valid_set,
+    )
+    # Make sure every theme has a count (default 1 if missing).
+    for t in themes:
+        counts.setdefault(t, 1)
+    priority = _coerce_unexpectedness(raw.get("policy_priority_signal"))
+    if priority is None:
+        priority = 0.0
+    regions = _coerce_region_list(raw.get("regions_mentioned"))
+    return {
+        "themes": themes,
+        "theme_mention_counts": counts,
+        "policy_priority_signal": float(priority),
+        "regions_mentioned": regions,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────
 # LLM wrapper — uses the same MiniMax client wired into
 # ``factors/llm_event_extractor_v2.py``. The wrapper here owns the
 # PBOC-specific system prompt; the network plumbing (auth header,
@@ -604,6 +810,24 @@ def _llm_extract_with_nbs_prompt(
     extract and the 16:10 PE-1 factor build).
     """
     return _llm_extract_via_minimax(content, system_prompt=SYSTEM_PROMPT_NBS)
+
+
+def _llm_extract_with_xinwen_lianbo_prompt(
+    content: str,
+) -> dict[str, Any] | None:
+    """Production LLM call with SYSTEM_PROMPT_XINWEN_LIANBO threaded as
+    a kwarg.
+
+    Same thread-safety contract as the PBC / SC / NBS wrappers: we MUST
+    NEVER monkey-patch ``factors.llm_event_extractor_v2.SYSTEM_PROMPT_V2``.
+    The per-call ``system_prompt`` arg is the only safe channel — the
+    per-stock LLM pipeline and the XWLB extraction run in the same
+    process (PE-4 sits between the 15:45 PE-3 collect and the 16:25
+    PE-4 build, and the V2 per-stock job is the L4 16:30 pipeline).
+    """
+    return _llm_extract_via_minimax(
+        content, system_prompt=SYSTEM_PROMPT_XINWEN_LIANBO,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -782,6 +1006,89 @@ def _append_to_event_store_nbs(
         })
     except Exception as e:
         logger.warning("EventStore.add_event failed: %s", e)
+
+
+def _append_to_event_store_xinwen_lianbo(
+    row: dict, *, source_row: dict, eventstore_dir: Path | None,
+) -> None:
+    """Append a PE-4 XWLB theme-attention event to the unified EventStore.
+
+    Schema choices mirror PE-2's per-industry split, but keyed per theme:
+      - source = "policy" (same category as PBC / SC / NBS).
+      - event_type = "media_attention_<theme>".
+      - direction = 0 — state-media attention is NOT a directional
+        forecast; the downstream factor builder counts mentions, the
+        sign of the price move is left entirely to the model.
+      - confidence = policy_priority_signal (0..1).
+      - stock_code = ``THEME_<UPPER>`` per theme so the FeatureMerger
+        can broadcast a theme to its stock basket via a downstream
+        theme→stock mapper (analogous to the PE-2 industry mapper).
+        Rows with NO themes get a single MARKET-keyed event so the
+        broadcast is not silently dropped.
+    """
+    try:
+        from factors.event_store import EventStore
+    except Exception as e:  # pragma: no cover — broken install
+        logger.warning("EventStore import failed (%s); skipping append", e)
+        return
+
+    try:
+        store = EventStore(store_dir=eventstore_dir) if eventstore_dir else EventStore()
+    except Exception as e:
+        logger.warning("EventStore init failed (%s); skipping append", e)
+        return
+
+    themes = row.get("themes") or []
+    counts = row.get("theme_mention_counts") or {}
+    priority = row.get("policy_priority_signal")
+    confidence = float(priority) if priority is not None else 0.5
+
+    publish_time = source_row.get("publish_date", "")
+    summary_text = (source_row.get("title") or "")[:200]
+
+    if not themes:
+        # No theme — keep a single MARKET-keyed event so the broadcast
+        # isn't silently lost. event_type stays generic.
+        try:
+            store.add_event({
+                "date": publish_time,
+                "stock_code": "MARKET",
+                "source": "policy",
+                "event_type": "media_attention_none",
+                "direction": 0,
+                "confidence": confidence,
+                "summary": summary_text,
+                "publish_time": publish_time,
+                "topic": "xinwen_lianbo",
+                "is_policy": True,
+            })
+        except Exception as e:
+            logger.warning("EventStore.add_event (XWLB MARKET) failed: %s", e)
+        return
+
+    for theme in themes:
+        try:
+            store.add_event({
+                "date": publish_time,
+                "stock_code": f"THEME_{theme.upper()}",
+                "source": "policy",
+                "event_type": f"media_attention_{theme}",
+                "direction": 0,
+                "confidence": confidence,
+                "summary": summary_text,
+                "publish_time": publish_time,
+                "topic": theme,
+                "is_policy": True,
+                # Carry mention count + priority in `extra` so the
+                # downstream factor builder doesn't have to reach
+                # back into the JSONL.
+                "extra": {
+                    "mention_count": int(counts.get(theme, 1)),
+                    "policy_priority_signal": confidence,
+                },
+            })
+        except Exception as e:
+            logger.warning("EventStore.add_event failed (%s): %s", theme, e)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1189,6 +1496,137 @@ def extract_nbs(
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Phase E.4 (PE-4) — Xinwen Lianbo theme attention extract loop.
+# Same shape as extract_pbc but uses the XWLB validator + XWLB LLM
+# wrapper + XWLB EventStore append (one event per theme). Each
+# extracted row carries a list of themes; the factor builder explodes
+# on themes to produce per-(date, THEME_<NAME>) factors.
+# ─────────────────────────────────────────────────────────────────────
+def extract_xinwen_lianbo(
+    *,
+    target_date: str,
+    input_dir: Path | None = None,
+    output_dir: Path | None = None,
+    eventstore_dir: Path | None = None,
+    llm_extract_fn: Callable[[str], dict[str, Any] | None] | None = None,
+) -> dict:
+    """Extract XWLB theme-attention events for a single date.
+
+    See ``extract_pbc`` for the parameter shape. XWLB-specific
+    differences:
+
+      - default input is ``policy_texts/xinwen_lianbo/<date>.jsonl``
+      - default output is ``policy_events/xinwen_lianbo/<date>.jsonl``
+      - default LLM wrapper is ``_llm_extract_with_xinwen_lianbo_prompt``
+      - validator is ``validate_event_xinwen_lianbo``
+      - EventStore append uses the XWLB variant (one event per theme,
+        keyed ``THEME_<UPPER>``).
+    """
+    input_root = input_dir or INPUT_DIR_XWLB
+    output_root = output_dir or OUTPUT_DIR_XWLB
+    llm_fn = llm_extract_fn or _llm_extract_with_xinwen_lianbo_prompt
+
+    input_path = input_root / f"{target_date}.jsonl"
+    output_path = output_root / f"{target_date}.jsonl"
+
+    summary = {
+        "target_date": target_date,
+        "n_input": 0,
+        "n_extracted": 0,
+        "n_failed": 0,
+        "n_downgraded": 0,
+        "n_unknown_themes": 0,
+        "output_path": str(output_path),
+        "errors": [],
+    }
+
+    if not input_path.exists():
+        logger.info(
+            "No XWLB input file for %s at %s — writing empty output",
+            target_date, input_path,
+        )
+        _atomic_write_jsonl([], output_path)
+        return summary
+
+    input_rows: list[dict] = []
+    with open(input_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                input_rows.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                summary["errors"].append({"stage": "input_parse", "msg": str(e)})
+
+    summary["n_input"] = len(input_rows)
+    output_rows: list[dict] = []
+
+    for src in input_rows:
+        content = (src.get("content") or "").strip()
+        if not content:
+            summary["n_failed"] += 1
+            summary["errors"].append({
+                "stage": "empty_content",
+                "url": src.get("url", ""),
+            })
+            continue
+
+        try:
+            raw = llm_fn(content)
+        except Exception as e:
+            summary["n_failed"] += 1
+            summary["errors"].append({
+                "stage": "llm_call",
+                "url": src.get("url", ""),
+                "msg": str(e)[:200],
+            })
+            continue
+
+        if raw is None:
+            summary["n_failed"] += 1
+            summary["errors"].append({
+                "stage": "llm_parse",
+                "url": src.get("url", ""),
+            })
+            continue
+
+        validated = validate_event_xinwen_lianbo(raw)
+        # Track how many themes fell outside the documented set so an
+        # operator can spot vocab drift. Themes are KEPT either way
+        # (free-form vocab — this is just a measurement).
+        unknown = [
+            t for t in validated["themes"]
+            if t not in XINWEN_LIANBO_KNOWN_THEMES
+        ]
+        if unknown:
+            summary["n_unknown_themes"] += len(unknown)
+
+        row = {
+            "publish_date": src.get("publish_date", target_date),
+            "policy_type": src.get("policy_type", "xinwen_lianbo_daily"),
+            "title": src.get("title", ""),
+            "url": src.get("url", ""),
+            **validated,
+            "extracted_at": _now_utc_iso(),
+        }
+        output_rows.append(row)
+        summary["n_extracted"] += 1
+
+        _append_to_event_store_xinwen_lianbo(
+            row, source_row=src, eventstore_dir=eventstore_dir,
+        )
+
+    _atomic_write_jsonl(output_rows, output_path)
+    logger.info(
+        "XWLB extracted %d/%d events for %s (failed=%d, unknown_themes=%d) → %s",
+        summary["n_extracted"], summary["n_input"], target_date,
+        summary["n_failed"], summary["n_unknown_themes"], output_path,
+    )
+    return summary
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Health publishing
 # ─────────────────────────────────────────────────────────────────────
 def publish_health(
@@ -1244,12 +1682,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--source", default="pbc",
-        choices=["pbc", "state_council", "nbs"],
+        choices=["pbc", "state_council", "nbs", "xinwen_lianbo"],
         help=(
             "Policy source. 'pbc' = monetary policy (Phase E.1). "
             "'state_council' = State Council + 3 ministries (Phase E.2). "
             "'nbs' = NBS macro statistics CPI/PPI/PMI/retail sales "
-            "(Phase E.3)."
+            "(Phase E.3). 'xinwen_lianbo' = CCTV 新闻联播 theme "
+            "attention (Phase E.4)."
         ),
     )
     parser.add_argument(
@@ -1283,6 +1722,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.source == "nbs":
         extract_fn = extract_nbs
         health_source = HEALTH_SOURCE_NAME_NBS
+    elif args.source == "xinwen_lianbo":
+        extract_fn = extract_xinwen_lianbo
+        health_source = HEALTH_SOURCE_NAME_XWLB
     else:
         logger.error("Unsupported --source %s", args.source)
         return 2

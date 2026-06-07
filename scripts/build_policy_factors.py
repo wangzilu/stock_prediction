@@ -22,11 +22,20 @@ Phase E.3 step 3 (PE-3, NBS macro surprise):
   surprises plus a PMI-above-50 dummy and a 3-month yoy retail-sales
   average.
 
+Phase E.4 step 3 (PE-4, Xinwen Lianbo theme attention):
+  Reads ``data/storage/policy_events/xinwen_lianbo/<YYYY-MM-DD>.jsonl``
+  and emits a parquet keyed by ``(datetime, "THEME_<NAME>")`` — per-
+  (theme, day) rows so the FeatureMerger can map A-share stocks to
+  themes at execution time. Theme attention is per-theme, NOT per-
+  industry or MARKET (the canonical 9 themes from the phase plan do
+  not align with industry taxonomy, e.g. 一带一路 spans many sectors).
+
 Output
 ------
     data/storage/pbc_liquidity_factors.parquet (PE-1, MARKET-keyed)
     data/storage/state_council_policy_factors.parquet (PE-2, INDUSTRY-keyed)
     data/storage/nbs_macro_factors.parquet (PE-3, MARKET-keyed)
+    data/storage/xinwen_lianbo_theme_factors.parquet (PE-4, THEME-keyed)
     Plus .health.json sidecars next to each parquet.
 
 Factor definitions (per the phase doc)
@@ -91,6 +100,12 @@ OUTPUT_PATH_NBS = DATA_DIR / "nbs_macro_factors.parquet"
 HEALTH_PATH_NBS = DATA_DIR / "nbs_macro_factors.health.json"
 HEALTH_SOURCE_NAME_NBS = "nbs_macro_factors"
 
+# Phase E.4 (PE-4) — Xinwen Lianbo theme attention (THEME-keyed).
+INPUT_DIR_XWLB = DATA_DIR / "policy_events" / "xinwen_lianbo"
+OUTPUT_PATH_XWLB = DATA_DIR / "xinwen_lianbo_theme_factors.parquet"
+HEALTH_PATH_XWLB = DATA_DIR / "xinwen_lianbo_theme_factors.health.json"
+HEALTH_SOURCE_NAME_XWLB = "xinwen_lianbo_theme_factors"
+
 # Window sizes — match the phase doc; kept as constants so changes
 # require a code edit rather than a config drift.
 ZSCORE_WINDOW_DAYS = 20
@@ -110,6 +125,16 @@ INDUSTRY_NOVELTY_WINDOW_DAYS = 60
 NBS_SURPRISE_WINDOW_DAYS = 90
 NBS_PMI_THRESHOLD = 50.0
 
+# PE-4 windows. Short 1d / 5d rolling windows match XWLB's DAILY publish
+# cadence. consecutive_days caps at 14: a theme that ran for >2 weeks
+# is already a regime, not a daily attention burst, and a higher cap
+# would just create a fat-tailed factor whose top-decile is one or two
+# special events (Two Sessions, Party Congress) that already get their
+# own overlay.
+XWLB_MENTION_SHORT_DAYS = 5
+XWLB_CONSECUTIVE_DAYS_CAP = 14
+XWLB_PRIORITY_WINDOW_DAYS = 5
+
 # Synthetic instrument the cross-market regime overlay already uses;
 # the FeatureMerger broadcasts MARKET-keyed rows to every stock at
 # merge time. Kept as a named constant so a future rename is one edit.
@@ -118,6 +143,10 @@ MARKET_INSTRUMENT = "MARKET"
 # A-share stocks -> industry via the supply_chain_mapper. Kept as a
 # named constant so the prefix is grep-discoverable in the merger.
 INDUSTRY_INSTRUMENT_PREFIX = "INDUSTRY_"
+# PE-4 theme instrument prefix. The downstream FeatureMerger will map
+# A-share stocks -> theme via a thematic basket mapper (TBD). Until
+# the mapper lands the parquet is consumed standalone.
+THEME_INSTRUMENT_PREFIX = "THEME_"
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -472,6 +501,12 @@ NBS_FACTOR_COLUMNS = (
     "nbs_pmi_above_50_dummy",
     "nbs_retail_growth_yoy_3m",
 )
+XWLB_FACTOR_COLUMNS = (
+    "theme_mention_count_1d",
+    "theme_mention_count_5d",
+    "theme_consecutive_days",
+    "theme_priority_5d_max",
+)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -625,6 +660,204 @@ def build_nbs_factors_range(
     return pd.DataFrame(rows)
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Phase E.4 (PE-4) — Xinwen Lianbo theme attention factor builder.
+# Per-(theme, date) parquet, NOT per-(MARKET, date). Theme attention is
+# the unit of analysis — a given day, the broadcast either covers a
+# theme or it doesn't, and the run length / mention count is what we
+# regress against (industry / basket-level returns, NOT individual
+# stock returns).
+#
+# Factors:
+#   - theme_mention_count_1d:    mention count from today's broadcast
+#   - theme_mention_count_5d:    sum over the trailing 5 calendar days
+#   - theme_consecutive_days:    length of the current consecutive-day
+#                                 streak the theme has been mentioned,
+#                                 capped at 14 (themes that run for
+#                                 more than 2 weeks are regimes, not
+#                                 attention bursts)
+#   - theme_priority_5d_max:     max policy_priority_signal over the
+#                                 trailing 5 days (= "did the theme
+#                                 get a lead-story spot at least once
+#                                 in the last week?")
+# ─────────────────────────────────────────────────────────────────────
+def _load_xinwen_lianbo_events_from_dir(input_dir: Path) -> pd.DataFrame:
+    """Load XWLB per-day JSONL files into a one-row-per-(date, theme)
+    DataFrame.
+
+    Each input row carries themes / theme_mention_counts / priority. We
+    EXPLODE on themes so the downstream factor calc is one row per
+    (date, theme). Rows whose theme list is empty are dropped — there
+    is no per-theme factor to emit for a "no-themes" broadcast (the
+    PE-4 phase plan explicitly excludes generic filler).
+    """
+    if not input_dir.exists():
+        return pd.DataFrame()
+    rows: list[dict] = []
+    for fp in sorted(input_dir.glob("*.jsonl")):
+        try:
+            for line in fp.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        except OSError as e:
+            logger.warning("Failed to read %s: %s", fp, e)
+            continue
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["publish_date"] = pd.to_datetime(df.get("publish_date"), errors="coerce")
+    df = df.dropna(subset=["publish_date"]).reset_index(drop=True)
+    # Default columns so downstream ops don't KeyError.
+    if "themes" not in df.columns:
+        df["themes"] = [[] for _ in range(len(df))]
+    if "theme_mention_counts" not in df.columns:
+        df["theme_mention_counts"] = [{} for _ in range(len(df))]
+    df["policy_priority_signal"] = pd.to_numeric(
+        df.get("policy_priority_signal"), errors="coerce",
+    ).fillna(0.0)
+
+    def _theme_list(item):
+        if isinstance(item, list):
+            return [t for t in item if isinstance(t, str) and t.strip()]
+        if isinstance(item, str) and item.strip():
+            return [item.strip()]
+        return []
+
+    df["themes"] = df["themes"].apply(_theme_list)
+    # Drop rows whose themes list is empty — they contribute no
+    # per-theme factor and would just become NaN noise.
+    df = df[df["themes"].apply(bool)].reset_index(drop=True)
+    if df.empty:
+        return df
+    # Explode and join the per-theme count back in. theme_mention_counts
+    # is a dict keyed by theme; we look up post-explode.
+    df = df.explode("themes").reset_index(drop=True)
+    df = df.rename(columns={"themes": "theme"})
+    df["theme"] = df["theme"].astype(str).str.lower().str.strip()
+    df = df[df["theme"].astype(bool)].reset_index(drop=True)
+
+    def _lookup_count(row) -> int:
+        counts = row.get("theme_mention_counts")
+        if not isinstance(counts, dict):
+            return 1
+        v = counts.get(row["theme"])
+        try:
+            n = int(v)
+            return max(1, n)
+        except (TypeError, ValueError):
+            return 1
+
+    df["mention_count"] = df.apply(_lookup_count, axis=1)
+    return df
+
+
+def build_xinwen_lianbo_factors_for_date(
+    events_df: pd.DataFrame,
+    signal_date: pd.Timestamp,
+) -> list[dict]:
+    """Compute per-theme factor rows for ``signal_date``.
+
+    PIT: only events with ``publish_date <= signal_date`` are visible.
+    Returns one dict per theme that has been mentioned in the trailing
+    5-day window. Themes whose last mention is older than 5 days drop
+    out of the output (the factor surface should be sparse — a theme
+    that hasn't been on the broadcast for a week is not a useful daily
+    factor).
+    """
+    if events_df.empty:
+        return []
+    visible = events_df[events_df["publish_date"] <= signal_date]
+    if visible.empty:
+        return []
+    short_cutoff = signal_date - pd.Timedelta(days=XWLB_MENTION_SHORT_DAYS - 1)
+    short_window = visible[visible["publish_date"] >= short_cutoff]
+    if short_window.empty:
+        return []
+    themes = sorted(short_window["theme"].unique().tolist())
+    consec_cutoff = signal_date - pd.Timedelta(days=XWLB_CONSECUTIVE_DAYS_CAP - 1)
+    consec_window = visible[visible["publish_date"] >= consec_cutoff]
+    out: list[dict] = []
+    today = signal_date.normalize()
+    for theme in themes:
+        theme_short = short_window[short_window["theme"] == theme]
+        theme_consec = consec_window[consec_window["theme"] == theme]
+        # 1d count: how many mention rows on signal_date (typically 0 or
+        # 1 — XWLB airs once per day — but defensively allow >1 if the
+        # collector duplicated a row across two sina list pages and the
+        # dedup missed).
+        today_rows = theme_short[
+            theme_short["publish_date"].dt.normalize() == today
+        ]
+        count_1d = int(today_rows["mention_count"].sum())
+        count_5d = int(theme_short["mention_count"].sum())
+        # priority max in 5d window.
+        prio_window = theme_short["policy_priority_signal"].dropna()
+        priority_max = float(prio_window.max()) if not prio_window.empty else 0.0
+        # Consecutive days: walk back from signal_date and count
+        # contiguous days with at least one mention. We compute the set
+        # of normalized days the theme appeared in the 14d window, then
+        # walk backwards.
+        appeared_days: set[pd.Timestamp] = set(
+            theme_consec["publish_date"].dt.normalize().tolist()
+        )
+        consec = 0
+        cur = today
+        while cur in appeared_days and consec < XWLB_CONSECUTIVE_DAYS_CAP:
+            consec += 1
+            cur = cur - pd.Timedelta(days=1)
+        out.append({
+            "theme": theme,
+            "theme_mention_count_1d": float(count_1d),
+            "theme_mention_count_5d": float(count_5d),
+            "theme_consecutive_days": float(consec),
+            "theme_priority_5d_max": priority_max,
+        })
+    return out
+
+
+def build_xinwen_lianbo_factors_range(
+    start_date: str,
+    end_date: str,
+    input_dir: Path | None = None,
+) -> pd.DataFrame:
+    """Build a long-form per-theme factor DataFrame for [start, end].
+
+    Schema::
+        datetime, instrument="THEME_<UPPER>",
+        theme_mention_count_1d, theme_mention_count_5d,
+        theme_consecutive_days, theme_priority_5d_max
+
+    Dates with no theme mentions in the 5d window produce ZERO rows
+    (consistent with PE-2's sparse-by-instrument output convention —
+    a future broadcast does not need a placeholder row for a theme
+    that has not been mentioned in over a week).
+    """
+    input_root = input_dir or INPUT_DIR_XWLB
+    events = _load_xinwen_lianbo_events_from_dir(input_root)
+    s = pd.Timestamp(start_date)
+    e = pd.Timestamp(end_date)
+    if e < s:
+        raise ValueError(f"end ({end_date}) must be >= start ({start_date})")
+    rows: list[dict] = []
+    cur = s
+    while cur <= e:
+        per_theme = build_xinwen_lianbo_factors_for_date(events, cur)
+        for r in per_theme:
+            theme = r.pop("theme")
+            rows.append({
+                "datetime": cur,
+                "instrument": THEME_INSTRUMENT_PREFIX + theme.upper(),
+                **r,
+            })
+        cur += pd.Timedelta(days=1)
+    return pd.DataFrame(rows)
+
+
 def _write_health_sidecar(
     *,
     output_path: Path,
@@ -728,13 +961,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--source", default="pbc",
-        choices=["pbc", "state_council", "nbs"],
+        choices=["pbc", "state_council", "nbs", "xinwen_lianbo"],
         help=(
             "Source. 'pbc' = monetary policy (Phase E.1), produces a "
             "MARKET-keyed parquet. 'state_council' = State Council + 3 "
             "ministries (Phase E.2), produces an INDUSTRY_<NAME>-keyed "
             "parquet. 'nbs' = NBS CPI/PPI/PMI/retail sales (Phase E.3), "
-            "produces a MARKET-keyed parquet."
+            "produces a MARKET-keyed parquet. 'xinwen_lianbo' = CCTV "
+            "新闻联播 theme attention (Phase E.4), produces a "
+            "THEME_<NAME>-keyed parquet."
         ),
     )
     parser.add_argument(
@@ -756,7 +991,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.source not in ("pbc", "state_council", "nbs"):
+    if args.source not in ("pbc", "state_council", "nbs", "xinwen_lianbo"):
         logger.error("Unsupported --source %s", args.source)
         return 2
 
@@ -788,7 +1023,7 @@ def main(argv: list[str] | None = None) -> int:
         health_path = HEALTH_PATH_SC
         health_source = HEALTH_SOURCE_NAME_SC
         factor_columns = SC_FACTOR_COLUMNS
-    else:
+    elif args.source == "nbs":
         build_fn = build_nbs_factors_range
         load_fn = _load_nbs_events_from_dir
         input_dir = INPUT_DIR_NBS
@@ -796,6 +1031,15 @@ def main(argv: list[str] | None = None) -> int:
         health_path = HEALTH_PATH_NBS
         health_source = HEALTH_SOURCE_NAME_NBS
         factor_columns = NBS_FACTOR_COLUMNS
+    else:
+        # xinwen_lianbo
+        build_fn = build_xinwen_lianbo_factors_range
+        load_fn = _load_xinwen_lianbo_events_from_dir
+        input_dir = INPUT_DIR_XWLB
+        output_path = OUTPUT_PATH_XWLB
+        health_path = HEALTH_PATH_XWLB
+        health_source = HEALTH_SOURCE_NAME_XWLB
+        factor_columns = XWLB_FACTOR_COLUMNS
 
     df = build_fn(start_date=start, end_date=end)
     if df.empty:

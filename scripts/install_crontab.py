@@ -206,6 +206,30 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                 "nbs_macro_factors.log",
                 network="none", timeout_sec=300,
                 enforce_deps=True),
+        # Phase E.4 (PE-4) — CCTV Xinwen Lianbo theme attention chain.
+        # 2026-06-07 cron registration. 5-minute stagger from PE-3 to
+        # avoid stacking MiniMax RPM calls within a single minute.
+        # XWLB airs every day (incl. weekends) but the cron runs
+        # weekdays — SLA budget is 2 trading days so a single failed
+        # weekday scrape can be recovered on Monday. Same shape as
+        # PE-1/PE-2/PE-3: collect → extract → build.
+        CronJob("xinwen_lianbo_policy_texts", "45 15 * * 1-5",
+                [py, str(scripts / "collect_policy_texts.py"),
+                 "--source", "xinwen_lianbo", "--fail-on-empty"],
+                "xinwen_lianbo_policy_texts.log",
+                network="domestic", timeout_sec=600),
+        CronJob("xinwen_lianbo_policy_events", "05 16 * * 1-5",
+                [py, str(scripts / "extract_policy_events.py"),
+                 "--source", "xinwen_lianbo"],
+                "xinwen_lianbo_policy_events.log",
+                network="llm", timeout_sec=1800,
+                enforce_deps=True),
+        CronJob("xinwen_lianbo_theme_factors", "25 16 * * 1-5",
+                [py, str(scripts / "build_policy_factors.py"),
+                 "--source", "xinwen_lianbo"],
+                "xinwen_lianbo_theme_factors.log",
+                network="none", timeout_sec=300,
+                enforce_deps=True),
         # Shadow paper-trade for xgb_209_llm promotion gate.
         # 2026-06-07 (cx P2 #3 fix): originally manual; now cron so the
         # 5-day shadow window auto-accumulates without operator drift.

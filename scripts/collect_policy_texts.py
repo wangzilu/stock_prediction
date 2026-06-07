@@ -1,8 +1,9 @@
 """Collect policy texts — Phase E.1 step 1 (PBOC liquidity overlay) +
 Phase E.2 step 1 (State Council / ministry industry policy overlay) +
-Phase E.3 step 1 (NBS macro statistics overlay).
+Phase E.3 step 1 (NBS macro statistics overlay) +
+Phase E.4 step 1 (CCTV Xinwen Lianbo theme attention overlay).
 
-Fetches policy texts from one of three source registries:
+Fetches policy texts from one of four source registries:
 
 - ``--source pbc`` — People's Bank of China monetary policy texts
   (www.pbc.gov.cn), output under
@@ -13,6 +14,12 @@ Fetches policy texts from one of three source registries:
 - ``--source nbs`` — National Bureau of Statistics CPI / PPI / PMI /
   retail-sales monthly releases from ``www.stats.gov.cn``, output
   under ``data/storage/policy_texts/nbs/<YYYY-MM-DD>.jsonl``.
+- ``--source xinwen_lianbo`` — CCTV Xinwen Lianbo (新闻联播) daily
+  broadcast transcripts (mirrored via ``news.sina.com.cn`` syndication
+  because tv.cctv.com daily archive pages are JavaScript-rendered and
+  do not return a static transcript without a headless browser). Output
+  under ``data/storage/policy_texts/xinwen_lianbo/<YYYY-MM-DD>.jsonl``.
+  Source URL host is ``news.sina.com.cn``.
 
 Raw HTML for any item that fails to parse is dropped into
 ``data/storage/policy_texts/<source>_raw_html/`` so the LLM extract step
@@ -87,6 +94,14 @@ RAW_HTML_DIR_SC = DATA_DIR / "policy_texts" / "state_council_raw_html"
 # Phase E.3 (PE-3): NBS (国家统计局) macro statistics from stats.gov.cn
 POLICY_DIR_NBS = DATA_DIR / "policy_texts" / "nbs"
 RAW_HTML_DIR_NBS = DATA_DIR / "policy_texts" / "nbs_raw_html"
+# Phase E.4 (PE-4): CCTV Xinwen Lianbo (新闻联播) daily transcripts
+# mirrored via news.sina.com.cn. tv.cctv.com daily archive pages are
+# JS-rendered and the transcript is only injected after the page boots,
+# so we cannot scrape them with plain ``requests``. Sina's "新闻联播文字
+# 版" syndication mirrors the transcript as static HTML which the same
+# parse_article_page parser can extract.
+POLICY_DIR_XWLB = DATA_DIR / "policy_texts" / "xinwen_lianbo"
+RAW_HTML_DIR_XWLB = DATA_DIR / "policy_texts" / "xinwen_lianbo_raw_html"
 
 # ── PBOC list pages — kept as named constants so a structural change
 # is one-line patchable. URLs verified against the public PBOC
@@ -123,6 +138,7 @@ INTER_REQUEST_DELAY = 0.4  # be polite to gov.cn / pbc.gov.cn
 HEALTH_SOURCE_NAME = "pbc_policy_texts"
 HEALTH_SOURCE_NAME_SC = "state_council_policy_texts"
 HEALTH_SOURCE_NAME_NBS = "nbs_policy_texts"
+HEALTH_SOURCE_NAME_XWLB = "xinwen_lianbo_policy_texts"
 
 # ── Phase E.2 (PE-2) — State Council + ministry list pages.
 # Like the PBOC registry above, these are LIST pages: each renders an
@@ -200,6 +216,39 @@ NBS_TITLE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "pmi": ("采购经理指数", "PMI", "制造业景气"),
     "retail_sales": ("社会消费品零售", "社零", "消费品零售总额"),
 }
+
+
+# ── Phase E.4 (PE-4) — Xinwen Lianbo (新闻联播) list pages.
+#
+# We pull from news.sina.com.cn rather than tv.cctv.com because the
+# CCTV daily-archive pages are JS-rendered: the transcript is only
+# injected after the page boots and is not present in the initial HTML
+# returned by ``requests``. Sina's 新闻联播文字版 mirror publishes a
+# static HTML page per day at predictable URLs that the shared
+# parse_list_page / parse_article_page parsers can read without
+# changes — same gov.cn-style ``/YYYY-MM-DD/`` URL pattern.
+#
+# Two list pages: the daily roundup (news.sina.com.cn/zt_d/xwlb) and
+# the syndication category page. Both list pages have considerable
+# overlap; the dedup-by-URL pass in collect_xinwen_lianbo keeps each
+# transcript single-counted.
+XINWEN_LIANBO_LIST_URLS: dict[str, str] = {
+    "xinwen_lianbo_daily": "https://news.sina.com.cn/zt_d/xwlb/",
+    "xinwen_lianbo_category": "https://news.sina.com.cn/c/xwlb.shtml",
+}
+
+XINWEN_LIANBO_POLICY_TYPES: frozenset[str] = frozenset({
+    "xinwen_lianbo_daily",
+})
+
+# Title-keyword filter: only keep articles whose title contains a
+# Xinwen Lianbo marker. Sina's category page mixes broadcast transcripts
+# with adjacent meta-news ("xx 评论员文章"); the marker keeps the
+# transcript flow clean. Falls back to keeping the row if the title is
+# empty (defensive — let downstream LLM handle).
+XINWEN_LIANBO_TITLE_KEYWORDS: tuple[str, ...] = (
+    "新闻联播", "xwlb", "联播文字版",
+)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -979,6 +1028,176 @@ def collect_nbs(
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Phase E.4 (PE-4) — CCTV Xinwen Lianbo daily transcript collector.
+#
+# Shape-identical to collect_pbc / collect_state_council / collect_nbs.
+# The list-page / article-page parsers are reused; the only PE-4-
+# specific logic is the broadcast-title keyword filter (XWLB transcripts
+# are interleaved with adjacent comment articles on sina.com.cn).
+# Source field is ``news.sina.com.cn``; the underlying broadcaster is
+# CCTV but our scraper path goes through Sina syndication.
+# ─────────────────────────────────────────────────────────────────────
+def _title_matches_xinwen_lianbo(title: str) -> bool:
+    """Return True if ``title`` looks like an XWLB transcript article.
+
+    Falls through to True when ``title`` is empty — defensive: don't
+    drop a row whose title parse fell back, let the downstream LLM
+    decide. Otherwise must contain one of the configured XWLB markers.
+    """
+    if not title:
+        return True
+    t = title.strip()
+    if not t:
+        return True
+    return any(kw in t for kw in XINWEN_LIANBO_TITLE_KEYWORDS)
+
+
+def collect_xinwen_lianbo(
+    *,
+    start: str,
+    end: str,
+    policy_types: Iterable[str] = (
+        "xinwen_lianbo_daily", "xinwen_lianbo_category",
+    ),
+    bonus_types: Iterable[str] = (),
+    http_get_fn: Callable[..., requests.Response] = http_get,
+    output_dir: Path | None = None,
+) -> dict:
+    """Collect CCTV Xinwen Lianbo broadcast transcripts for [start, end].
+
+    Shape-identical to ``collect_pbc`` — same summary dict, same JSONL
+    schema, same atomic per-day writes. XWLB-specific differences:
+
+      - LIST URL registry is XINWEN_LIANBO_LIST_URLS (Sina mirror)
+      - source field is ``"news.sina.com.cn"``
+      - raw-html-on-failure dump goes to RAW_HTML_DIR_XWLB
+      - policy_type is always ``"xinwen_lianbo_daily"`` (single broadcast
+        per day, no series split)
+      - title-keyword filter keeps only rows whose title contains an
+        XWLB marker (新闻联播 / xwlb / 联播文字版) to avoid the
+        adjacent comment articles on the same category index.
+
+    XWLB airs every day (incl. weekends) but the cron only fires on
+    weekdays. The SLA budget is 2 trading days so a single failed
+    scrape can be recovered on Monday without painting the gate red.
+    """
+    output_root = output_dir or POLICY_DIR_XWLB
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    dates = _date_range(start, end)
+    date_set: set[str] = set(dates)
+
+    summary: dict = {
+        "rows_by_date": {d: 0 for d in dates},
+        "errors": [],
+        "files_written": [],
+        "policy_types_seen": {},
+        "n_total": 0,
+    }
+
+    by_date_rows: dict[str, list[dict]] = {d: [] for d in dates}
+    seen_urls: set[str] = set()
+    session = requests.Session()
+
+    for pt in list(policy_types) + list(bonus_types):
+        list_url = XINWEN_LIANBO_LIST_URLS.get(pt)
+        if not list_url:
+            continue
+        try:
+            resp = http_get_fn(list_url, session=session)
+            list_html = resp.content.decode("utf-8", errors="replace")
+        except Exception as e:
+            logger.warning("XWLB list page failed for %s: %s", pt, e)
+            summary["errors"].append(
+                {"url": list_url, "stage": "list", "msg": str(e)}
+            )
+            continue
+
+        links = parse_list_page(list_html, list_url)
+        logger.info("XWLB %s list page: %d candidate links", pt, len(links))
+
+        for ln in links:
+            # Drop comment-article rows that aren't transcript text.
+            if not _title_matches_xinwen_lianbo(ln.title):
+                continue
+            if ln.url in seen_urls:
+                continue
+            if ln.publish_date and ln.publish_date not in date_set:
+                continue
+            seen_urls.add(ln.url)
+            time.sleep(INTER_REQUEST_DELAY)
+            try:
+                art_resp = http_get_fn(ln.url, session=session)
+                art_html = art_resp.content.decode("utf-8", errors="replace")
+            except Exception as e:
+                logger.warning("XWLB article fetch failed %s: %s", ln.url, e)
+                summary["errors"].append(
+                    {"url": ln.url, "stage": "article", "msg": str(e)}
+                )
+                continue
+            try:
+                content, article_date = parse_article_page(art_html)
+            except Exception as e:
+                logger.warning("XWLB article parse failed %s: %s", ln.url, e)
+                summary["errors"].append(
+                    {"url": ln.url, "stage": "parse", "msg": str(e)}
+                )
+                _save_raw_html_on_failure(
+                    ln.url, art_html, ln.publish_date or start,
+                    raw_html_dir=RAW_HTML_DIR_XWLB,
+                )
+                continue
+
+            publish_date = ln.publish_date or article_date
+            if not publish_date:
+                _save_raw_html_on_failure(
+                    ln.url, art_html, start, raw_html_dir=RAW_HTML_DIR_XWLB,
+                )
+                summary["errors"].append(
+                    {"url": ln.url, "stage": "no_date", "msg": "no publish_date"}
+                )
+                continue
+            if publish_date not in date_set:
+                continue
+            if not content or len(content) < 20:
+                _save_raw_html_on_failure(
+                    ln.url, art_html, publish_date,
+                    raw_html_dir=RAW_HTML_DIR_XWLB,
+                )
+                summary["errors"].append(
+                    {"url": ln.url, "stage": "empty_body", "msg": "len(content)<20"}
+                )
+                continue
+
+            row = {
+                "publish_date": publish_date,
+                # Single XWLB policy_type — the daily broadcast itself.
+                "policy_type": "xinwen_lianbo_daily",
+                "title": ln.title,
+                "url": ln.url,
+                "content": content,
+                "source": "news.sina.com.cn",
+                "fetch_time": _now_utc_iso(),
+            }
+            by_date_rows[publish_date].append(row)
+            summary["policy_types_seen"]["xinwen_lianbo_daily"] = (
+                summary["policy_types_seen"].get("xinwen_lianbo_daily", 0) + 1
+            )
+
+    for d in dates:
+        rows = by_date_rows[d]
+        rows.sort(key=lambda r: (r["policy_type"], r["url"]))
+        out_path = output_root / f"{d}.jsonl"
+        _atomic_write_jsonl(rows, out_path)
+        summary["rows_by_date"][d] = len(rows)
+        summary["files_written"].append(out_path)
+        summary["n_total"] += len(rows)
+        logger.info("Wrote %d row(s) -> %s", len(rows), out_path)
+
+    return summary
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Health publishing
 # ─────────────────────────────────────────────────────────────────────
 def publish_health(
@@ -1046,13 +1265,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--source",
         default="pbc",
-        choices=["pbc", "state_council", "nbs"],
+        choices=["pbc", "state_council", "nbs", "xinwen_lianbo"],
         help=(
             "Policy source. 'pbc' = People's Bank monetary policy texts "
             "(Phase E.1). 'state_council' = State Council + 3 ministry "
             "policy docs from gov.cn (Phase E.2). 'nbs' = National "
             "Bureau of Statistics CPI / PPI / PMI / retail sales "
-            "monthly releases (Phase E.3)."
+            "monthly releases (Phase E.3). 'xinwen_lianbo' = CCTV "
+            "新闻联播 daily broadcast transcripts via Sina mirror "
+            "(Phase E.4)."
         ),
     )
     parser.add_argument(
@@ -1118,6 +1339,19 @@ def main(argv: list[str] | None = None) -> int:
             policy_types=("cpi", "ppi", "pmi", "retail_sales"),
         )
         health_source = HEALTH_SOURCE_NAME_NBS
+    elif args.source == "xinwen_lianbo":
+        # PE-4: CCTV Xinwen Lianbo daily transcript via Sina mirror. Two
+        # list pages (daily roundup + category index) — overlapping rows
+        # are deduped by URL. XWLB airs DAILY incl. weekends but the
+        # cron only runs weekdays; SLA budget is 2 trading days so a
+        # single failed scrape can be recovered on Monday.
+        collector = lambda: collect_xinwen_lianbo(
+            start=start, end=end,
+            policy_types=(
+                "xinwen_lianbo_daily", "xinwen_lianbo_category",
+            ),
+        )
+        health_source = HEALTH_SOURCE_NAME_XWLB
     else:
         # Re-raise as a hard error rather than silently no-op. The
         # argparse choices= already prevents this, but defend.

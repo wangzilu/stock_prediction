@@ -60,6 +60,14 @@ JOB_DEPS: dict[str, list[str]] = {
     "nbs_policy_texts": [],
     "nbs_policy_events": ["nbs_policy_texts"],
     "nbs_macro_factors": ["nbs_policy_events"],
+    # Phase E.4 PE-4 chain — 15:45 → 16:05 → 16:25 strict sequence.
+    # Same gating discipline as PE-1/PE-2/PE-3: no text → no LLM call;
+    # no events → no factor build. XWLB airs DAILY incl. weekends; the
+    # SLA budget is 2 trading days so a single failed weekday scrape
+    # can be recovered on Monday without painting the gate red.
+    "xinwen_lianbo_policy_texts": [],
+    "xinwen_lianbo_policy_events": ["xinwen_lianbo_policy_texts"],
+    "xinwen_lianbo_theme_factors": ["xinwen_lianbo_policy_events"],
     # ---- Post-data-update processing -------------------------------------
     "fund_flow_update": ["qlib_data_update"],
     "st_daily_factors_update": ["qlib_data_update"],

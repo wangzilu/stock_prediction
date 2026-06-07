@@ -223,6 +223,31 @@ SLA_BY_SOURCE: dict[str, SourceSLA] = {
         "aggregates). MARKET-keyed; broadcast to every stock by the "
         "FeatureMerger. 35-day budget matches the monthly release cycle.",
     ),
+    # ── PE-4 CCTV Xinwen Lianbo theme attention chain (Phase E.4) ───
+    # XWLB airs DAILY (incl. weekends) but our cron only runs weekdays.
+    # The 2-trading-day budget covers a single failed weekday scrape
+    # that gets re-run on Monday without painting the gate red. The
+    # underlying broadcast is a CNS state-media program — theme
+    # attention is a fact about media coverage, NOT a price prediction.
+    "xinwen_lianbo_policy_texts": SourceSLA(
+        "daily", 2,
+        "CCTV Xinwen Lianbo (新闻联播) daily transcript collection via "
+        "Sina syndication mirror. 2-day budget tolerates a single "
+        "failed weekday scrape that gets re-run the next morning.",
+    ),
+    "xinwen_lianbo_policy_events": SourceSLA(
+        "daily", 2,
+        "Daily LLM extraction of Xinwen Lianbo transcripts → structured "
+        "theme-attention events. 2-day budget matches the upstream "
+        "collector.",
+    ),
+    "xinwen_lianbo_theme_factors": SourceSLA(
+        "daily", 2,
+        "Daily Xinwen Lianbo theme-attention factor build. Emits per-"
+        "(theme, date) rows keyed THEME_<NAME>; FeatureMerger will map "
+        "themes → stock baskets at execution time (mapper is TBD; for "
+        "now the parquet is consumed standalone).",
+    ),
     # ── Auxiliary ───────────────────────────────────────────────────
     "weekly_mask_rebuild": SourceSLA(
         "weekly", 7,
