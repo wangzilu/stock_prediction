@@ -1441,7 +1441,23 @@ class DailyPipeline:
             if not ok:
                 continue
             short_score = _finite_float(item.get("model_score", item.get("lgb_score")))
-            # 2026-06-03 P0: do NOT filter on `short_score <= 0`. Per cx code review of the 22:00 0-recommendation incident, the trained model (242 features) is fed only 158 features at inference (no merge_for_inference call in models/short_term.py), so XGBoost follows the missing-value default branch on 84 cols, producing a narrow leaf-set whose sign on any given day is roughly coin-flip. Filtering `<= 0` silently swallows half the days. Rank order is the right signal; let the sort downstream pick top-K.
+            # 2026-06-03 P0: do NOT filter on `short_score <= 0`.
+            # Original context: the 22:00 0-recommendation incident was
+            # caused by feature-count mismatch (model trained on 242
+            # features, inference fed only 158). That underlying bug is
+            # fixed (ShortTermModel.load_from_pickle now does contract +
+            # dim gate at models/short_term.py and injects supplementary
+            # features via FeatureMerger). But the no-negative-filter
+            # convention was validated as the right ranking strategy
+            # independently — rank order on the full distribution beats
+            # a one-sided <=0 cut on several backtests. So this
+            # conservative choice stays by sorting policy, not by
+            # dim-mismatch necessity.
+            # cx P3 #5 2026-06-07 (round 2 — site 1): the original
+            # round-1 comment rewrite at scheduler/jobs.py commit 99a5d0c
+            # touched the live-path twins but missed this snapshot-path
+            # site, so the stale "fed only 158" wording survived here.
+            # Rewritten so all three sites tell the same fixed-bug story.
             has_lgb = bool(item.get("has_lgb", item.get("score_source") == "ml_model"))
             candidate = {
                 "code": code,

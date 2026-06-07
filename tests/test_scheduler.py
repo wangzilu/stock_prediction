@@ -185,8 +185,18 @@ def test_lgb_predictions_degrade_when_latest_count_is_too_low(monkeypatch):
         def predict_batch(self):
             return {"SH600519": 0.1}
 
-    fake_module = types.SimpleNamespace(ShortTermModel=FakeShortTermModel)
-    monkeypatch.setitem(sys.modules, "models.short_term", fake_module)
+    # 2026-06-07 cx batch A P2 #4 fix: pre-fix only swapped
+    # sys.modules["models.short_term"], but scheduler.jobs binds
+    # ShortTermModel at import time (line 45: `from models.short_term
+    # import ShortTermModel`). A sys.modules swap leaves the bound
+    # name untouched, so this test was hitting the REAL ShortTermModel,
+    # producing 5197 predictions, and asserting False against {} —
+    # except the assertion never tripped because the test fixture
+    # raised earlier on missing qlib in CI. Now we monkey-patch the
+    # bound symbol directly so the FakeShortTermModel is actually
+    # used; the test exercises the degrade-on-low-coverage path.
+    import scheduler.jobs as _sched_jobs
+    monkeypatch.setattr(_sched_jobs, "ShortTermModel", FakeShortTermModel)
     import models.lgb_cache as lgb_cache
 
     monkeypatch.setattr(
@@ -213,8 +223,14 @@ def test_lgb_predictions_use_valid_cache_when_live_load_fails(monkeypatch):
         def load_from_pickle(cls, model_path):
             raise ModuleNotFoundError("No module named 'qlib'")
 
-    fake_module = types.SimpleNamespace(ShortTermModel=FakeShortTermModel)
-    monkeypatch.setitem(sys.modules, "models.short_term", fake_module)
+    # 2026-06-07 cx batch A P2 #4 fix: see twin in
+    # test_lgb_predictions_degrade_when_latest_count_is_too_low.
+    # Also: with the cache-fallback status="degraded" change from
+    # cx round 5 (commit ed663e5), the assertion below must match
+    # the new semantics — "ok" was the pre-fix value that hid the
+    # live-inference failure.
+    import scheduler.jobs as _sched_jobs
+    monkeypatch.setattr(_sched_jobs, "ShortTermModel", FakeShortTermModel)
     import models.lgb_cache as lgb_cache
 
     monkeypatch.setattr(
@@ -229,7 +245,7 @@ def test_lgb_predictions_use_valid_cache_when_live_load_fails(monkeypatch):
     preds = pipeline._load_lgb_predictions()
 
     assert preds["SH600519"] == 0.12
-    assert pipeline._lgb_status["status"] == "ok"
+    assert pipeline._lgb_status["status"] == "degraded"
     assert pipeline._lgb_status["source"] == "cache"
     assert pipeline._lgb_status["latest_date"] == "2026-05-07"
 
