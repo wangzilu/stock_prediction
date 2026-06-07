@@ -1630,6 +1630,20 @@ class FeatureMerger:
             ]
             if not factor_cols:
                 return None
+            # cx F.P1 #3 belt-and-braces (2026-06-07): the source parquet
+            # is supposed to be UPPERCASE qlib instruments after the
+            # collect_guba_sentiment.py fix, but if any future drift
+            # writes lowercase again the case-sensitive reindex below
+            # would silently miss every row and emit a dead constant-zero
+            # column. Normalize the instrument level here so the loader
+            # is robust regardless of producer.
+            if df.index.nlevels >= 2:
+                try:
+                    df.index = df.index.set_levels(
+                        df.index.levels[1].astype(str).str.upper(), level=1,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug("Guba case-normalize skipped (non-string level)")
             result = df[factor_cols].reindex(index)
             non_null = result.notna().any(axis=1).sum()
             logger.info("Guba factors: %d cols, %d rows non-null",

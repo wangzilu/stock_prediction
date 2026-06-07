@@ -56,10 +56,16 @@ def fetch_popularity_ranking() -> list[dict]:
                 rc = item.get("rc", 0)   # rank change
                 hrc = item.get("hisRc", 0)  # historical rank change
                 if sc:
-                    # Convert SZ000725 → 000725.SZ for ts_code, sz000725 for qlib
+                    # Convert SZ000725 → 000725.SZ for ts_code, SZ000725 for qlib.
+                    # cx F.P1 #3 (2026-06-07): qlib_code MUST be UPPERCASE so
+                    # FeatureMerger's MultiIndex reindex (case-sensitive) hits
+                    # the production training index keyed by SH/SZ/BJ + code.
+                    # Pre-fix this wrote ``sh600000`` etc., so the reindex
+                    # missed every row → near-100% NaN → fill-zero → a dead
+                    # constant-zero "factor" column that looked alive.
                     code = sc[2:]
-                    exchange = sc[:2]
-                    qlib_code = f"{exchange.lower()}{code}"
+                    exchange = sc[:2].upper()
+                    qlib_code = f"{exchange}{code}"
                     ts_code = f"{code}.{exchange}"
                     results.append({
                         "qlib_code": qlib_code,
@@ -99,10 +105,51 @@ def collect_daily(target_date: str):
     return output_path
 
 
+def _migrate_lowercase_parquet_to_uppercase():
+    """One-shot in-place migration for cx F.P1 #3.
+
+    Before the 2026-06-07 case fix, ``guba_factors.parquet`` was written
+    with lowercase qlib instruments (``sh600000``). FeatureMerger reindexes
+    by the production training MultiIndex which is keyed by UPPERCASE
+    (``SH600000``), so every row missed → near-100% NaN → fill-zero in
+    the downstream NaN handler → a dead constant-zero column that the
+    model would happily train on as if it were a real factor. This
+    function reads the existing parquet, uppercases the instrument level
+    of its MultiIndex, and rewrites the file. Runs at most once per
+    machine — the second run sees an already-uppercase index and is a
+    no-op.
+    """
+    import pandas as pd
+
+    out_path = DATA_DIR / "guba_factors.parquet"
+    if not out_path.exists():
+        return
+    try:
+        existing = pd.read_parquet(str(out_path))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[guba-case-migration] read failed, skipping: %s", exc)
+        return
+    if not isinstance(existing.index, pd.MultiIndex) or existing.index.nlevels < 2:
+        return
+    inst_level_vals = existing.index.get_level_values(1).astype(str)
+    upper_vals = inst_level_vals.str.upper()
+    n_changed = int((inst_level_vals != upper_vals).sum())
+    if n_changed == 0:
+        return
+    existing.index = existing.index.set_levels(
+        existing.index.levels[1].astype(str).str.upper(), level=1,
+    )
+    existing.to_parquet(str(out_path))
+    logger.info("[guba-case-migration] %d rows uppercased", n_changed)
+
+
 def build_factors():
     """Build popularity factor parquet from all collected daily files."""
     import pandas as pd
     import numpy as np
+
+    # cx F.P1 #3: one-shot migration of pre-fix lowercase parquet.
+    _migrate_lowercase_parquet_to_uppercase()
 
     files = sorted(GUBA_DIR.glob("*.jsonl"))
     if not files:
@@ -114,7 +161,13 @@ def build_factors():
         with open(f) as fh:
             for line in fh:
                 try:
-                    all_records.append(json.loads(line))
+                    rec = json.loads(line)
+                    # cx F.P1 #3: any pre-fix JSONL line carries a
+                    # lowercase qlib_code; force uppercase on read so
+                    # rebuilds from old data emit the right index.
+                    if "qlib_code" in rec and isinstance(rec["qlib_code"], str):
+                        rec["qlib_code"] = rec["qlib_code"].upper()
+                    all_records.append(rec)
                 except json.JSONDecodeError:
                     continue
 
