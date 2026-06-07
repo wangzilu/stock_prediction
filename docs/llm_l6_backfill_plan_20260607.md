@@ -206,3 +206,58 @@ given the news recency constraint). If the answer is "still no
 ΔRankIC ≥ +0.005 even with the gap filled", the project lead's
 original concern that the LLM event factor is structurally
 inadequate is confirmed and we move on.
+
+## 9. Launch postscript — 2026-06-07 22:50 / 22:55 BOTH 429-stormed
+
+Two launch attempts tonight, both killed within 5 minutes after
+hitting the MiniMax account-level RPM cap on every call.
+
+| attempt | PID    | rpm | result                                |
+|---------|--------|-----|---------------------------------------|
+| 22:50   | 22496  |  60 | 0 successes, 12+ 4-attempt 429 fails  |
+| 22:55   | 47511  |  30 | 0 successes, ~10 4-attempt 429 fails  |
+
+Both runs hit ``HTTP 429 rate_limit_error: rate limit exceeded(RPM)
+(1002)``. The `(1002)` is MiniMax's **account-shared RPM counter**,
+not our per-instance rate. We were sending ≤30 RPM in the second
+attempt; the account meter is still saturated from today's 16:30
+daily cron (which extracted ~22k events that built `llm_event_factors`
+end at 17:29 per `logs/llm_event_pipeline.log`).
+
+A standalone single-call probe at 22:55 succeeded in 6.7s (token
+usage 406+96=502, no 429), confirming MiniMax itself is alive — the
+quota is intermittently saturated when the daily cron's tail
+activity overlaps with our backfill bursts.
+
+Side effect to flag: the first launch deleted
+`llm_events_v2/2026-05-25.jsonl` (256 events) before stalling, then
+the second launch wrote 95 events into it before being killed. So
+the v2 file for 2026-05-25 is now thinner than it was pre-L6. The
+unified `events/2026-05-25.jsonl` retains the original 256 events
+(EventStore dedups by `_hash` in `add_events`), so the production
+factor build is unaffected.
+
+### Operator next step
+
+Wait until off-peak (e.g. early next morning, before the 16:30 daily
+cron) and relaunch:
+
+```bash
+cd /Users/wangzilu/MyProjects/stockPrediction
+nohup python -u scripts/run_l6_backfill.py --sleep-secs 60 --rpm 20 \
+  > logs/llm_l6_backfill.log 2>&1 &
+echo "BACKFILL_PID=$!" > logs/llm_l6_backfill.pid
+```
+
+In a separate shell, register the followup (will block until the
+backfill log shows `[L6 backfill done]`):
+
+```bash
+nohup scripts/run_l6_followup.sh > logs/llm_l6_followup.log 2>&1 &
+```
+
+If 429s persist even at off-peak hours with rpm=20, escalate to
+MiniMax for an account RPM cap raise, or split the L6 backfill
+across multiple accounts via env-variable swap. The driver script
+is idempotent — re-running it picks up where it left off based on
+the per-date `≥--min-events` skip rule.
