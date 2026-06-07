@@ -974,19 +974,15 @@ class FeatureMerger:
         # dimension-preserving (model sees the 10 columns it expects,
         # just always as 0). Re-enable contract for real macro values
         # documented below remains in force.
-        path = self.data_dir / "macro_features.parquet"
-        if not path.exists():
-            # No parquet → no column-name template → cannot synthesise.
-            return None
-        try:
-            df_template = pd.read_parquet(path)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("macro template parquet read failed: %s", e)
-            return None
-        factor_cols = [c for c in df_template.columns
-                       if c not in ("date", "collected_at")]
-        if not factor_cols:
-            return None
+        # cx F.P2 #6 (2026-06-07): pin column NAMES to a static tuple
+        # in config.production_features, NOT to whatever the live
+        # macro_features.parquet template happens to have today.
+        # Pre-fix any schema drift in the template (collector adds a
+        # new col, renames an old one) would silently change the
+        # supplementary dimension and the count gate at
+        # ``assert_profile_dimensions`` would refuse the contract.
+        # The static list freezes current production-contract state.
+        from config.production_features import MACRO_ZERO_BASELINE_COLS
 
         # Single warn-once per session
         if not getattr(FeatureMerger, "_macro_drop_warned", False):
@@ -997,7 +993,7 @@ class FeatureMerger:
             )
             FeatureMerger._macro_drop_warned = True
 
-        macro_cols = [f"macro_{c}" for c in factor_cols]
+        macro_cols = [f"macro_{c}" for c in MACRO_ZERO_BASELINE_COLS]
         return pd.DataFrame(
             np.zeros((len(index), len(macro_cols)), dtype=np.float32),
             index=index,

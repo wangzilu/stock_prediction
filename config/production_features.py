@@ -268,6 +268,42 @@ RESEARCH_ALL_LOADERS: str = "_research_all_"
 
 
 # ---------------------------------------------------------------------------
+# cx F.P2 #6 (2026-06-07): pin macro_zero_baseline column NAMES
+# ---------------------------------------------------------------------------
+# Pre-fix ``FeatureMerger._load_macro`` derived its emitted column list
+# from whatever ``macro_features.parquet`` happened to have on disk. The
+# parquet is a TEMPLATE — a single-row snapshot whose schema can drift
+# as the collector script adds/renames columns. Any such drift would
+# silently change the supplementary dimension (51 → 52 → 50 → …) under
+# the production model, and the count gate at
+# ``assert_profile_dimensions`` would refuse the contract.
+#
+# The fix is to take the dimension OUT of the template's hands: the
+# loader reads ONLY the names below, emits zeros for them, and ignores
+# whatever else the template has. The names match what the live
+# production contract artifacts already encode (see
+# data/storage/production_feature_contract_xgb_209.json), so this is
+# strictly a freeze of current state — not a behaviour change today.
+#
+# To add or remove a macro column SAFELY: edit this tuple, regenerate
+# the production contract via ``scripts/train_lgb.py``, and update
+# ``PROFILE_EXPECTED_COUNTS[*]["supplementary"]`` for any affected
+# profile in the same commit.
+MACRO_ZERO_BASELINE_COLS: tuple[str, ...] = (
+    "bond_10y",
+    "bond_1y",
+    "term_spread",
+    "usdcny",
+    "copper_close",
+    "iron_ore_close",
+    "crude_oil_close",
+    "gold_futures_close",
+    "pmi",
+    "cpi",
+)
+
+
+# ---------------------------------------------------------------------------
 # Qlib custom expression profile (cx round 10 follow-up, 2026-06-04)
 # ---------------------------------------------------------------------------
 # The xgb_174 profile needs not just FeatureMerger groups but ALSO a set
