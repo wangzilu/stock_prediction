@@ -17,6 +17,23 @@ import os
 import logging
 import importlib.util
 
+# 2026-06-08 morning-hang root cause: macOS spawns joblib workers via
+# `loky` (spawn-based). Workers re-import this script, triggering
+# scheduler.jobs / qlib imports that themselves call joblib.Parallel
+# (qlib.data.dataset_processor at qlib/data/data.py:577). Nested
+# joblib in a spawn-bootstrapping child raises RuntimeError(
+# "An attempt has been made to start a new process before the
+# current process has finished its bootstrapping phase"), the worker
+# dies, and the parent joblib.Parallel hangs forever waiting for
+# results — that's the 25-minute silent hang at 09:24.
+#
+# Forcing JOBLIB_MULTIPROCESSING=0 tells joblib to fall back to a
+# sequential loop. No spawn, no recursion, no hang. Slightly slower
+# Alpha158 setup (~30s vs ~10s) but it actually completes. Set BEFORE
+# any joblib/qlib import. setdefault so an operator who explicitly
+# wants parallel (e.g. for batch experimentation) can override.
+os.environ.setdefault("JOBLIB_MULTIPROCESSING", "0")
+
 # Ensure working directory is project root (for crontab execution)
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 

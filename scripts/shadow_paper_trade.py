@@ -34,6 +34,11 @@ Usage:
 """
 from __future__ import annotations
 
+import os
+# Must precede joblib/qlib import — see main.py header for the
+# 2026-06-08 morning-hang root cause writeup.
+os.environ.setdefault("JOBLIB_MULTIPROCESSING", "0")
+
 import argparse
 import json
 import logging
