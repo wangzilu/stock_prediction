@@ -112,8 +112,41 @@ def predict_top_n(profile: str, date: str, top_n: int = TOP_N) -> pd.DataFrame:
     df = pd.read_parquet(cache_path)
     # Filter to target date.
     dt = pd.Timestamp(date)
+    # 2026-06-08 fix: shadow_paper_trade_generate cron at 09:00 wants
+    # TODAY's row but the cache is refreshed by champion_cache_rebuild
+    # at 18:30 weekday — so at 09:00 the latest cache row is
+    # YESTERDAY's close (or the prior weekday's). Pre-fix df.xs() raised
+    # KeyError("Timestamp(...)") and the whole profile crashed, pushing
+    # a failure alert every morning. Now: try the exact date first,
+    # fall back to the most recent available date with a WARN. The
+    # backfill side stays exact (it queries --date YYYY-MM-DD known
+    # to be in cache).
     if "datetime" in df.index.names:
-        day_df = df.xs(dt, level="datetime", drop_level=False)
+        try:
+            day_df = df.xs(dt, level="datetime", drop_level=False)
+        except KeyError:
+            all_dates = df.index.get_level_values("datetime").unique()
+            if len(all_dates) == 0:
+                logger.error("Cache empty for profile=%s", profile)
+                return pd.DataFrame()
+            fallback_dt = sorted(all_dates)[-1]
+            if fallback_dt >= dt:
+                # cache has FUTURE rows but not today's specific row —
+                # data is corrupted or test scenario; bail.
+                logger.error(
+                    "profile=%s date=%s not in cache and latest cache "
+                    "date %s is not strictly before — refusing fallback.",
+                    profile, dt.date(), fallback_dt.date(),
+                )
+                return pd.DataFrame()
+            logger.warning(
+                "profile=%s date=%s missing in cache; falling back to "
+                "latest available cache date %s (cache typically "
+                "refreshes after market close — 09:00 generate runs "
+                "BEFORE today's bar lands).",
+                profile, dt.date(), fallback_dt.date(),
+            )
+            day_df = df.xs(fallback_dt, level="datetime", drop_level=False)
     else:
         day_df = df[df["datetime"] == dt]
     if day_df.empty:
