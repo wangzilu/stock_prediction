@@ -80,19 +80,45 @@ Regression evidence:
 
 - `tests/test_market_judge_weights.py` passed in the targeted test run.
 
-### A5-4: geo fallback no longer reads supply-chain news
+### A5-4: geo fallback as-of with PIT constraints (revised 2026-06-08)
 
 Pre-fix risk:
 
 - When `MacroCollector` returned no headlines, geo analysis could fall
-  back to `global_industry_news`.
-- That mixed supply-chain research material into macro / geo reporting.
+  back to `global_industry_news` without date constraints — letting
+  future-dated supply-chain rows leak into a "today" decision.
 
-Post-fix behavior:
+Original A5-4 (2026-06-06):
 
-- `scheduler/jobs.py:2306` falls back only to `macro_policy_news`.
-- `scheduler/jobs.py:2314` rejects files after the target date.
-- `scheduler/jobs.py:2316` rejects files older than one trading day.
+- Restricted fallback to `macro_policy_news` with PIT constraints
+  (`file_date <= target`, `trading_day_age <= 1`).
+- Goal: keep supply-chain news semantically out of the geo channel.
+
+Revision 2026-06-08:
+
+- `macro_policy_news` collector was never built. The strict path
+  silently produced `geo_factors={...:0.0}` every evening — fewer
+  signals than reading noisy headlines.
+- Restored `global_industry_news` as the fallback source, **keeping the
+  PIT constraints** that were the actual safety control.
+- In practice the cached global_industry_news file carries plenty of
+  macro/geo content (export controls, US-China tech decoupling, central
+  bank stance covered by the same RSS feeds), so the semantic-purity
+  concern from the original A5-4 was overweighted relative to the
+  silent-zero failure mode it introduced.
+
+Current behavior:
+
+- `scheduler/jobs.py:2418` falls back to `global_industry_news`.
+- `scheduler/jobs.py:2426` rejects files after the target date.
+- `scheduler/jobs.py:2430` rejects files older than one trading day.
+
+Re-tightening path:
+
+- When/if a real `macro_policy_news` collector is added (separate RSS
+  feeds for policy/macro only), flip the directory back here. The
+  scaffolding (PIT filter + age gate + 3-candidate sort) is unchanged
+  and works on either source.
 
 ## Production Impact
 

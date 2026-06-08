@@ -2406,16 +2406,20 @@ class DailyPipeline:
         headlines = [item.get("title", "") for item in all_news if item.get("title")]
 
         # MacroCollector returns [] in domestic profile (proxy unavailable).
-        # Fall back only to as-of macro/policy news. Supply-chain news
-        # (global_industry_news) is not a macro/geo source and must not be
-        # used here.
+        # Fall back to cached global_industry_news with PIT constraints
+        # (file_date <= target, age <= 1 trading day). A5-4 originally
+        # restricted this to macro_policy_news, but that collector was
+        # never built — the strict path silently produced zero geo
+        # factors every evening. global_industry_news in practice carries
+        # plenty of geo/policy content (chip export controls, US-China
+        # tech decoupling, etc.); prefer noisy fallback over silent zeros.
         if not headlines:
             from pathlib import Path
             from config.settings import DATA_DIR
             import json as _json_gn
             target = getattr(self, "_pipeline_target_date", None) or datetime.now().strftime("%Y-%m-%d")
             target_ts = pd.Timestamp(target)
-            gn_dir = DATA_DIR / "macro_policy_news"
+            gn_dir = DATA_DIR / "global_industry_news"
             if gn_dir.exists():
                 candidates = []
                 for path in gn_dir.glob("*.jsonl"):
@@ -2447,7 +2451,7 @@ class DailyPipeline:
                         if gn_headlines:
                             headlines = gn_headlines[:120]
                             logger.info(
-                                "MacroCollector returned 0; using cached macro_policy_news %s (%d headlines)",
+                                "MacroCollector returned 0; using cached global_industry_news %s (%d headlines)",
                                 gn_path.name, len(headlines),
                             )
                             break
