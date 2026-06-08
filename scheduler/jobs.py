@@ -322,15 +322,33 @@ class DailyPipeline:
                 logger.warning("Failed to load LGB model/cache: %s", self._lgb_status["error"])
                 return self._lgb_predictions
 
+        # 2026-06-08 morning-hang root-cause diagnostic: when the morning
+        # 09:20 cron hangs silently for 25 min before timeout-kill, the
+        # log shows nothing past "Stage 1: Screening" → qlib init →
+        # 25-min void. We don't know WHICH step is stuck. faulthandler
+        # writes a full per-thread stack trace to stderr every 60s so
+        # the wrapper log finally tells us where it died. The 60s cadence
+        # is small enough that 25-min hang would produce ~24 dumps —
+        # one of them will pinpoint the blocking call. dump_traceback_later
+        # is no-op when no hang happens (just registers a timer).
+        import faulthandler, sys
+        try:
+            faulthandler.dump_traceback_later(60, repeat=True, file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             # P0-1: ShortTermModel / FeatureContractViolation / lgb_cache
             # helpers are imported at module level — a missing module
             # is process-startup death, not a per-day silent cache
             # fallback.
+            logger.info("[lgb_load] step 1/3: ShortTermModel.load_from_pickle ...")
             model = ShortTermModel.load_from_pickle(
                 str(LGB_MODEL_PATH)
             )
+            logger.info("[lgb_load] step 2/3: model loaded; predict_batch ...")
             preds = model.predict_batch()
+            logger.info("[lgb_load] step 3/3: predict_batch returned %d entries",
+                        len(preds))
             finite_preds = finite_prediction_map(preds)
             if len(finite_preds) < LGB_MIN_PREDICTIONS:
                 return _use_cache(

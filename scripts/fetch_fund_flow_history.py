@@ -221,6 +221,15 @@ def save_checkpoint(all_dfs: list, path: Path, dedup_cols: list):
         else:
             logger.warning(f"  Skip dedup for {path.name}; missing columns: {dedup_cols}")
     path.parent.mkdir(parents=True, exist_ok=True)
+    # 2026-06-08: AKShare's ggt_ss (港股通南向) field intermittently
+    # returns NaN floats mixed with strings — pyarrow.Table.from_pandas
+    # then raises ArrowTypeError("Expected bytes, got a 'float' object")
+    # and the whole checkpoint write fails (see 6-8 18:21 incident).
+    # Coerce all object-dtype columns to str — preserves human-readable
+    # values, eliminates the mixed-type-column trap, costs nothing for
+    # already-string columns. Numeric columns are untouched.
+    for _col in result.select_dtypes(include="object").columns:
+        result[_col] = result[_col].astype(str)
     result.to_parquet(path, index=False)
     logger.info(f"  Checkpoint: saved {len(result)} records to {path.name}")
 
@@ -648,6 +657,9 @@ def _save_with_merge(new_df: pd.DataFrame, path: Path, dedup_cols: list, label: 
         if all(c in new_df.columns for c in dedup_cols):
             new_df.drop_duplicates(subset=dedup_cols, keep="last", inplace=True)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # 2026-06-08: see batch_fetch site for ggt_ss mixed-type root cause.
+    for _col in new_df.select_dtypes(include="object").columns:
+        new_df[_col] = new_df[_col].astype(str)
     new_df.to_parquet(path, index=False)
     logger.info(f"Saved {label} to {path} ({len(new_df)} rows)")
     if "trade_date" in new_df.columns:

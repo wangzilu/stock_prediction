@@ -333,7 +333,12 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                  "--min-lgb-data-instruments", "4500",
                  "--check-today"],
                 "data_update.log",
-                network="domestic", timeout_sec=3600, critical=True),
+                # 2026-06-08: bump 3600→7200. Today's run got to 4650/5198
+                # at 18:45 wrapper-kill — baostock reconnect-per-batch
+                # was too slow. 2h cap absorbs slow-baostock days without
+                # cascade (champion_cache_rebuild waits, sees failure,
+                # pushes alert) like 6-8 evening.
+                network="domestic", timeout_sec=7200, critical=True),
         # cx batch G P1 #3 (2026-06-07): enforce_deps wired up. Both
         # gate on qlib_data_update per scheduler/job_deps.py.
         # dep_wait_seconds=3600 covers qlib's worst-case 3600s timeout
