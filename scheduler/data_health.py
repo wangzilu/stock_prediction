@@ -625,6 +625,20 @@ def _resolve_profile_critical_sources() -> list[str]:
         PRODUCTION_MODEL_PROFILE,
         SUPPLEMENTARY_GROUPS_BY_PROFILE,
     )
+    # 2026-06-08 follow-up: the training gate must NOT block on a
+    # weekly/quarterly source being "not today". Those cadences are
+    # validated by the per-source SLA budget in config/data_sla.py
+    # (#157 A7), not by an "expected_latest_date >= today" check that
+    # only makes sense for daily sources. Without this filter, the
+    # gate fails Mon-Fri because fundamental_update / quality_update /
+    # st_holder_number_update only refresh on Saturday — bug found
+    # when tonight's rescue smoke kept failing on
+    # ['fundamental_update', 'quality_update', 'st_holder_number_update'].
+    try:
+        from config.data_sla import SLA_BY_SOURCE
+    except Exception:  # noqa: BLE001
+        SLA_BY_SOURCE = {}
+    NON_DAILY_FREQUENCIES = {"weekly", "quarterly"}
 
     sources: list[str] = list(CRITICAL_SOURCES)  # hard floor
     supp_groups = SUPPLEMENTARY_GROUPS_BY_PROFILE.get(
@@ -632,8 +646,13 @@ def _resolve_profile_critical_sources() -> list[str]:
     )
     for group in supp_groups:
         health_source = PRODUCTION_GROUP_TO_HEALTH_SOURCE.get(group)
-        if health_source and health_source not in sources:
-            sources.append(health_source)
+        if not health_source or health_source in sources:
+            continue
+        sla = SLA_BY_SOURCE.get(health_source)
+        if sla is not None and sla.frequency in NON_DAILY_FREQUENCIES:
+            # weekly/quarterly — daily gate skips; SLA gate enforces
+            continue
+        sources.append(health_source)
     return sources
 
 
