@@ -913,6 +913,7 @@ def publish_health(
     latest_event_date: str,
     target_date: str,
     health_source: str = HEALTH_SOURCE_NAME,
+    sparse_steady: bool = False,
 ) -> None:
     """Publish PE-1 factor build health.
 
@@ -923,13 +924,18 @@ def publish_health(
     of value. Now success requires BOTH non-zero factor rows AND at
     least one underlying event — so an LLM extraction outage / parser
     regression surfaces as a failure on the day it happens.
+
+    2026-06-09 follow-up: state_council / xinwen_lianbo are
+    sparse-by-design — a window with 0 events is a legitimate
+    steady state, not a pipeline failure. Caller passes
+    sparse_steady=True for those so the freshness gate stays green.
     """
     try:
         from scheduler.data_health import HealthStatus, write_health
     except Exception as e:  # pragma: no cover — broken install
         logger.warning("Cannot import scheduler.data_health (%s)", e)
         return
-    has_real_signal = n_rows > 0 and n_events > 0
+    has_real_signal = sparse_steady or (n_rows > 0 and n_events > 0)
     status = HealthStatus(
         success=has_real_signal,
         n_items=n_rows,
@@ -1060,10 +1066,16 @@ def main(argv: list[str] | None = None) -> int:
             if not events.empty else ""
         )
         sparse_by_design = args.source in ("xinwen_lianbo", "state_council")
-        if sparse_by_design and n_events > 0:
+        if sparse_by_design:
+            # 2026-06-09: state_council failed today even though events
+            # ran OK, because the [lookback, end] window happened to
+            # contain 0 events. For sparse-by-design sources this is a
+            # legitimate steady state — drop the original n_events > 0
+            # guard. (Earlier C.P2 #4 fix was over-restrictive.)
             logger.info(
-                "[%s] no_theme_signal (%d events but 0 material themes) — "
-                "exit 0; this is the sparse-by-theme steady state.",
+                "[%s] sparse-by-design source: %d events in window, "
+                "0 material factor rows — exit 0 (steady state, not "
+                "pipeline failure).",
                 args.source, n_events,
             )
             publish_health(
@@ -1072,6 +1084,7 @@ def main(argv: list[str] | None = None) -> int:
                 latest_event_date=latest_event_date,
                 target_date=end,
                 health_source=health_source,
+                sparse_steady=True,
             )
             return 0
         publish_health(

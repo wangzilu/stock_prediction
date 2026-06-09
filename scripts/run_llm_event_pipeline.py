@@ -345,6 +345,33 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
 
     news_path = filtered_path
 
+    # 2026-06-09: when akshare bak_basic + tushare liquid_stocks both
+    # fail upstream, collect_daily_news returns a path but never writes
+    # the file. extract_from_news_file then ENOENTs and the whole job
+    # exits 1 + pushes a Failure alert. That's a noisy false-positive —
+    # the news API was down, the pipeline can't help. Treat it as a
+    # soft fail: write partial health (success=False, error_type set)
+    # and return False without raising.
+    if not news_path.exists():
+        logger.error(
+            "  News file missing after Step 1.5 (%s) — upstream news "
+            "API was down today. Marking pipeline partial, returning "
+            "False without crashing extractor.", news_path,
+        )
+        try:
+            from scheduler.data_health import HealthStatus, write_health
+            write_health("llm_event_pipeline", HealthStatus(
+                success=False,
+                n_items=0,
+                error_type="upstream_news_api_down",
+                error_message=f"news_path={news_path} not written by Step 1",
+                network_profile="domestic",
+                extra={"partial": True, "stage": "step_1_collect"},
+            ))
+        except Exception as _hexc:  # pragma: no cover
+            logger.warning("  Could not write partial health: %s", _hexc)
+        return False
+
     # Step 2: Extract events via LLM (120-min timeout for full-A 5000 stocks)
     logger.info("[Step 2/3] Extracting events via MiniMax LLM...")
     try:
