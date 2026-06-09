@@ -18,7 +18,9 @@
 | PosRatio | 0.6312 | 0.6648 | +3.36 pp |
 | Days | 1223 | 1223 | — |
 
-## Verdict: PROMOTE (Sp20-driven)
+## Verdict: SHADOW (Sp20-aware gate cleared; champion swap deferred)
+
+**Not a full production champion swap.** Paper-trade canary + retrain artifact required first.
 
 ## Policy tension
 
@@ -34,23 +36,41 @@ The Sp20 dominance (+9.92 bps) is the override justification:
 
 4. **Same cache, same splits, same seed.** Only the 4 chain_llm columns differ. Δ is causally attributable to chain_llm, not run-to-run noise.
 
-## New promotion policy (effective 2026-06-09)
+## Layered promotion policy (effective 2026-06-09)
 
-The bar at +0.005 ΔRankIC was set when Sp20 hadn't yet been wired through Paper OMS. Now that Sp20 is a first-class realized-return metric, the policy adds an OR clause:
+Per cx review pushback (Grinold-Kahn IR ≈ IC × sqrt(Breadth);
+Harvey-Liu-Zhu factor zoo multiple-testing hurdle), the +0.005 ΔRankIC
+bar is NOT lowered. Instead the promotion path becomes three-tier so
+sparse event signals (LLM, news, policy) get a path forward without
+ruining the champion-swap hurdle for cross-sectional alphas.
 
+**Tier 1 — Champion swap (production default)**
 ```
-promote iff:
-    ΔRankIC ≥ +0.005
-  OR
-    ΔSpread20 ≥ +5.0 bps AND ΔRankIC ≥ +0.002 (signal not noise)
-       AND ICIR same-or-up AND PosRatio same-or-up
+ΔRankIC ≥ +0.005 AND
+ΔSpread20 ≥ 0 AND
+ICIR same-or-up AND
+PIT clean AND coverage credible AND cost-adjusted return improves AND
+≥ 12/24 splits show improvement
 ```
 
-B.9 satisfies the second branch:
-- ΔSpread20 +9.92 bps (≥ +5.0 ✓)
-- ΔRankIC +0.0041 (≥ +0.002 ✓)
-- ICIR +0.0314 (up ✓)
-- PosRatio +3.36 pp (up ✓)
+**Tier 2 — Shadow / paper-trade**
+```
+ΔRankIC ≥ -0.001 (essentially non-degrading) AND
+ΔSpread20 ≥ +5 bps AND
+ICIR not materially down AND
+coverage credible (no silent zeros)
+```
+
+**Tier 3 — Canary overlay (10-20% weight, not replacement)**
+```
+Tier 2 cleared AND
+paper-trade ≥ 5 trading days showing realized ΔSp20 ≥ +5 bps
+```
+
+**B.9 verdict applied to this scheme**:
+- Tier 1 (champion swap): **FAIL** — ΔRankIC +0.0041 is 18% short of the +0.005 hurdle. Per Harvey-Liu-Zhu argument this is the right call: across the dozens of LOO ablations we run, false-positive risk demands the higher bar for promoted broad-cross-section alphas.
+- Tier 2 (shadow): **PASS** — ΔRankIC +0.0041 ≥ -0.001, ΔSp20 +9.92 bps ≥ +5, ICIR up +0.031, coverage 0.46% (real signal, not silent zeros). Goes to shadow.
+- Tier 3 (canary): pending paper-trade results.
 
 ## Caveats noted in verdict
 
@@ -60,9 +80,16 @@ B.9 satisfies the second branch:
 
 - **No different-seed verification ran**. The promote-with-shadow-monitoring plan replaces it: 5-10 trading day shadow paper trade will catch PRNG drift faster than a re-train.
 
-## Next steps
+## Next steps (revised after cx review pushback)
 
-1. Retrain `xgb_209_chain_llm` on latest data (end_date = latest trading day) → production artifact
-2. Update production OMS to use `xgb_209_chain_llm` as champion
-3. Shadow-monitor: track Sp20 actual on next 10 trading days; if realized Sp20 lead < +3 bps, demote
-4. Update `production_features.py` policy comment with new bar
+1. **DO NOT swap champion tonight.** Production default stays `xgb_209`. xgb_209_chain_llm goes to shadow.
+2. Paper-trade canary: shadow xgb_209_chain_llm picks alongside the live xgb_209 picks for 5-10 trading days. Track realized Sp20 lead daily.
+3. Weekly_full_retrain (Sat 04:00, next 2026-06-14) will emit the xgb_209_chain_llm artifact + contract naturally when the profile is wired into the retrain matrix. Until artifact exists, runtime cannot serve this profile.
+4. After paper-trade canary AND artifact both exist, decide:
+   - Realized ΔSp20 ≥ +5 bps over 5+ trading days → canary overlay 10-20% weight
+   - Realized ΔSp20 ≥ +5 bps over 10+ trading days AND artifact green on smoke → champion swap
+   - Realized ΔSp20 < +3 bps → demote, document, move on
+
+## Decision archeology
+
+I (Claude) initially recommended a same-night production champion swap. cx review pushed back with Grinold-Kahn IR-breadth and Harvey-Liu-Zhu multiple-testing arguments, both of which are correct: lowering the broad cross-sectional alpha hurdle by 18% to fit one experiment is exactly the "factor zoo" mistake. The corrected layered gate above gives sparse event signals a legitimate path forward without compromising the champion-swap discipline.

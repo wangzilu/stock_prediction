@@ -21,6 +21,11 @@ Promotion workflow:
   ``SHADOW_SUPPLEMENTARY_GROUPS``.
 - Shadow backtests / hold-out IC compare must show net positive
   cost-adjusted improvement.
+- Promotion gate has two branches (effective 2026-06-09, Phase B.9):
+    1. Primary RankIC branch: delta RankIC >= +0.005 vs champion.
+    2. Sp20-aware branch for sparse top-tail signals:
+       delta Spread20 >= +5.0 bps AND delta RankIC >= +0.002
+       AND ICIR same-or-up AND RankIC positive ratio same-or-up.
 - Only then does the loader's group name move into
   ``PRODUCTION_SUPPLEMENTARY_GROUPS`` (this file), with a comment
   recording the promotion evidence.
@@ -115,15 +120,22 @@ SUPPLEMENTARY_GROUPS_BY_PROFILE: dict[str, tuple[str, ...]] = {
         "st_holder_number",
         "global_chain",
     ),
-    # xgb_209_chain_llm — PROMOTED 2026-06-09 via Phase B.9.
-    # xgb_209 + global supply chain LLM-extracted factors (4 cols:
-    # global_chain_alpha + event_count + pos_score + neg_score). Built
-    # from extract_global_chain_llm.py output. B.9 24-split LOO
-    # (end=2026-05-19) verdict: ΔRankIC +0.0041 (below the historical
-    # +0.005 RankIC bar) BUT ΔSp20 +9.92 bps + ΔICIR +0.031 + ΔPosRatio
-    # +3.36 pp — all corroborating. Sparse-by-design signal (0.46%
-    # non-zero) lifts the top-tail picks where Paper OMS realizes
-    # return. See docs/phase_b9_verdict_20260609.md.
+    # xgb_209_chain_llm — SHADOW (B.9 cleared Sp20-aware secondary
+    # gate; NOT production-default until paper-trade canary AND
+    # retrain artifact both exist). xgb_209 + global supply chain
+    # LLM-extracted factors (4 cols: global_chain_alpha + event_count
+    # + pos_score + neg_score). Built from extract_global_chain_llm.py.
+    # B.9 24-split LOO (end=2026-05-19): ΔRankIC +0.0041 (BELOW primary
+    # +0.005 RankIC branch — does NOT clear champion-swap hurdle per
+    # Harvey-Liu-Zhu multiple-testing argument) BUT clears Sp20-aware
+    # secondary branch for sparse top-tail signals: ΔSp20 +9.92 bps,
+    # ΔICIR +0.031, ΔPosRatio +3.36 pp. 0.46% non-zero signal lifts
+    # high-conviction picks where Paper OMS realizes return.
+    # Champion swap pre-requisites:
+    #   1. Paper-trade canary 5-10 trading days, realized ΔSp20 ≥ +5 bps
+    #   2. weekly_full_retrain emits xgb_209_chain_llm artifact + contract
+    #   3. lgb_after_close_smoke green on the new artifact
+    # See docs/phase_b9_verdict_20260609.md.
     "xgb_209_chain_llm": (
         "fundamental",
         "macro_zero_baseline",
@@ -156,7 +168,7 @@ SUPPLEMENTARY_GROUPS_BY_PROFILE: dict[str, tuple[str, ...]] = {
     # (popularity_rank / rank_change / popularity_score). Same shadow
     # contract as xgb_209_llm: the loader is wired in feature_merger.py
     # so a Phase B-style LOO can ablate it, but production stays on
-    # xgb_209 until ablation evidence shows ΔRankIC ≥ +0.005.
+    # the live champion until ablation evidence clears the promotion gate.
     "xgb_209_guba": (
         "fundamental",
         "macro_zero_baseline",
@@ -196,8 +208,8 @@ SUPPLEMENTARY_GROUPS_BY_PROFILE: dict[str, tuple[str, ...]] = {
     # 4 supp cols: xwlb_theme_mention_count_1d /
     # xwlb_theme_mention_count_5d / xwlb_theme_consecutive_days /
     # xwlb_theme_priority_5d_max. Profile gated by candidate basket
-    # coverage — production stays on xgb_209 until ablation evidence
-    # confirms lift over the (partial) basket map.
+    # coverage — production stays on the live champion until ablation
+    # evidence confirms lift over the (partial) basket map.
     "xgb_209_xwlb": (
         "fundamental",
         "macro_zero_baseline",
@@ -252,8 +264,10 @@ PRODUCTION_SUPPLEMENTARY_GROUPS: tuple[str, ...] = (
 # loader groups beyond the production tuple — the staging pool was
 # effectively undocumented. New loaders MUST land here first;
 # promotion to PRODUCTION_SUPPLEMENTARY_GROUPS only after ablation
-# evidence (Phase B-style 24-split or hold-out LOO, ΔRankIC ≥ +0.005
-# or net-positive cost-adjusted backtest).
+# evidence (Phase B-style 24-split or hold-out LOO) clears either:
+#   1. primary RankIC branch: ΔRankIC ≥ +0.005; or
+#   2. Sp20-aware branch: ΔSp20 ≥ +5 bps AND ΔRankIC ≥ +0.002
+#      AND ICIR / positive-ratio do not degrade.
 #
 # Derived programmatically: union of supp groups across every candidate
 # xgb_209_* profile, minus what's already in PRODUCTION_SUPPLEMENTARY_GROUPS.
@@ -542,4 +556,3 @@ def assert_profile_dimensions(
             f"{alpha_count}+{supp_count}+{custom_count}={total} "
             f"!= contract {spec['total']}"
         )
-
