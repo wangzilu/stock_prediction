@@ -20,6 +20,13 @@ from config.settings import (
     LGB_INFERENCE_UNIVERSE,
     LGB_MIN_DATA_INSTRUMENTS,
     LGB_MIN_PREDICTIONS,
+    # 2026-06-10 cx P2 #1: PREDICTION_HORIZON_DAYS was used in the
+    # label expression (line ~536) but never imported, so ExperimentArtifact
+    # save raised NameError after the model + symlink were already on
+    # disk. Symptom seen in the 2026-06-10 00:42 retrain log: "model
+    # saved, contract saved, but experiment artifact save failed".
+    # Importing it here closes that hole.
+    PREDICTION_HORIZON_DAYS,
     QLIB_PROVIDER_URI,
 )
 from scripts.check_qlib_data_health import check_qlib_dir

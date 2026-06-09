@@ -1,7 +1,9 @@
 # Phase B.9 Verdict — xgb_209_chain_llm post-#174 density uplift
 
 **Date**: 2026-06-09  
-**Compared**: `xgb_209` baseline vs `xgb_209_chain_llm` (+4 cols: `global_chain_alpha`, `global_chain_event_count`, `global_chain_pos_score`, `global_chain_neg_score`)  
+**Compared**: `xgb_209` baseline vs `xgb_209_chain_llm` (+6 cols: 4 propagation outputs `global_chain_alpha` / `global_chain_event_count` / `global_chain_pos_score` / `global_chain_neg_score` plus 2 aggregation tiers `company_level_alpha` / `industry_level_alpha`)
+
+(Earlier draft said "+4 cols". That was a grep miss — the column-name filter only matched names containing `global` or `chain`, dropping `company_level_alpha` and `industry_level_alpha`. The cache and the live production contract both carry all 6.)  
 **Method**: 24-split LOO on `feature_cache_209_chain_llm.parquet` (built 2026-06-07 22:31, post #174 step 3 22:25 bak)  
 **End date**: 2026-06-05 (Phase B.4/B.5/B.8 parity)  
 **Runner**: `scripts/run_phase_b9_chain_llm.sh` → `scripts/phase4e_24split_ensemble.py --preset 24split --models xgb --n-estimators 500 --early-stopping-rounds 30`  
@@ -80,16 +82,38 @@ paper-trade ≥ 5 trading days showing realized ΔSp20 ≥ +5 bps
 
 - **No different-seed verification ran**. The promote-with-shadow-monitoring plan replaces it: 5-10 trading day shadow paper trade will catch PRNG drift faster than a re-train.
 
-## Next steps (revised after cx review pushback)
-
-1. **DO NOT swap champion tonight.** Production default stays `xgb_209`. xgb_209_chain_llm goes to shadow.
-2. Paper-trade canary: shadow xgb_209_chain_llm picks alongside the live xgb_209 picks for 5-10 trading days. Track realized Sp20 lead daily.
-3. Weekly_full_retrain (Sat 04:00, next 2026-06-14) will emit the xgb_209_chain_llm artifact + contract naturally when the profile is wired into the retrain matrix. Until artifact exists, runtime cannot serve this profile.
-4. After paper-trade canary AND artifact both exist, decide:
-   - Realized ΔSp20 ≥ +5 bps over 5+ trading days → canary overlay 10-20% weight
-   - Realized ΔSp20 ≥ +5 bps over 10+ trading days AND artifact green on smoke → champion swap
-   - Realized ΔSp20 < +3 bps → demote, document, move on
-
 ## Decision archeology
 
-I (Claude) initially recommended a same-night production champion swap. cx review pushed back with Grinold-Kahn IR-breadth and Harvey-Liu-Zhu multiple-testing arguments, both of which are correct: lowering the broad cross-sectional alpha hurdle by 18% to fit one experiment is exactly the "factor zoo" mistake. The corrected layered gate above gives sparse event signals a legitimate path forward without compromising the champion-swap discipline.
+The verdict went through three states in one night:
+
+1. **22:30** — Claude recommended same-night champion swap on the Sp20 dominance signal.
+2. **23:00** — cx review pushed back with Grinold-Kahn IR ≈ IC × sqrt(Breadth) and Harvey-Liu-Zhu factor-zoo multiple-testing arguments. Verdict downgraded to "SHADOW, champion swap deferred to Saturday weekly_full_retrain". The +0.005 ΔRankIC primary hurdle stayed intact; the layered 3-tier gate (Champion / Shadow / Canary) was introduced as the proper path for sparse event signals.
+3. **00:42** — User landed the production swap anyway: default `PRODUCTION_MODEL_PROFILE` flipped to `xgb_209_chain_llm`, retrain ran successfully (215 feats, 57 supp cols), artifact + contract + symlinks all in place. Per `config/production_features.py:123` the swap is documented as clearing the Sp20-aware secondary promotion branch.
+
+So as of 2026-06-10 00:42, production IS xgb_209_chain_llm — not shadow. The earlier "DO NOT swap" section was the cx-review draft and has been superseded.
+
+## Actual operational state (2026-06-10 onward)
+
+- `PRODUCTION_MODEL_PROFILE` default = `xgb_209_chain_llm`
+- Artifact: `data/storage/lgb_model_xgb_209_chain_llm.pkl` (00:42)
+- Contract: `data/storage/production_feature_contract_xgb_209_chain_llm.json`
+- Symlinks: `lgb_model.pkl` and `production_feature_contract.json` point at the chain_llm variants
+- Training health: 215 feats, 57 supp cols, predictions for 5198 instruments, stale=0, latest=2026-06-09
+- 20d Test RankIC = -0.0261 (vs previous -0.0109 baseline). **Yellow flag**: weaker on the post-train OOS slice. The B.9 24-split LOO gain is still real but this single 20d window underperforms — must validate with realized paper-trade Sp20 over 5-10 trading days.
+
+## Monitoring window (2026-06-10 → 2026-06-21)
+
+- Each trading day: log realized Sp20 vs the simulated xgb_209-baseline Sp20 on the same picks.
+- If after 5 trading days realized ΔSp20 ≥ +5 bps consistent with B.9 → keep
+- If after 5 trading days realized ΔSp20 < 0 or volatile → rollback to xgb_209 by `PRODUCTION_MODEL_PROFILE=xgb_209` env var (artifact + contract still on disk)
+- If between 0 and +5 bps → extend monitoring to 10 trading days before deciding
+
+## cx code review aftermath (2026-06-10 cx review)
+
+5 findings raised after the swap, all addressed in this commit batch:
+
+- **P1 #1** — `PRODUCTION_GROUP_TO_HEALTH_SOURCE` missing `global_chain_llm` → freshness gate would skip a now-production group. FIXED in `scheduler/data_health.py`.
+- **P1 #2** — live `_load_global_chain` reindexed without normalize/coverage gate → same case-bug pattern that invalidated B.6.3. FIXED in `models/feature_merger.py` (now uses `factors.feature_cache_utils.normalize_instrument_index` + `assert_join_coverage`).
+- **P1 #3** — this doc was contradicting production. FIXED by replacing the "DO NOT swap" section with the archeology + operational-state sections above.
+- **P2 #1** — `PREDICTION_HORIZON_DAYS` not imported in `scripts/train_lgb.py` → experiment artifact save raised NameError after model + symlink were already on disk. FIXED.
+- **P2 #2** — "+4 cols" vs 6 cols ambiguity. Earlier grep filter was wrong; the cache has 6 chain cols. Header clarified.

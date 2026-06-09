@@ -579,6 +579,20 @@ PRODUCTION_GROUP_TO_HEALTH_SOURCE: dict[str, str] = {
     "st_moneyflow": "st_moneyflow_update",
     "st_holder_number": "st_holder_number_update",
     "cross_market_regime": "regime_daily_update",
+    # 2026-06-10 (Phase B.9 promote): global_chain_llm became a
+    # production feature group. Without this mapping, training-gate
+    # would silently skip it and lgb_after_close_smoke could pass
+    # even if global_chain_factors_llm.parquet went stale or missing.
+    # Use global_chain_factors_llm as the SLA source (the factor
+    # builder publishes that key; rule-based global_chain stays
+    # separate so we can independently detect LLM-pipeline stalls
+    # without rule-side noise). Marked as the dedicated LLM health
+    # source — do NOT alias to global_chain_factors.
+    "global_chain_llm": "global_chain_factors_llm",
+    # Keep the rule-based mapping too in case xgb_209_chain ever
+    # promotes; today it's still shadow but the cross-check below
+    # warns on unmapped production groups, so this is harmless.
+    "global_chain": "global_chain_factors",
 }
 
 

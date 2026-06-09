@@ -1457,8 +1457,21 @@ class FeatureMerger:
             if df.empty or "qlib_code" not in df.columns or "date" not in df.columns:
                 return None
 
-            factor_cols = [c for c in df.columns
-                          if c.startswith("st_") and c not in ("st_code",)]
+            # Freeze to the xgb_209 / B.9 validated schema. The upstream
+            # ST parquet may grow extra numeric columns; those require a
+            # separate ablation before joining production training.
+            factor_cols = [
+                c for c in (
+                    "st_pe_ttm",
+                    "st_pb",
+                    "st_ps_ttm",
+                    "st_turnover_rate",
+                    "st_total_mv",
+                    "st_circ_mv",
+                    "st_dv_ratio",
+                )
+                if c in df.columns
+            ]
             if not factor_cols:
                 return None
 
@@ -1468,7 +1481,7 @@ class FeatureMerger:
             daily = df[["qlib_code", "date"] + factor_cols].copy()
             # PIT safety: daily_basic is published after market close on day T,
             # so it should only be available for predictions on T+1.
-            daily["date"] = pd.to_datetime(daily["date"])
+            daily["date"] = _parse_date_series(daily["date"])
             daily["date"] = daily["date"] + pd.tseries.offsets.BDay(1)
 
             result = self._asof_merge_timeseries(daily, index, "date", factor_cols)
@@ -1490,7 +1503,31 @@ class FeatureMerger:
             if df.empty or "qlib_code" not in df.columns or "date" not in df.columns:
                 return None
 
-            factor_cols = [c for c in df.columns if c.startswith("st_")]
+            # Freeze to the xgb_209 / B.9 validated schema. Newer ST
+            # amount-ratio/net columns stay research-only until ablated.
+            factor_cols = [
+                c for c in (
+                    "st_buy_sm_vol",
+                    "st_sell_sm_vol",
+                    "st_buy_md_vol",
+                    "st_sell_md_vol",
+                    "st_buy_lg_vol",
+                    "st_sell_lg_vol",
+                    "st_buy_elg_vol",
+                    "st_sell_elg_vol",
+                    "st_net_mf_vol",
+                    "st_net_mf_amount",
+                    "st_buy_sm_amount",
+                    "st_sell_sm_amount",
+                    "st_buy_md_amount",
+                    "st_sell_md_amount",
+                    "st_buy_lg_amount",
+                    "st_sell_lg_amount",
+                    "st_buy_elg_amount",
+                    "st_sell_elg_amount",
+                )
+                if c in df.columns
+            ]
             if not factor_cols:
                 return None
 
@@ -1501,7 +1538,7 @@ class FeatureMerger:
 
             # PIT safety: moneyflow data is published after market close on day T,
             # so it should only be available for predictions on T+1.
-            mf_daily["date"] = pd.to_datetime(mf_daily["date"])
+            mf_daily["date"] = _parse_date_series(mf_daily["date"])
             mf_daily["date"] = mf_daily["date"] + pd.tseries.offsets.BDay(1)
 
             result = self._asof_merge_timeseries(
@@ -1570,13 +1607,26 @@ class FeatureMerger:
         2026-06-07 (Phase B.7): added so xgb_209_chain / xgb_209_chain_llm
         candidate profiles can ablate via the standard --drop-group path.
         ``llm=False`` reads the rule-based parquet (production cron).
-        ``llm=True`` reads the LLM-extracted parquet (B.7 ablation).
+        ``llm=True`` reads the LLM-extracted parquet (Phase B.9 promote).
         Both share the same downstream loader so only the source events
         differ — the propagation, decay and shrink are identical.
 
+        2026-06-10 (cx P1 #2 post-B.9 promote): wired case-norm + coverage
+        gate through factors.feature_cache_utils. B.8 case-bug showed
+        .reindex() onto a base index with mismatched instrument case
+        silently produces all-NaN columns that pass dimension checks but
+        carry zero signal. Now that this loader serves the production
+        champion path, the same discipline that guards the offline
+        cache builder must guard the live loader.
+
         Drops the non-numeric ``level`` column before reindex.
         """
+        from factors.feature_cache_utils import (
+            normalize_instrument_index,
+            assert_join_coverage,
+        )
         name = "global_chain_factors_llm.parquet" if llm else "global_chain_factors.parquet"
+        source_name = f"global_chain_{'llm' if llm else 'rule'}"
         path = self.data_dir / name
         if not path.exists():
             logger.warning("Chain factors parquet not found: %s", path)
@@ -1589,6 +1639,9 @@ class FeatureMerger:
                 logger.warning("Chain parquet has unexpected index: %s",
                                df.index.names)
                 return None
+            df = normalize_instrument_index(
+                df, level="instrument", source_name=source_name,
+            )
             factor_cols = [
                 c for c in df.columns
                 if pd.api.types.is_numeric_dtype(df[c])
@@ -1596,6 +1649,17 @@ class FeatureMerger:
             if not factor_cols:
                 return None
             result = df[factor_cols].reindex(index)
+            # Fail loudly on the B.6.3 / B.8 zero-coverage pattern —
+            # better than a silently-empty production champion. Default
+            # min_match_pct=1e-5 is well below the chain 0.46% non-zero
+            # rate so legitimate sparsity passes; only the case-mismatch
+            # "0 of 6M rows" outcome raises.
+            assert_join_coverage(
+                source_df=df,
+                reindexed=result,
+                factor_cols=factor_cols,
+                source_name=source_name,
+            )
             non_null = result.notna().any(axis=1).sum()
             logger.info("Chain factors (%s): %d cols, %d rows non-null",
                         "llm" if llm else "rule", len(factor_cols), non_null)
