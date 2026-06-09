@@ -115,10 +115,15 @@ SUPPLEMENTARY_GROUPS_BY_PROFILE: dict[str, tuple[str, ...]] = {
         "st_holder_number",
         "global_chain",
     ),
-    # xgb_209_chain_llm — CANDIDATE profile for Phase B.7 ablation.
-    # xgb_209 + global supply chain LLM-extracted factors (same 6 cols
-    # as xgb_209_chain but from extract_global_chain_llm.py output).
-    # Differs from xgb_209_chain only in event source.
+    # xgb_209_chain_llm — PROMOTED 2026-06-09 via Phase B.9.
+    # xgb_209 + global supply chain LLM-extracted factors (4 cols:
+    # global_chain_alpha + event_count + pos_score + neg_score). Built
+    # from extract_global_chain_llm.py output. B.9 24-split LOO
+    # (end=2026-05-19) verdict: ΔRankIC +0.0041 (below the historical
+    # +0.005 RankIC bar) BUT ΔSp20 +9.92 bps + ΔICIR +0.031 + ΔPosRatio
+    # +3.36 pp — all corroborating. Sparse-by-design signal (0.46%
+    # non-zero) lifts the top-tail picks where Paper OMS realizes
+    # return. See docs/phase_b9_verdict_20260609.md.
     "xgb_209_chain_llm": (
         "fundamental",
         "macro_zero_baseline",
