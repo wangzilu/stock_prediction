@@ -815,11 +815,211 @@ def fetch_with_tushare(start_by_code: dict[str, str], end_date: str) -> dict[str
     return data
 
 
+def _parse_stocktoday_response(resp) -> pd.DataFrame:
+    """Parse StockToday/Tushare-compatible responses into a DataFrame."""
+    if resp is None:
+        return pd.DataFrame()
+    if isinstance(resp, list):
+        return pd.DataFrame(resp)
+    if not isinstance(resp, dict):
+        return pd.DataFrame()
+    if "error" in resp:
+        raise RuntimeError(str(resp["error"]))
+    code = resp.get("code")
+    if code not in (None, 0, "0"):
+        raise RuntimeError(f"code={code}, msg={resp.get('msg', '')}")
+    data = resp.get("data")
+    if not data:
+        return pd.DataFrame()
+    if isinstance(data, dict):
+        items = data.get("items")
+        columns = data.get("fields") or data.get("columns")
+        if items and columns:
+            return pd.DataFrame(items, columns=columns)
+        if items:
+            return pd.DataFrame(items)
+    if isinstance(data, list):
+        return pd.DataFrame(data)
+    return pd.DataFrame()
+
+
+def _stocktoday_call(label: str, fn):
+    return _run_with_alarm(45, fn, label=f"StockToday {label}")
+
+
+def _stocktoday_trade_dates(st, start_date: str, end_date: str) -> list[str]:
+    try:
+        df = _parse_stocktoday_response(
+            _stocktoday_call(
+                "trade_cal",
+                lambda: st.trade_cal(
+                    exchange="SSE",
+                    start_date=start_date.replace("-", ""),
+                    end_date=end_date.replace("-", ""),
+                    is_open="1",
+                ),
+            )
+        )
+    except Exception as exc:
+        logger.warning("StockToday trade_cal failed: %s; using weekday fallback", exc)
+        df = pd.DataFrame()
+    if df.empty or "cal_date" not in df.columns:
+        return [d.strftime("%Y%m%d") for d in pd.bdate_range(start_date, end_date)]
+    dates = sorted(set(df["cal_date"].astype(str).tolist()))
+    end_yyyymmdd = end_date.replace("-", "")
+    # ST trade_cal can lag intraday/early evening while daily/daily_basic
+    # already has the latest trading day. Include a weekday end-date probe
+    # and let the actual daily endpoint decide whether data exists.
+    if pd.Timestamp(end_date).weekday() < 5 and end_yyyymmdd not in dates:
+        dates.append(end_yyyymmdd)
+        dates = sorted(dates)
+    return dates
+
+
+def fetch_with_stocktoday(start_by_code: dict[str, str], end_date: str) -> dict[str, pd.DataFrame]:
+    from config.settings import ST_TOKEN
+    from ST_CLIENT import StockToday
+
+    if not ST_TOKEN:
+        raise RuntimeError("ST_TOKEN is not configured")
+
+    st = StockToday(token=ST_TOKEN)
+    requested_ts_codes = {bs_code_to_ts_code(code): code for code in start_by_code}
+    min_start = min(start_by_code.values())
+    trade_dates = _stocktoday_trade_dates(st, min_start, end_date)
+    if not trade_dates:
+        return {}
+
+    frames: list[pd.DataFrame] = []
+    # 2026-06-11 root-cause fix: ST_CLIENT's daily endpoint returns
+    # HTTP 400 for specific past dates where the server has no data
+    # (verified per-date: today and 06-10 succeed, 06-09 hits 400,
+    # then 06-05 succeeds again). ST_CLIENT library does 3 internal
+    # retries per failed call. With ~25 trade_dates × 3 endpoints
+    # (daily / daily_basic / adj_factor) the cumulative wasted time
+    # has timed out the 7200s cron budget every day for 4 days.
+    # Fail-fast: if 5 consecutive `daily` calls return error,
+    # raise so auto-provider falls through to tushare/akshare/baostock
+    # for THIS run. Subsequent runs can still try ST. Threshold
+    # picked to absorb up to 4 contiguous data-missing days in
+    # history without false-positive bailout on a healthy provider.
+    consecutive_daily_failures = 0
+    MAX_CONSECUTIVE_DAILY_FAILURES = 5
+    with progress_bar(len(trade_dates), "stocktoday", "day") as progress:
+        for i, trade_date in enumerate(trade_dates, start=1):
+            try:
+                daily = _parse_stocktoday_response(
+                    _stocktoday_call(
+                        f"daily {trade_date}",
+                        lambda td=trade_date: st.daily(trade_date=td),
+                    )
+                )
+                consecutive_daily_failures = 0
+            except Exception as exc:
+                logger.warning("StockToday daily failed for %s: %s", trade_date, exc)
+                daily = pd.DataFrame()
+                consecutive_daily_failures += 1
+                if consecutive_daily_failures >= MAX_CONSECUTIVE_DAILY_FAILURES:
+                    raise RuntimeError(
+                        f"StockToday daily failed {consecutive_daily_failures} "
+                        f"trade_dates in a row (last={trade_date}). Provider "
+                        f"appears degraded — bailing out so the auto chain "
+                        f"can try tushare/akshare/baostock for the remaining "
+                        f"{len(trade_dates) - i} dates."
+                    )
+            if daily.empty or "ts_code" not in daily.columns:
+                if progress is not None:
+                    progress.update(1)
+                    progress.set_postfix(frames=len(frames), current=trade_date)
+                continue
+            daily = daily[daily["ts_code"].astype(str).isin(requested_ts_codes)]
+            if daily.empty:
+                if progress is not None:
+                    progress.update(1)
+                    progress.set_postfix(frames=len(frames), current=trade_date)
+                continue
+
+            try:
+                basic = _parse_stocktoday_response(
+                    _stocktoday_call(
+                        f"daily_basic {trade_date}",
+                        lambda td=trade_date: st.daily_basic(
+                            trade_date=td,
+                            fields="ts_code,trade_date,turnover_rate,pe_ttm,pb",
+                        ),
+                    )
+                )
+                if not basic.empty:
+                    daily = daily.merge(basic, on=["ts_code", "trade_date"], how="left")
+            except Exception as exc:
+                logger.warning("StockToday daily_basic failed for %s: %s", trade_date, exc)
+
+            try:
+                factor = _parse_stocktoday_response(
+                    _stocktoday_call(
+                        f"adj_factor {trade_date}",
+                        lambda td=trade_date: st.adj_factor(trade_date=td),
+                    )
+                )
+                if not factor.empty:
+                    daily = daily.merge(factor, on=["ts_code", "trade_date"], how="left")
+            except Exception as exc:
+                logger.warning("StockToday adj_factor failed for %s: %s", trade_date, exc)
+
+            frames.append(daily)
+            if progress is not None:
+                progress.update(1)
+                progress.set_postfix(frames=len(frames), current=trade_date)
+            if i % 10 == 0:
+                time.sleep(0.5)
+
+    if not frames:
+        return {}
+
+    merged = pd.concat(frames, ignore_index=True)
+    data: dict[str, pd.DataFrame] = {}
+    for ts_code, part in merged.groupby("ts_code"):
+        bs_code = requested_ts_codes.get(str(ts_code))
+        if not bs_code:
+            continue
+        min_code_start = start_by_code[bs_code].replace("-", "")
+        part = part[part["trade_date"].astype(str) >= min_code_start]
+        if part.empty:
+            continue
+        df = pd.DataFrame({
+            "date": pd.to_datetime(part["trade_date"].astype(str)),
+            "open": part["open"],
+            "high": part["high"],
+            "low": part["low"],
+            "close": part["close"],
+            "volume": part["vol"],
+            "amount": part["amount"],
+            "turn": part.get("turnover_rate", np.nan),
+            "peTTM": part.get("pe_ttm", np.nan),
+            "pbMRQ": part.get("pb", np.nan),
+            "factor": part.get("adj_factor", np.nan),
+        })
+        data[bs_code] = normalize_frame(df)
+    return data
+
+
 def fetch_data(provider: str, start_by_code: dict[str, str], end_date: str) -> tuple[str, dict[str, pd.DataFrame]]:
     if not start_by_code:
         return provider, {}
 
     if provider == "auto":
+        try:
+            logger.info("Trying StockToday provider")
+            data = fetch_with_stocktoday(start_by_code, end_date)
+            min_ok = min(4500, max(1, int(len(start_by_code) * 0.85)))
+            if len(data) >= min_ok:
+                return "stocktoday", data
+            raise RuntimeError(
+                f"StockToday coverage too low: {len(data)}/{len(start_by_code)} "
+                f"(min_ok={min_ok})"
+            )
+        except Exception as exc:
+            logger.warning("StockToday provider unavailable: %s", exc)
         if os.environ.get("TUSHARE_TOKEN") or os.environ.get("TUSHARE_PRO_TOKEN"):
             try:
                 logger.info("Trying Tushare provider")
@@ -834,6 +1034,8 @@ def fetch_data(provider: str, start_by_code: dict[str, str], end_date: str) -> t
         logger.info("Falling back to baostock provider")
         return "baostock", fetch_with_baostock(start_by_code, end_date)
 
+    if provider == "stocktoday":
+        return provider, fetch_with_stocktoday(start_by_code, end_date)
     if provider == "tushare":
         return provider, fetch_with_tushare(start_by_code, end_date)
     if provider == "akshare":
@@ -1257,13 +1459,55 @@ def update_manifest(
     }
 
 
+def check_instrument_freshness(qlib_dir: Path, universe: str, expected_date: str) -> tuple[bool, list[str]]:
+    """Check representative instrument end dates from Qlib instrument files."""
+    inst_file = qlib_dir / "instruments" / f"{universe}.txt"
+    if not inst_file.exists():
+        inst_file = qlib_dir / "instruments" / "all.txt"
+
+    sample_rows = []
+    if inst_file.exists():
+        watched = {"sh600000", "sz000001", "sh601398", "sz000002", "sh600519"}
+        lines = inst_file.read_text().splitlines()
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 3 and parts[0] in watched:
+                sample_rows.append(parts[:3])
+        if len(sample_rows) < 3:
+            rows = [line.split()[:3] for line in lines if len(line.split()) >= 3]
+            sample_rows.extend(rows[:5])
+    if len(sample_rows) < 3:
+        detail = [f"insufficient_sample:{len(sample_rows)}"]
+        logger.error(
+            "Freshness check could not inspect enough instrument rows "
+            "(universe=%s, file=%s, sample=%s); failing closed",
+            universe,
+            inst_file,
+            len(sample_rows),
+        )
+        return False, detail
+
+    stale_detail = []
+    for stock, _start, latest in sample_rows[:10]:
+        if latest < expected_date:
+            stale_detail.append(f"{stock}:{latest}")
+            logger.warning(
+                "  %s latest date = %s (expected=%s)",
+                stock,
+                latest,
+                expected_date,
+            )
+
+    return len(stale_detail) < 3, stale_detail
+
+
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--incremental", action="store_true", help="Incremental daily update (default)")
     mode.add_argument("--full", action="store_true", help="Full historical rebuild/update")
     mode.add_argument("--repair-only", action="store_true", help="Repair legacy Qlib bin format without fetching data")
-    parser.add_argument("--provider", choices=["auto", "tushare", "akshare", "baostock"], default=QLIB_DATA_PROVIDER)
+    parser.add_argument("--provider", choices=["auto", "stocktoday", "tushare", "akshare", "baostock"], default=QLIB_DATA_PROVIDER)
     parser.add_argument("--universe", default=LGB_INFERENCE_UNIVERSE, help="csi800, all, or instrument file stem")
     parser.add_argument("--refresh-universe", action="store_true", help="Refresh universe constituents from AKShare/baostock")
     parser.add_argument("--universe-source", choices=["auto", "akshare", "baostock"], default=QLIB_UNIVERSE_SOURCE)
@@ -1432,6 +1676,27 @@ def _main_inner(args: argparse.Namespace) -> int:
                 network_profile="domestic",
             ))
             return 1
+        if getattr(args, "check_today", False):
+            from scheduler.data_health import _expected_latest_trading_date
+            expected_date = _expected_latest_trading_date()
+            fresh, stale_detail = check_instrument_freshness(
+                args.qlib_dir,
+                args.universe,
+                expected_date,
+            )
+            if not fresh:
+                write_health("qlib_data_update", HealthStatus(
+                    success=False,
+                    error_type="FreshnessFail",
+                    error_message=(
+                        f"no-op freshness failed expected={expected_date}; "
+                        f"details={','.join(stale_detail)[:160]}"
+                    ),
+                    n_items=0,
+                    latest_date=latest_date,
+                    network_profile="domestic",
+                ))
+                return 1
         write_health("qlib_data_update", HealthStatus(
             success=True,
             n_items=len(codes),
@@ -1519,6 +1784,35 @@ def _main_inner(args: argparse.Namespace) -> int:
         logger.error("Staged data was not promoted; manifest progress was not advanced")
         return 1
 
+    if getattr(args, "check_today", False):
+        from scheduler.data_health import _expected_latest_trading_date
+        expected_date = _expected_latest_trading_date()
+        fresh, stale_detail = check_instrument_freshness(
+            output_dir,
+            args.universe,
+            expected_date,
+        )
+        if not fresh:
+            logger.error(
+                "DATA STALE: %s sample stocks do not have expected date (%s). "
+                "Staged data was not promoted; manifest progress was not advanced.",
+                len(stale_detail),
+                expected_date,
+            )
+            write_health("qlib_data_update", HealthStatus(
+                success=False,
+                error_type="FreshnessFail",
+                error_message=(
+                    f"{len(stale_detail)} sample stocks behind "
+                    f"expected={expected_date}; details={','.join(stale_detail)[:160]}"
+                ),
+                n_items=success,
+                latest_date=args.end_date,
+                network_profile="domestic",
+            ))
+            return 1
+        logger.info("--check-today: staged data freshness OK (expected=%s)", expected_date)
+
     update_manifest(manifest, data_by_code, set(start_by_code), source, args.end_date)
     save_manifest(manifest, args.manifest)
 
@@ -1528,68 +1822,6 @@ def _main_inner(args: argparse.Namespace) -> int:
 
     logger.info("Update complete: %s stocks updated, %s failed, source=%s", success, fail, source)
     logger.info("Data stored in %s", args.qlib_dir)
-
-    # 2026-06-04 cx round 4 P0-1: --check-today MUST run BEFORE the
-    # success-health write. Pre-fix, write_health("qlib_data_update",
-    # success=True) fired first; if --check-today then found 3+ sample
-    # stocks stale and returned 1, the success-health was still on
-    # disk and downstream stages (feature_cache_rebuild → smoke →
-    # morning_recommendation) read it as green and proceeded on stale
-    # data.
-    if getattr(args, "check_today", False):
-        # cx round 13 P1-3: use the centralised CN-calendar helper
-        # instead of pandas bdate_range. The helper consults Qlib's
-        # calendar first (covers 节假日 / 调休 / 临时休市) and falls
-        # back to bdate only when Qlib isn't initialised.
-        from scheduler.data_health import _expected_latest_trading_date
-        expected_date = _expected_latest_trading_date()
-
-        # Check a few representative stocks for latest date
-        qlib_dir = args.qlib_dir
-        sample_stocks = ["sh600000", "sz000001", "sh601398", "sz000002", "sh600519"]
-        stale_count = 0
-        stale_detail = []
-        for stock in sample_stocks:
-            day_file = qlib_dir / "instruments" / f"{stock}.txt"
-            if not day_file.exists():
-                continue
-            # Read last line of instrument file to get latest date
-            lines = day_file.read_text().strip().split("\n")
-            if lines:
-                last_line = lines[-1].strip()
-                # Format: "2026-01-01\t2026-05-17" (start\tend)
-                parts = last_line.split("\t")
-                if len(parts) >= 2:
-                    latest = parts[-1].strip()
-                    if latest < expected_date:
-                        stale_count += 1
-                        stale_detail.append(f"{stock}:{latest}")
-                        logger.warning(f"  {stock} latest date = {latest} "
-                                       f"(expected={expected_date})")
-
-        if stale_count >= 3:
-            logger.error(
-                f"DATA STALE: {stale_count}/{len(sample_stocks)} sample stocks "
-                f"do not have expected date ({expected_date}). "
-                f"Data source may not have published yet."
-            )
-            # Record the failure BEFORE returning so downstream cron
-            # stages see qlib_data_update as RED, not green.
-            write_health("qlib_data_update", HealthStatus(
-                success=False,
-                error_type="FreshnessFail",
-                error_message=(
-                    f"{stale_count}/{len(sample_stocks)} sample stocks "
-                    f"behind expected={expected_date}; "
-                    f"details={','.join(stale_detail)[:160]}"
-                ),
-                n_items=success,
-                latest_date=args.end_date,
-                network_profile="domestic",
-            ))
-            return 1
-        else:
-            logger.info(f"--check-today: data freshness OK (expected={expected_date})")
 
     # Only NOW is it safe to declare success — both the update and
     # any requested freshness check have passed.
