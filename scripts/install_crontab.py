@@ -64,6 +64,14 @@ class CronJob:
     # completion time from this job's start. Default 1800s (30 min) only
     # works for jobs whose upstreams are guaranteed done by start time.
     dep_wait_seconds: int = 1800
+    # 2026-06-11: env var pairs prepended to the inner command via
+    # `env KEY=VAL ...`. Used today by morning/sell/risk/evening to
+    # carry MITPS_LGB_FORCE_CACHE=1, the load_from_pickle hang escape
+    # hatch. Was a manual crontab edit before; bringing it back into
+    # the renderer so re-installing the crontab does not silently
+    # strip it. Tuple of pairs because @dataclass(frozen=True)
+    # disallows mutable default like dict.
+    env_vars: tuple[tuple[str, str], ...] = ()
 
     def effective_enforce_deps(self) -> bool:
         """Return enforce_deps OR critical — critical jobs always gate.
@@ -89,14 +97,24 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         # added ~9 min to live LGB inference (asof_merge across 12
         # parquet sources × 5195 stocks). 1800s = 30 min budget keeps
         # an 18-min headroom over the observed 12-min cold-path total.
+        # 2026-06-11: MITPS_LGB_FORCE_CACHE=1 is the load_from_pickle hang
+        # escape hatch. Without it, ShortTermModel.load_from_pickle stalls
+        # indefinitely on macOS joblib/loky workers (same family bug we
+        # diagnosed 2026-06-08). FORCE_CACHE skips the live load and
+        # uses the prediction cache produced by champion_cache_rebuild.
+        # If you ever remove this from one of these 4 jobs and the cron
+        # times out at 25 min — that is why.
         CronJob("morning_recommendation", "20 9 * * 1-5", [py, main_py, "--morning"], "cron_morning.log",
-                network="domestic", timeout_sec=1800),
+                network="domestic", timeout_sec=1800,
+                env_vars=(("MITPS_LGB_FORCE_CACHE", "1"),)),
         CronJob("sell_check", "30 14 * * 1-5", [py, main_py, "--sell-check"], "cron_sell_check.log",
-                network="domestic", timeout_sec=1800),
+                network="domestic", timeout_sec=1800,
+                env_vars=(("MITPS_LGB_FORCE_CACHE", "1"),)),
         CronJob("daily_summary", "30 15 * * 1-5", [py, main_py, "--daily-summary"], "cron_daily_summary.log",
                 network="domestic", timeout_sec=600),
         CronJob("risk_check", "35 9-15 * * 1-5", [py, main_py, "--risk-check"], "cron_risk_check.log",
-                network="domestic", timeout_sec=900),
+                network="domestic", timeout_sec=900,
+                env_vars=(("MITPS_LGB_FORCE_CACHE", "1"),)),
         # evening_outlook generates the NEXT trading day's strategy /
         # outlook from current evening's data. Therefore it must fire on
         # the evening BEFORE each trading day, not on trading-day evenings:
@@ -121,7 +139,8 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         # restores the 18-min headroom we use for morning_recommendation.
         CronJob("evening_outlook", "0 22 * * 0-4", [py, main_py, "--evening-outlook"], "cron_evening_outlook.log",
                 network="domestic", timeout_sec=1800,
-                enforce_deps=True, dep_wait_seconds=900),
+                enforce_deps=True, dep_wait_seconds=900,
+                env_vars=(("MITPS_LGB_FORCE_CACHE", "1"),)),
         # --- Post-close: LLM / event collection ---
     ]
     if (scripts / "collect_global_industry_news.py").exists():
@@ -319,15 +338,12 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         # --- Post-close: data update (domestic, critical) ---
         CronJob("qlib_data_update", "45 17 * * 1-5",
                 [py, str(scripts / "update_qlib_data.py"),
-                 # 2026-06-04 cx round 4 P1-7: ``--universe-source
-                 # baostock`` is hard-coded here even when price
-                 # provider auto-picks Tushare. Production used to
-                 # advertise "all Tushare" but the universe still
-                 # came from baostock. If your goal is full-Tushare,
-                 # change this to "tushare" — and make sure the
-                 # Tushare universe endpoint is whitelisted in your
-                 # TS token. Tracked in cx round 4 P1-7.
-                 "--universe", "all", "--universe-source", "baostock",
+                 # 2026-06-10: keep both price provider and universe
+                 # source on auto. update_qlib_data.py now tries
+                 # StockToday first for daily bars, then falls back to
+                 # Tushare/AKShare/baostock; hard-coding baostock here
+                 # recreates the 2-3h slow path even after ST support.
+                 "--universe", "all", "--universe-source", "auto",
                  "--refresh-universe",
                  "--min-health-instruments", "4500",
                  "--min-lgb-data-instruments", "4500",
@@ -566,6 +582,12 @@ def render_job(job: CronJob, python_bin: str = DEFAULT_PYTHON, project_root: Pat
 
     # Build the innermost command (the actual job)
     inner_cmd = list(job.target)
+    if job.env_vars:
+        # Inject `env KEY=VAL ...` right before the inner python so the
+        # env vars apply ONLY to the job process, not to run_network_job
+        # or run_with_status. Order matters for /usr/bin/env which expects
+        # KEY=VAL tokens before the program argv.
+        inner_cmd = ["env"] + [f"{k}={v}" for k, v in job.env_vars] + inner_cmd
 
     # Wrap with run_network_job.py (network profile + timeout)
     network_cmd = [
