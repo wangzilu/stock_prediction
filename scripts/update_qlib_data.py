@@ -886,25 +886,49 @@ def fetch_with_stocktoday(start_by_code: dict[str, str], end_date: str) -> dict[
     st = StockToday(token=ST_TOKEN)
     requested_ts_codes = {bs_code_to_ts_code(code): code for code in start_by_code}
     min_start = min(start_by_code.values())
+    # 2026-06-11 root-cause fix D: cap min_start at 30 days back.
+    # Earlier today's investigation showed `--new-symbol-days=365`
+    # causes every fresh / partial-history stock to fall back to
+    # `end_date - 365d`. If even ONE stock in universe lacks history,
+    # the WHOLE market-wide fetch loops 365 trade_dates × 3 endpoints —
+    # that's the actual reason 4 days of qlib_data_update have
+    # timed out. ST is market-wide per trade_date, so per-stock filter
+    # later trims rows; capping the date span here only loses old
+    # rows for new-listing stocks — acceptable since (a) ST returns
+    # 400 on many of those old dates anyway and (b) a quarterly
+    # ``--full`` run repairs deep history. baostock fallback still
+    # honors original min_start for stocks that truly need it.
+    ST_MAX_LOOKBACK_DAYS = 30
+    cap_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=ST_MAX_LOOKBACK_DAYS)
+    cap_str = cap_dt.strftime("%Y-%m-%d")
+    if min_start < cap_str:
+        logger.info(
+            "StockToday min_start clipped from %s to %s (cap %d days) — "
+            "deep-history backfill goes to --full or another provider.",
+            min_start, cap_str, ST_MAX_LOOKBACK_DAYS,
+        )
+        min_start = cap_str
     trade_dates = _stocktoday_trade_dates(st, min_start, end_date)
     if not trade_dates:
         return {}
 
     frames: list[pd.DataFrame] = []
-    # 2026-06-11 root-cause fix: ST_CLIENT's daily endpoint returns
-    # HTTP 400 for specific past dates where the server has no data
-    # (verified per-date: today and 06-10 succeed, 06-09 hits 400,
-    # then 06-05 succeeds again). ST_CLIENT library does 3 internal
-    # retries per failed call. With ~25 trade_dates × 3 endpoints
-    # (daily / daily_basic / adj_factor) the cumulative wasted time
-    # has timed out the 7200s cron budget every day for 4 days.
-    # Fail-fast: if 5 consecutive `daily` calls return error,
-    # raise so auto-provider falls through to tushare/akshare/baostock
-    # for THIS run. Subsequent runs can still try ST. Threshold
-    # picked to absorb up to 4 contiguous data-missing days in
-    # history without false-positive bailout on a healthy provider.
-    consecutive_daily_failures = 0
-    MAX_CONSECUTIVE_DAILY_FAILURES = 5
+    # 2026-06-11 fix A: count failures across ALL 3 endpoints (daily,
+    # daily_basic, adj_factor). Earlier B-style "consecutive daily
+    # failures" missed the case where daily succeeds but daily_basic
+    # fails — today 11 daily_basic 400s vs 10 daily 400s, both
+    # interleaved. Bail at 10 cumulative endpoint failures so we
+    # waste at most ~150s on a degraded ST run before falling through.
+    total_endpoint_failures = 0
+    MAX_TOTAL_ENDPOINT_FAILURES = 10
+    def _bail_if_exhausted(latest_label: str):
+        nonlocal total_endpoint_failures
+        if total_endpoint_failures >= MAX_TOTAL_ENDPOINT_FAILURES:
+            raise RuntimeError(
+                f"StockToday hit {total_endpoint_failures} endpoint failures "
+                f"(latest={latest_label}). Provider appears degraded — "
+                f"bailing so auto chain can try tushare/akshare/baostock."
+            )
     with progress_bar(len(trade_dates), "stocktoday", "day") as progress:
         for i, trade_date in enumerate(trade_dates, start=1):
             try:
@@ -914,19 +938,11 @@ def fetch_with_stocktoday(start_by_code: dict[str, str], end_date: str) -> dict[
                         lambda td=trade_date: st.daily(trade_date=td),
                     )
                 )
-                consecutive_daily_failures = 0
             except Exception as exc:
                 logger.warning("StockToday daily failed for %s: %s", trade_date, exc)
                 daily = pd.DataFrame()
-                consecutive_daily_failures += 1
-                if consecutive_daily_failures >= MAX_CONSECUTIVE_DAILY_FAILURES:
-                    raise RuntimeError(
-                        f"StockToday daily failed {consecutive_daily_failures} "
-                        f"trade_dates in a row (last={trade_date}). Provider "
-                        f"appears degraded — bailing out so the auto chain "
-                        f"can try tushare/akshare/baostock for the remaining "
-                        f"{len(trade_dates) - i} dates."
-                    )
+                total_endpoint_failures += 1
+                _bail_if_exhausted(f"daily {trade_date}")
             if daily.empty or "ts_code" not in daily.columns:
                 if progress is not None:
                     progress.update(1)
@@ -953,6 +969,8 @@ def fetch_with_stocktoday(start_by_code: dict[str, str], end_date: str) -> dict[
                     daily = daily.merge(basic, on=["ts_code", "trade_date"], how="left")
             except Exception as exc:
                 logger.warning("StockToday daily_basic failed for %s: %s", trade_date, exc)
+                total_endpoint_failures += 1
+                _bail_if_exhausted(f"daily_basic {trade_date}")
 
             try:
                 factor = _parse_stocktoday_response(
@@ -965,6 +983,8 @@ def fetch_with_stocktoday(start_by_code: dict[str, str], end_date: str) -> dict[
                     daily = daily.merge(factor, on=["ts_code", "trade_date"], how="left")
             except Exception as exc:
                 logger.warning("StockToday adj_factor failed for %s: %s", trade_date, exc)
+                total_endpoint_failures += 1
+                _bail_if_exhausted(f"adj_factor {trade_date}")
 
             frames.append(daily)
             if progress is not None:
