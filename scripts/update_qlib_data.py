@@ -943,22 +943,21 @@ def fetch_with_stocktoday(start_by_code: dict[str, str], end_date: str) -> dict[
         return {}
 
     frames: list[pd.DataFrame] = []
-    # 2026-06-11 fix A: count failures across ALL 3 endpoints (daily,
-    # daily_basic, adj_factor). Earlier B-style "consecutive daily
-    # failures" missed the case where daily succeeds but daily_basic
-    # fails — today 11 daily_basic 400s vs 10 daily 400s, both
-    # interleaved. Bail at 10 cumulative endpoint failures so we
-    # waste at most ~150s on a degraded ST run before falling through.
+    # 2026-06-13 fix A v3 — skip-and-continue.
+    # Original "bail at 10 endpoint failures" was too aggressive.
+    # 06-13 re-test: ST returned errors on 15/22 past trade_dates (mix
+    # of HTTP 400 / "服务器异常状态" / "数据服务不可用"). The 06-12 run
+    # bailed in 3 min having wasted the 7200s cron budget, leaving
+    # akshare (dead) and baostock (7.7h) as the fallback. Even a
+    # PARTIAL ST result (e.g. only today's date succeeds) is far more
+    # useful than running baostock for hours and timing out.
+    # New behaviour: log failures, skip the failed date+endpoint, keep
+    # going. Whatever frames we collect get returned. The auto-chain
+    # `len(data) >= min_ok` gate decides whether the partial result
+    # is enough; if not, baostock fallback still runs but for fewer
+    # stocks because partial ST data populated some of them.
     total_endpoint_failures = 0
-    MAX_TOTAL_ENDPOINT_FAILURES = 10
-    def _bail_if_exhausted(latest_label: str):
-        nonlocal total_endpoint_failures
-        if total_endpoint_failures >= MAX_TOTAL_ENDPOINT_FAILURES:
-            raise RuntimeError(
-                f"StockToday hit {total_endpoint_failures} endpoint failures "
-                f"(latest={latest_label}). Provider appears degraded — "
-                f"bailing so auto chain can try tushare/akshare/baostock."
-            )
+    per_endpoint_failures = {"daily": 0, "daily_basic": 0, "adj_factor": 0}
     with progress_bar(len(trade_dates), "stocktoday", "day") as progress:
         for i, trade_date in enumerate(trade_dates, start=1):
             try:
@@ -972,7 +971,7 @@ def fetch_with_stocktoday(start_by_code: dict[str, str], end_date: str) -> dict[
                 logger.warning("StockToday daily failed for %s: %s", trade_date, exc)
                 daily = pd.DataFrame()
                 total_endpoint_failures += 1
-                _bail_if_exhausted(f"daily {trade_date}")
+                per_endpoint_failures["daily"] += 1
             if daily.empty or "ts_code" not in daily.columns:
                 if progress is not None:
                     progress.update(1)
@@ -1000,7 +999,7 @@ def fetch_with_stocktoday(start_by_code: dict[str, str], end_date: str) -> dict[
             except Exception as exc:
                 logger.warning("StockToday daily_basic failed for %s: %s", trade_date, exc)
                 total_endpoint_failures += 1
-                _bail_if_exhausted(f"daily_basic {trade_date}")
+                per_endpoint_failures["daily_basic"] += 1
 
             try:
                 factor = _parse_stocktoday_response(
@@ -1014,7 +1013,7 @@ def fetch_with_stocktoday(start_by_code: dict[str, str], end_date: str) -> dict[
             except Exception as exc:
                 logger.warning("StockToday adj_factor failed for %s: %s", trade_date, exc)
                 total_endpoint_failures += 1
-                _bail_if_exhausted(f"adj_factor {trade_date}")
+                per_endpoint_failures["adj_factor"] += 1
 
             frames.append(daily)
             if progress is not None:
@@ -1022,6 +1021,22 @@ def fetch_with_stocktoday(start_by_code: dict[str, str], end_date: str) -> dict[
                 progress.set_postfix(frames=len(frames), current=trade_date)
             if i % 10 == 0:
                 time.sleep(0.5)
+
+    n_dates = len(trade_dates)
+    n_success = len(frames)
+    logger.info(
+        "StockToday loop done: %d/%d trade_dates returned data. "
+        "Endpoint failure breakdown: daily=%d daily_basic=%d adj_factor=%d "
+        "(total=%d). %s",
+        n_success, n_dates,
+        per_endpoint_failures["daily"],
+        per_endpoint_failures["daily_basic"],
+        per_endpoint_failures["adj_factor"],
+        total_endpoint_failures,
+        ("Partial data passed downstream — auto-chain min_ok gate decides "
+         "whether to use it or fall through to next provider.") if n_success > 0
+        else "No usable data — falling through to next provider.",
+    )
 
     if not frames:
         return {}
