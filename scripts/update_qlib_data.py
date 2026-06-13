@@ -609,7 +609,11 @@ def fetch_stock_data_baostock(bs_code: str, start_date: str, end_date: str) -> p
     return normalize_frame(df)
 
 
-def fetch_with_baostock(start_by_code: dict[str, str], end_date: str) -> dict[str, pd.DataFrame]:
+def fetch_with_baostock(
+    start_by_code: dict[str, str],
+    end_date: str,
+    cap_lookback_days: int | None = 30,
+) -> dict[str, pd.DataFrame]:
     import baostock as bs
 
     # 2026-06-13 root-cause fix: 324 / 5527 stocks were `missing` in
@@ -618,29 +622,32 @@ def fetch_with_baostock(start_by_code: dict[str, str], end_date: str) -> dict[st
     # defaulted them to `end_date - new_symbol_days (=365)`. baostock
     # is per-stock so it dutifully tried to pull a full year for each
     # of those 324, taking ~9h cumulatively vs the cron's 7200s budget.
-    # Cap start_date at end_date - 30d per stock here too. Stocks that
-    # truly need deeper history get repaired by the weekly --full run
-    # (Sat 04:00) where the budget allows. Daily cron keeps the
-    # already-warm 5198 stocks (last_success=06-09) only needing 3-4
-    # business days each — sub-30-minute total.
-    BAOSTOCK_MAX_LOOKBACK_DAYS = 30
-    cap_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=BAOSTOCK_MAX_LOOKBACK_DAYS)
-    cap_str = cap_dt.strftime("%Y-%m-%d")
-    capped_count = 0
-    capped_starts: dict[str, str] = {}
-    for code, start in start_by_code.items():
-        if start < cap_str:
-            capped_starts[code] = cap_str
-            capped_count += 1
-        else:
-            capped_starts[code] = start
-    if capped_count > 0:
-        logger.info(
-            "baostock start-date clipped: %d/%d stocks had start_date "
-            "older than %s — clipped to %s (deep history goes to --full).",
-            capped_count, len(start_by_code), cap_str, cap_str,
-        )
-    start_by_code = capped_starts
+    # Cap start_date at end_date - cap_lookback_days per stock here too.
+    # Stocks that truly need deeper history get repaired by the weekly
+    # ``--full`` run (Sat 04:00) — caller passes cap_lookback_days=None
+    # from main() in that mode so the cap is skipped. Daily cron keeps
+    # the already-warm 5198 stocks (last_success=06-09) only needing
+    # 3-4 business days each — sub-30-minute total.
+    # cx review 2026-06-13 C1 fix: cap is now opt-in via parameter so
+    # ``--full --provider baostock`` actually returns full history.
+    if cap_lookback_days is not None:
+        cap_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=cap_lookback_days)
+        cap_str = cap_dt.strftime("%Y-%m-%d")
+        capped_count = 0
+        capped_starts: dict[str, str] = {}
+        for code, start in start_by_code.items():
+            if start < cap_str:
+                capped_starts[code] = cap_str
+                capped_count += 1
+            else:
+                capped_starts[code] = start
+        if capped_count > 0:
+            logger.info(
+                "baostock start-date clipped: %d/%d stocks had start_date "
+                "older than %s — clipped to %s (deep history goes to --full).",
+                capped_count, len(start_by_code), cap_str, cap_str,
+            )
+        start_by_code = capped_starts
 
     session_attempts = 0
     consecutive_errors = 0
@@ -906,7 +913,11 @@ def _stocktoday_trade_dates(st, start_date: str, end_date: str) -> list[str]:
     return dates
 
 
-def fetch_with_stocktoday(start_by_code: dict[str, str], end_date: str) -> dict[str, pd.DataFrame]:
+def fetch_with_stocktoday(
+    start_by_code: dict[str, str],
+    end_date: str,
+    cap_lookback_days: int | None = 30,
+) -> dict[str, pd.DataFrame]:
     from config.settings import ST_TOKEN
     from ST_CLIENT import StockToday
 
@@ -917,7 +928,9 @@ def fetch_with_stocktoday(start_by_code: dict[str, str], end_date: str) -> dict[
     requested_ts_codes = {bs_code_to_ts_code(code): code for code in start_by_code}
     min_start = min(start_by_code.values())
     # 2026-06-11 root-cause fix D: cap min_start at 30 days back.
-    # Earlier today's investigation showed `--new-symbol-days=365`
+    # cx review 2026-06-13 C1 fix: cap is now opt-in via parameter so
+    # ``--full --provider stocktoday`` actually iterates full history.
+    # The 2026-06-11 investigation showed `--new-symbol-days=365`
     # causes every fresh / partial-history stock to fall back to
     # `end_date - 365d`. If even ONE stock in universe lacks history,
     # the WHOLE market-wide fetch loops 365 trade_dates × 3 endpoints —
@@ -928,16 +941,16 @@ def fetch_with_stocktoday(start_by_code: dict[str, str], end_date: str) -> dict[
     # 400 on many of those old dates anyway and (b) a quarterly
     # ``--full`` run repairs deep history. baostock fallback still
     # honors original min_start for stocks that truly need it.
-    ST_MAX_LOOKBACK_DAYS = 30
-    cap_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=ST_MAX_LOOKBACK_DAYS)
-    cap_str = cap_dt.strftime("%Y-%m-%d")
-    if min_start < cap_str:
-        logger.info(
-            "StockToday min_start clipped from %s to %s (cap %d days) — "
-            "deep-history backfill goes to --full or another provider.",
-            min_start, cap_str, ST_MAX_LOOKBACK_DAYS,
-        )
-        min_start = cap_str
+    if cap_lookback_days is not None:
+        cap_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=cap_lookback_days)
+        cap_str = cap_dt.strftime("%Y-%m-%d")
+        if min_start < cap_str:
+            logger.info(
+                "StockToday min_start clipped from %s to %s (cap %d days) — "
+                "deep-history backfill goes to --full or another provider.",
+                min_start, cap_str, cap_lookback_days,
+            )
+            min_start = cap_str
     trade_dates = _stocktoday_trade_dates(st, min_start, end_date)
     if not trade_dates:
         return {}
@@ -1068,14 +1081,26 @@ def fetch_with_stocktoday(start_by_code: dict[str, str], end_date: str) -> dict[
     return data
 
 
-def fetch_data(provider: str, start_by_code: dict[str, str], end_date: str) -> tuple[str, dict[str, pd.DataFrame]]:
+def fetch_data(
+    provider: str,
+    start_by_code: dict[str, str],
+    end_date: str,
+    cap_lookback_days: int | None = 30,
+) -> tuple[str, dict[str, pd.DataFrame]]:
+    # cx review 2026-06-13 C1 fix: ``cap_lookback_days=None`` means
+    # "honor every per-stock start_date" — used by ``--full`` callers.
+    # Default 30 matches the incremental-cron policy. Note: the
+    # ``min_ok`` gate below is on stock-count coverage (width), not on
+    # date freshness; the real freshness defense is
+    # ``check_instrument_freshness`` + ``validate_qlib_health`` on the
+    # staged output. See cx review I2.
     if not start_by_code:
         return provider, {}
 
     if provider == "auto":
         try:
             logger.info("Trying StockToday provider")
-            data = fetch_with_stocktoday(start_by_code, end_date)
+            data = fetch_with_stocktoday(start_by_code, end_date, cap_lookback_days)
             min_ok = min(4500, max(1, int(len(start_by_code) * 0.85)))
             if len(data) >= min_ok:
                 return "stocktoday", data
@@ -1097,16 +1122,16 @@ def fetch_data(provider: str, start_by_code: dict[str, str], end_date: str) -> t
         except Exception as exc:
             logger.warning("AKShare provider unavailable: %s", exc)
         logger.info("Falling back to baostock provider")
-        return "baostock", fetch_with_baostock(start_by_code, end_date)
+        return "baostock", fetch_with_baostock(start_by_code, end_date, cap_lookback_days)
 
     if provider == "stocktoday":
-        return provider, fetch_with_stocktoday(start_by_code, end_date)
+        return provider, fetch_with_stocktoday(start_by_code, end_date, cap_lookback_days)
     if provider == "tushare":
         return provider, fetch_with_tushare(start_by_code, end_date)
     if provider == "akshare":
         return provider, fetch_with_akshare(start_by_code, end_date)
     if provider == "baostock":
-        return provider, fetch_with_baostock(start_by_code, end_date)
+        return provider, fetch_with_baostock(start_by_code, end_date, cap_lookback_days)
     raise ValueError(f"Unknown provider: {provider}")
 
 
@@ -1778,7 +1803,13 @@ def _main_inner(args: argparse.Namespace) -> int:
         return 0
     logger.info("Symbols needing data: %s/%s", len(start_by_code), len(codes))
 
-    source, data_by_code = fetch_data(args.provider, start_by_code, args.end_date)
+    # cx review 2026-06-13 C1 fix: ``--full`` mode disables the
+    # 30-day lookback cap so a manual full backfill actually returns
+    # the requested deep history. Incremental cron stays capped.
+    cap_lookback_days = None if mode == "full" else 30
+    source, data_by_code = fetch_data(
+        args.provider, start_by_code, args.end_date, cap_lookback_days,
+    )
     if not data_by_code:
         logger.error("No data fetched; refusing to update Qlib")
         update_manifest(manifest, data_by_code, set(start_by_code), source, args.end_date)
