@@ -612,6 +612,36 @@ def fetch_stock_data_baostock(bs_code: str, start_date: str, end_date: str) -> p
 def fetch_with_baostock(start_by_code: dict[str, str], end_date: str) -> dict[str, pd.DataFrame]:
     import baostock as bs
 
+    # 2026-06-13 root-cause fix: 324 / 5527 stocks were `missing` in
+    # the manifest (no last_success_date) — usually because manifest
+    # was reset or a stock just got listed. build_start_dates then
+    # defaulted them to `end_date - new_symbol_days (=365)`. baostock
+    # is per-stock so it dutifully tried to pull a full year for each
+    # of those 324, taking ~9h cumulatively vs the cron's 7200s budget.
+    # Cap start_date at end_date - 30d per stock here too. Stocks that
+    # truly need deeper history get repaired by the weekly --full run
+    # (Sat 04:00) where the budget allows. Daily cron keeps the
+    # already-warm 5198 stocks (last_success=06-09) only needing 3-4
+    # business days each — sub-30-minute total.
+    BAOSTOCK_MAX_LOOKBACK_DAYS = 30
+    cap_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=BAOSTOCK_MAX_LOOKBACK_DAYS)
+    cap_str = cap_dt.strftime("%Y-%m-%d")
+    capped_count = 0
+    capped_starts: dict[str, str] = {}
+    for code, start in start_by_code.items():
+        if start < cap_str:
+            capped_starts[code] = cap_str
+            capped_count += 1
+        else:
+            capped_starts[code] = start
+    if capped_count > 0:
+        logger.info(
+            "baostock start-date clipped: %d/%d stocks had start_date "
+            "older than %s — clipped to %s (deep history goes to --full).",
+            capped_count, len(start_by_code), cap_str, cap_str,
+        )
+    start_by_code = capped_starts
+
     session_attempts = 0
     consecutive_errors = 0
     data: dict[str, pd.DataFrame] = {}
