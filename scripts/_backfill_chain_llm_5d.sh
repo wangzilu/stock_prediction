@@ -18,9 +18,11 @@ for d in $DATES; do
   echo "[$(date '+%T')] extract $d rc=$rc"
 done
 
-echo "[$(date '+%T')] build chain_llm factors (rebuilds whole parquet)"
-python scripts/build_global_chain_factors.py --source llm \
-  > "$LOG_DIR/build_factors.log" 2>&1
-echo "[$(date '+%T')] build rc=$?"
+echo "[$(date '+%T')] build chain_llm factors per-date (script takes --date one at a time)"
+for d in $DATES; do
+  python scripts/build_global_chain_factors.py --source llm --date "$d" \
+    > "$LOG_DIR/build_${d}.log" 2>&1
+  echo "[$(date '+%T')] build $d rc=$?"
+done
 
 echo "[$(date '+%T')] backfill done"
