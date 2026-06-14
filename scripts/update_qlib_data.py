@@ -1659,6 +1659,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-health-check", action="store_true")
     parser.add_argument("--check-today", action="store_true",
                         help="After update, verify latest data date matches today (exit 1 if stale)")
+    parser.add_argument("--check-today-tolerance-days", type=int, default=0,
+                        help=(
+                            "When --check-today flags sample stocks as stale, "
+                            "tolerate up to N trading days behind expected. "
+                            "Used when ST has per-date 400 outages — the staged "
+                            "data covers earlier dates but not today. With N=1, "
+                            "ST missing today still promotes yesterday's data."
+                        ))
     return parser.parse_args(argv)
 
 
@@ -1915,7 +1923,7 @@ def _main_inner(args: argparse.Namespace) -> int:
         return 1
 
     if getattr(args, "check_today", False):
-        from scheduler.data_health import _expected_latest_trading_date
+        from scheduler.data_health import _expected_latest_trading_date, trading_day_age
         expected_date = _expected_latest_trading_date()
         fresh, stale_detail = check_instrument_freshness(
             output_dir,
@@ -1923,25 +1931,68 @@ def _main_inner(args: argparse.Namespace) -> int:
             expected_date,
         )
         if not fresh:
-            logger.error(
-                "DATA STALE: %s sample stocks do not have expected date (%s). "
-                "Staged data was not promoted; manifest progress was not advanced.",
-                len(stale_detail),
+            # 2026-06-14: relax the strict freshness gate. ST has
+            # documented per-date HTTP 400 outages — if today is
+            # 06-12 and ST returns 06-10/06-11 successfully but 400s
+            # on 06-12, refusing to promote means the OK 06-10/06-11
+            # data also gets thrown away. With ``--check-today-tolerance-days N``
+            # > 0, we accept staged data that is up to N trading days
+            # behind expected, with a loud WARNING and a health record
+            # that flags ``partial=True`` so downstream consumers can
+            # still see it's not at full freshness.
+            tolerance = int(getattr(args, "check_today_tolerance_days", 0) or 0)
+            stale_ages: list[int] = []
+            for s in stale_detail:
+                if ":" in s:
+                    age = trading_day_age(s.split(":", 1)[1], expected_date)
+                    if age is not None:
+                        stale_ages.append(age)
+            max_age = max(stale_ages) if stale_ages else 999
+            if tolerance > 0 and max_age <= tolerance:
+                logger.warning(
+                    "DATA STALE-but-TOLERATED: %s sample stocks behind "
+                    "expected=%s by up to %d trading day(s); tolerance=%d. "
+                    "Promoting anyway with partial=True health record.",
+                    len(stale_detail), expected_date, max_age, tolerance,
+                )
+                write_health("qlib_data_update", HealthStatus(
+                    success=True,
+                    n_items=success,
+                    latest_date=args.end_date,
+                    network_profile="domestic",
+                    extra={
+                        "partial": True,
+                        "freshness_age_trading_days": max_age,
+                        "freshness_expected_date": expected_date,
+                        "freshness_tolerated_via_cli": tolerance,
+                    },
+                ))
+                # Fall through to promote_staging below.
+            else:
+                logger.error(
+                    "DATA STALE: %s sample stocks do not have expected date (%s). "
+                    "Staged data was not promoted; manifest progress was not advanced. "
+                    "(max age %d trading days; tolerance %d)",
+                    len(stale_detail), expected_date, max_age, tolerance,
+                )
+                write_health("qlib_data_update", HealthStatus(
+                    success=False,
+                    error_type="FreshnessFail",
+                    error_message=(
+                        f"{len(stale_detail)} sample stocks behind "
+                        f"expected={expected_date} by {max_age} trading days "
+                        f"(tolerance={tolerance}); details={','.join(stale_detail)[:160]}"
+                    ),
+                    n_items=success,
+                    latest_date=args.end_date,
+                    network_profile="domestic",
+                ))
+                return 1
+        else:
+            logger.info(
+                "--check-today: staged data freshness OK (expected=%s)",
                 expected_date,
             )
-            write_health("qlib_data_update", HealthStatus(
-                success=False,
-                error_type="FreshnessFail",
-                error_message=(
-                    f"{len(stale_detail)} sample stocks behind "
-                    f"expected={expected_date}; details={','.join(stale_detail)[:160]}"
-                ),
-                n_items=success,
-                latest_date=args.end_date,
-                network_profile="domestic",
-            ))
-            return 1
-        logger.info("--check-today: staged data freshness OK (expected=%s)", expected_date)
 
     update_manifest(manifest, data_by_code, set(start_by_code), source, args.end_date)
     save_manifest(manifest, args.manifest)
