@@ -163,7 +163,12 @@ JOB_DEPS: dict[str, list[str]] = {
     "morning_recommendation": [],
     "sell_check": [],
     "daily_summary": [],
-    "evening_outlook": ["qlib_data_update"],
+    # 2026-06-14 fix: evening_outlook fires Sun-Thu (the eve of each
+    # trading day). On Sun the cron checks SAME-DAY qlib_data_update
+    # for 2026-06-14 — but qlib only runs Mon-Fri so it never fires
+    # Sunday. The right gate is YESTERDAY (Friday)'s qlib success,
+    # not today's no-fire. Moving to JOB_DEPS_PREV_BDAY below.
+    "evening_outlook": [],
     # ---- Shadow paper-trade (xgb_209_llm promotion gate) ---------------
     # cx batch G P2 #6 (2026-06-07): added to JOB_DEPS so daily_status
     # reports these jobs and the 5-day shadow window appears in the
@@ -206,6 +211,14 @@ JOB_DEPS_PREV_BDAY: dict[str, list[str]] = {
     # Saturday 04:00 weekly_full_retrain wants Friday's 18:25 cache —
     # not Saturday's, which never ran.
     "weekly_full_retrain": ["feature_cache_rebuild"],
+    # 2026-06-14: evening_outlook fires Sun-Thu 22:00 — for next
+    # trading day's strategy. On Sunday/Thursday/etc the same-day
+    # qlib_data_update never ran (cron is Mon-Fri only) so the gate
+    # used to refuse on Sunday with `same-day-missing=['qlib_data_update']`
+    # for 5 weeks. The actual data dependency is the LAST trading
+    # day's qlib_data_update output, which prev-bday computes
+    # correctly (Sun → Fri, Thu eve → Thu morning's same-day cron OK).
+    "evening_outlook": ["qlib_data_update"],
     # cx batch G P2 #6 (2026-06-07): shadow paper-trade reads the
     # *_latest.parquet produced by yesterday's 18:30
     # champion_cache_rebuild. generate at 09:00 and backfill at 16:30
