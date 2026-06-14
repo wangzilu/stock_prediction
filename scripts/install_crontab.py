@@ -155,9 +155,27 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                 [py, str(scripts / "extract_global_supply_chain_events.py")], "global_chain_extract.log",
                 network="none", timeout_sec=600,
                 enforce_deps=True, dep_wait_seconds=7200))
+    # 2026-06-14 silent-gap fix: production swap to xgb_209_chain_llm (06-10)
+    # depends on global_chain_factors_llm.parquet, but no cron was maintaining
+    # it. The fossil file dated 06-05 (last manual #174 backfill). Add the two
+    # missing LLM-side jobs so the production champion keeps getting fresh
+    # supply chain signal. Token cost: ~80 LLM calls/day × ~¥0.002/call ≈ ¥0.2/day.
+    if (scripts / "extract_global_chain_llm.py").exists():
+        jobs.append(CronJob("global_chain_llm_extract", "0 17 * * 1-5",
+                [py, str(scripts / "extract_global_chain_llm.py"),
+                 "--schema", "v1", "--max-candidates", "200", "--max-llm", "80"],
+                "global_chain_llm_extract.log",
+                network="llm", timeout_sec=1200,
+                enforce_deps=True, dep_wait_seconds=7200))
     if (scripts / "build_global_chain_factors.py").exists():
         jobs.append(CronJob("global_chain_factors", "10 17 * * 1-5",
                 [py, str(scripts / "build_global_chain_factors.py")], "global_chain_factors.log",
+                network="none", timeout_sec=600,
+                enforce_deps=True, dep_wait_seconds=7200))
+        # LLM variant: separate output parquet, separate cron.
+        jobs.append(CronJob("global_chain_factors_llm", "20 17 * * 1-5",
+                [py, str(scripts / "build_global_chain_factors.py"), "--source", "llm"],
+                "global_chain_factors_llm.log",
                 network="none", timeout_sec=600,
                 enforce_deps=True, dep_wait_seconds=7200))
     # Sentiment: xueqiu + 同花顺 + 东财股吧
