@@ -712,39 +712,71 @@ def fetch_with_baostock(
 
 def fetch_with_akshare(start_by_code: dict[str, str], end_date: str) -> dict[str, pd.DataFrame]:
     import akshare as ak
+    import time as _time
+
+    # 2026-06-14 fix A: 1-shot fail was too brittle. Today's 06-12 cron
+    # observed AKShare returning RemoteDisconnected on the FIRST stock,
+    # 1 retry exhausted, fall-through. But AKShare's eastmoney back-end
+    # is known to drop the first connection of a session, then work after
+    # a reconnect. Retry up to 3 times with 1s / 2s / 4s exponential
+    # backoff. Also count consecutive failures: if >50 stocks in a row
+    # ALL fail, the provider is dead, raise to fall through. Otherwise
+    # we'd grind through all 5527 with 0% success burning ~20 minutes.
+    MAX_RETRIES = 3
+    MAX_CONSECUTIVE_FAILURES = 50
+    consecutive_failures = 0
 
     data: dict[str, pd.DataFrame] = {}
     total = len(start_by_code)
     with progress_bar(total, "akshare", "stock") as progress:
         for i, (code, start_date) in enumerate(sorted(start_by_code.items()), start=1):
             symbol = code.split(".")[1]
-            try:
-                raw = ak.stock_zh_a_hist(
-                    symbol=symbol,
-                    period="daily",
-                    start_date=start_date.replace("-", ""),
-                    end_date=end_date.replace("-", ""),
-                    adjust="qfq",
-                )
-                if raw is not None and not raw.empty:
-                    df = raw.rename(
-                        columns={
-                            "日期": "date",
-                            "开盘": "open",
-                            "最高": "high",
-                            "最低": "low",
-                            "收盘": "close",
-                            "成交量": "volume",
-                            "成交额": "amount",
-                            "换手率": "turn",
-                        }
+            raw = None
+            last_exc = None
+            for attempt in range(MAX_RETRIES):
+                try:
+                    raw = ak.stock_zh_a_hist(
+                        symbol=symbol,
+                        period="daily",
+                        start_date=start_date.replace("-", ""),
+                        end_date=end_date.replace("-", ""),
+                        adjust="qfq",
                     )
-                    for missing in ("peTTM", "pbMRQ"):
-                        if missing not in df.columns:
-                            df[missing] = np.nan
-                    data[code] = normalize_frame(df)
-            except Exception as exc:
-                logger.warning("AKShare failed for %s: %s", code, exc)
+                    consecutive_failures = 0
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < MAX_RETRIES - 1:
+                        _time.sleep(2 ** attempt)  # 1s, 2s, then bail
+            if raw is None:
+                logger.warning(
+                    "AKShare failed for %s after %d retries: %s",
+                    code, MAX_RETRIES, last_exc,
+                )
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    raise RuntimeError(
+                        f"AKShare hit {consecutive_failures} consecutive stock "
+                        f"failures (latest={code}). Service appears down — "
+                        f"bailing so the auto chain falls through to baostock."
+                    )
+            elif not raw.empty:
+                df = raw.rename(
+                    columns={
+                        "日期": "date",
+                        "开盘": "open",
+                        "最高": "high",
+                        "最低": "low",
+                        "收盘": "close",
+                        "成交量": "volume",
+                        "成交额": "amount",
+                        "换手率": "turn",
+                    }
+                )
+                for missing in ("peTTM", "pbMRQ"):
+                    if missing not in df.columns:
+                        df[missing] = np.nan
+                data[code] = normalize_frame(df)
             if progress is not None:
                 progress.update(1)
                 progress.set_postfix(ok=len(data), current=code)
@@ -1098,31 +1130,33 @@ def fetch_data(
         return provider, {}
 
     if provider == "auto":
-        try:
-            logger.info("Trying StockToday provider")
-            data = fetch_with_stocktoday(start_by_code, end_date, cap_lookback_days)
-            min_ok = min(4500, max(1, int(len(start_by_code) * 0.85)))
-            if len(data) >= min_ok:
-                return "stocktoday", data
+        # 2026-06-14: drop the tushare → akshare → baostock fallback
+        # chain. Today's evidence:
+        #   - tushare: requires paid official token we don't have
+        #   - akshare: backend RemoteDisconnected on every stock 06-12,
+        #     looks like IP block or service outage
+        #   - baostock: 5s/query × 5527 stocks = 7.7h, cron budget is
+        #     7200s; cannot finish under any cap
+        # ST is reliable for recent dates and the ONLY days it returns
+        # 400 are specific past dates where the server-side ETL has a
+        # gap — those days baostock can't recover either. Better to
+        # accept a calendar gap than burn the cron budget on a chain
+        # that will time out. Opt-in providers (--provider baostock
+        # etc.) still work for manual deep-history backfill.
+        logger.info("Trying StockToday provider (auto = ST-only since 2026-06-14)")
+        data = fetch_with_stocktoday(start_by_code, end_date, cap_lookback_days)
+        # No min_ok threshold gate: accept whatever ST returned. If it
+        # returned 0 stocks (e.g. ST fully dark today), raise so the
+        # cron registers a clean failure rather than falling through to
+        # a multi-hour baostock attempt that also won't finish.
+        if not data:
             raise RuntimeError(
-                f"StockToday coverage too low: {len(data)}/{len(start_by_code)} "
-                f"(min_ok={min_ok})"
+                "StockToday returned no data (auto mode is ST-only "
+                "since 2026-06-14). Calendar may have a gap for "
+                f"end_date={end_date}; will retry on next cron tick. "
+                "For manual deep-history backfill use --provider baostock."
             )
-        except Exception as exc:
-            logger.warning("StockToday provider unavailable: %s", exc)
-        if os.environ.get("TUSHARE_TOKEN") or os.environ.get("TUSHARE_PRO_TOKEN"):
-            try:
-                logger.info("Trying Tushare provider")
-                return "tushare", fetch_with_tushare(start_by_code, end_date)
-            except Exception as exc:
-                logger.warning("Tushare provider unavailable: %s", exc)
-        try:
-            logger.info("Trying AKShare provider")
-            return "akshare", fetch_with_akshare(start_by_code, end_date)
-        except Exception as exc:
-            logger.warning("AKShare provider unavailable: %s", exc)
-        logger.info("Falling back to baostock provider")
-        return "baostock", fetch_with_baostock(start_by_code, end_date, cap_lookback_days)
+        return "stocktoday", data
 
     if provider == "stocktoday":
         return provider, fetch_with_stocktoday(start_by_code, end_date, cap_lookback_days)
