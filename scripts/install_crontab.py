@@ -154,7 +154,7 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         jobs.append(CronJob("global_chain_extract", "50 16 * * 1-5",
                 [py, str(scripts / "extract_global_supply_chain_events.py")], "global_chain_extract.log",
                 network="none", timeout_sec=600,
-                enforce_deps=True, dep_wait_seconds=7200))
+                enforce_deps=True, dep_wait_seconds=10800))
     # 2026-06-14 silent-gap fix: production swap to xgb_209_chain_llm (06-10)
     # depends on global_chain_factors_llm.parquet, but no cron was maintaining
     # it. The fossil file dated 06-05 (last manual #174 backfill). Add the two
@@ -166,18 +166,18 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                  "--schema", "v1", "--max-candidates", "200", "--max-llm", "80"],
                 "global_chain_llm_extract.log",
                 network="llm", timeout_sec=1200,
-                enforce_deps=True, dep_wait_seconds=7200))
+                enforce_deps=True, dep_wait_seconds=10800))
     if (scripts / "build_global_chain_factors.py").exists():
         jobs.append(CronJob("global_chain_factors", "10 17 * * 1-5",
                 [py, str(scripts / "build_global_chain_factors.py")], "global_chain_factors.log",
                 network="none", timeout_sec=600,
-                enforce_deps=True, dep_wait_seconds=7200))
+                enforce_deps=True, dep_wait_seconds=10800))
         # LLM variant: separate output parquet, separate cron.
         jobs.append(CronJob("global_chain_factors_llm", "20 17 * * 1-5",
                 [py, str(scripts / "build_global_chain_factors.py"), "--source", "llm"],
                 "global_chain_factors_llm.log",
                 network="none", timeout_sec=600,
-                enforce_deps=True, dep_wait_seconds=7200))
+                enforce_deps=True, dep_wait_seconds=10800))
     # Sentiment: xueqiu + 同花顺 + 东财股吧
     if (scripts / "collect_sentiment_daily.py").exists():
         jobs.append(CronJob("sentiment_daily", "40 16 * * 1-5",
@@ -385,18 +385,18 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                 network="domestic", timeout_sec=7200, critical=True),
         # cx batch G P1 #3 (2026-06-07): enforce_deps wired up. Both
         # gate on qlib_data_update per scheduler/job_deps.py.
-        # dep_wait_seconds=7200 covers qlib's worst-case 3600s timeout
+        # dep_wait_seconds=10800 covers qlib's worst-case 3600s timeout
         # so a slow qlib doesn't make these false-fail-quick.
         CronJob("fund_flow_update", "55 17 * * 1-5",
                 [py, str(scripts / "fetch_fund_flow_history.py"), "--incremental", "--workers", "1"],
                 "fund_flow_update.log",
                 network="domestic", timeout_sec=1800,
-                enforce_deps=True, dep_wait_seconds=7200),
+                enforce_deps=True, dep_wait_seconds=10800),
         CronJob("st_daily_factors_update", "58 17 * * 1-5",
                 [py, str(scripts / "fetch_st_daily_factors.py"), "--days", "60"],
                 "st_daily_factors_update.log",
                 network="domestic", timeout_sec=1800,
-                enforce_deps=True, dep_wait_seconds=7200),
+                enforce_deps=True, dep_wait_seconds=10800),
         # st_holder_number is quarterly, but it is a production feature
         # source distinct from shareholder_features.parquet. Refresh weekly
         # with --force so new announcements are not skipped merely because
@@ -413,16 +413,23 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                 [py, str(scripts / "fetch_fundamental_valuation.py"), "--days", "10", "--incremental"],
                 "valuation_update.log",
                 network="domestic", timeout_sec=7200,
-                enforce_deps=True, dep_wait_seconds=7200),
+                enforce_deps=True, dep_wait_seconds=10800),
+        # 2026-06-16: 3600s timeout was undersized — baostock per-stock
+        # ~1.5s × 5419 stocks ≈ 2.25 hrs, so the cron consistently killed
+        # the job at 1000/5419 (50 min in). That blocked feature_cache_rebuild,
+        # which blocked predict_crash_daily for 9 consecutive trading days
+        # (06-04 → 06-16). Risk hard-block silently degraded the entire window.
+        # Bumped to 10800s (3 hrs). Real fix is migrating to ST_CLIENT batch
+        # endpoints (stk_holdernumber, stk_holdertrade), tracked separately.
         CronJob("shareholder_update", "2 18 * * 1-5",
                 [py, str(scripts / "fetch_shareholder_data.py")],
                 "shareholder_update.log",
-                network="domestic", timeout_sec=3600,
-                enforce_deps=True, dep_wait_seconds=7200),
+                network="domestic", timeout_sec=10800,
+                enforce_deps=True, dep_wait_seconds=10800),
         CronJob("regime_daily_update", "5 18 * * 1-5",
                 [py, str(scripts / "update_regime_daily.py")], "regime_daily.log",
                 network="domestic", timeout_sec=1200,
-                enforce_deps=True, dep_wait_seconds=7200),
+                enforce_deps=True, dep_wait_seconds=10800),
         # --- Training (none) ---
         # cx batch G P1 #3 (2026-06-07): enforce_deps wired up — gates
         # on feature_cache_rebuild which itself fires at 18:25, before
@@ -432,7 +439,7 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("midweek_train", "15 18 * * 3",
                 [py, str(scripts / "train_lgb.py")], "lgb_after_close_train.log",
                 network="none", timeout_sec=7200,
-                enforce_deps=True, dep_wait_seconds=7200),
+                enforce_deps=True, dep_wait_seconds=10800),
         # --- Feature cache rebuild (depends on qlib_data_update + fund_flow_update) ---
         # qlib_data_update 17:45 + fund_flow_update 17:55 (timeout 1800s).
         # In the worst case fund_flow runs until ~18:25, so the cache rebuild
@@ -451,7 +458,7 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("feature_cache_rebuild", "25 18 * * 1-5",
                 [py, str(scripts / "build_feature_cache.py"), "--all"], "feature_cache_rebuild.log",
                 network="domestic", timeout_sec=1800, critical=True,
-                enforce_deps=True, dep_wait_seconds=7200),
+                enforce_deps=True, dep_wait_seconds=10800),
         # 2026-06-07 cx P1 #1 + #2 fix: feature_cache_rebuild only
         # touches the legacy 174-family cache. The xgb_209 production
         # champion + xgb_209_llm shadow candidate read separate
@@ -467,7 +474,7 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                 [py, str(scripts / "build_champion_cache.py")],
                 "champion_cache_rebuild.log",
                 network="none", timeout_sec=1200,
-                enforce_deps=True, dep_wait_seconds=7200),
+                enforce_deps=True, dep_wait_seconds=10800),
         # --- Prediction + Paper (none, critical) ---
         # Smoke depends on champion_cache_rebuild (xgb_209 / xgb_209_llm
         # 209-family parquets it actually reads); downstream paper/shadow
@@ -493,35 +500,46 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("lgb_after_close_smoke", "35 18 * * 1-5",
                 [py, str(scripts / "smoke_lgb_predict.py")], "lgb_after_close_smoke.log",
                 network="none", timeout_sec=1800, critical=True,
-                enforce_deps=True, dep_wait_seconds=7200),
+                enforce_deps=True, dep_wait_seconds=10800),
         CronJob("predict_crash_daily", "37 18 * * 1-5",
                 [py, str(scripts / "predict_crash_daily.py")], "crash_predict.log",
                 network="none", timeout_sec=120,
-                enforce_deps=True, dep_wait_seconds=7200),
+                enforce_deps=True, dep_wait_seconds=10800),
+        # 2026-06-16: B.9 shadow Sp20 tracker — snapshots the cache each
+        # business day post-smoke and computes realized Sp20 once 5td
+        # forward returns become available. Cheap (1-2 min) and the only
+        # way to anchor a real-world Sp20 verdict against the LOO
+        # simulation baseline (+9.92 bps). Gated on smoke so it always
+        # snapshots the canonical post-close cache.
+        CronJob("b9_shadow_sp20_tracker", "38 18 * * 1-5",
+                [py, str(scripts / "track_b9_shadow_sp20.py")],
+                "b9_shadow_sp20.log",
+                network="none", timeout_sec=300,
+                enforce_deps=True, dep_wait_seconds=10800),
         CronJob("shadow_optimizer", "40 18 * * 1-5",
                 [py, str(scripts / "run_shadow_optimizer.py")], "shadow_optimizer.log",
                 network="none", timeout_sec=600,
-                enforce_deps=True, dep_wait_seconds=7200),
+                enforce_deps=True, dep_wait_seconds=10800),
         CronJob("paper_trading", "42 18 * * 1-5",
                 [py, str(scripts / "run_paper_trading.py")], "paper_trading.log",
                 network="none", timeout_sec=600,
-                enforce_deps=True, dep_wait_seconds=7200),
+                enforce_deps=True, dep_wait_seconds=10800),
         CronJob("shadow_chain_overlay", "45 18 * * 1-5",
                 [py, str(scripts / "shadow_supply_chain_overlay.py")], "shadow_chain_overlay.log",
                 network="none", timeout_sec=120,
-                enforce_deps=True, dep_wait_seconds=7200),
+                enforce_deps=True, dep_wait_seconds=10800),
         CronJob("shadow_klen_overlay", "46 18 * * 1-5",
                 [py, str(scripts / "shadow_klen_overlay.py")], "shadow_klen_overlay.log",
                 network="none", timeout_sec=120,
-                enforce_deps=True, dep_wait_seconds=7200),
+                enforce_deps=True, dep_wait_seconds=10800),
         CronJob("shadow_vol_compression", "47 18 * * 1-5",
                 [py, str(scripts / "shadow_vol_compression.py")], "shadow_vol_compression.log",
                 network="none", timeout_sec=120,
-                enforce_deps=True, dep_wait_seconds=7200),
+                enforce_deps=True, dep_wait_seconds=10800),
         CronJob("shadow_roc5_tsmin10", "48 18 * * 1-5",
                 [py, str(scripts / "shadow_roc5_tsmin10.py")], "shadow_roc5_tsmin10.log",
                 network="none", timeout_sec=120,
-                enforce_deps=True, dep_wait_seconds=7200),
+                enforce_deps=True, dep_wait_seconds=10800),
         # --- Monitoring (none) ---
         # cx batch G P1 #3 (2026-06-07): enforce_deps wired up — these
         # both gate on lgb_after_close_smoke per scheduler/job_deps.py
@@ -530,7 +548,7 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("factor_decay_monitor", "49 18 * * 1-5",
                 [py, str(scripts / "monitor_factor_decay.py")], "factor_decay.log",
                 network="none", timeout_sec=600,
-                enforce_deps=True, dep_wait_seconds=7200),
+                enforce_deps=True, dep_wait_seconds=10800),
         # brinson_attribution: timeout bumped 600 → 1200 (Task #76).
         # The window itself is a fixed 29 days (run_brinson_attribution.py
         # line 53), but Alpha158 dataset preparation has grown past 600s on
@@ -540,7 +558,7 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("brinson_attribution", "50 18 * * 1-5",
                 [py, str(scripts / "run_brinson_attribution.py")], "brinson_attribution.log",
                 network="none", timeout_sec=1200,
-                enforce_deps=True, dep_wait_seconds=7200),
+                enforce_deps=True, dep_wait_seconds=10800),
         # --- LLM 429 retry queue drain (after main pipeline + evening) ---
         # Deliberately NOT enforce_deps. This is a recovery job — gating it
         # on the main pipeline's success would defeat its purpose when the
@@ -558,7 +576,7 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("daily_health_check", "55 18 * * 1-5",
                 [py, str(scripts / "daily_health_check.py")], "health_check.log",
                 network="none", timeout_sec=300,
-                enforce_deps=True, dep_wait_seconds=7200),
+                enforce_deps=True, dep_wait_seconds=10800),
         # --- Weekly (Saturday) ---
         # 2026-06-06: bumped 14400→28800 (4h→8h). Last run died at 08:00
         # after 4h with qlib instruments sync still running (5208 stocks

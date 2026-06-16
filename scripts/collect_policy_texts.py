@@ -154,24 +154,25 @@ HEALTH_SOURCE_NAME_XWLB = "xinwen_lianbo_policy_texts"
 # 工信部 (MIIT) — semiconductor / EV / industrial policy
 # 发改委 (NDRC) — pricing / industrial planning / investment
 # 财政部 (MOF) — fiscal / subsidy / tax
-# 2026-06-16: gov.cn restructured — premier/changwu.htm and the
-# bumen/<ministry>/index.htm pattern all return 404. zhengce/zuixin.htm
-# now redirects to a JS-rendered SPA shell with no parseable static
-# content. The 4 ministry URLs below are commented out until the
-# collector is rewritten against gov.cn's JSON sousuo API:
-#   https://sousuo.www.gov.cn/search-gov/data?...
-# Tracked as P1 — needs sousuo API contract + per-ministry filter.
-# state_council_doc kept in the dict so the existing job still has a
-# scrape target, even though its list page is also SPA-shell (0 rows
-# expected steady-state until full rewrite).
+# 2026-06-16 revised — gov.cn restructured; sousuo JSON API is HMAC-gated
+# (research confirmed in docs/state_council_sousuo_api_research_20260616.md).
+# Fallback: hit each ministry's own portal directly. All 5 URLs verified
+# live with vanilla User-Agent GET on 2026-06-16. The existing parse_list_page
+# regex fan-out handles the date-encoded link patterns; ``state_council_doc``
+# and ``state_council_meeting`` share the same zhengce/index.htm list and
+# downstream filtering (TODO: STATE_COUNCIL_TITLE_KEYWORDS) splits doc vs
+# meeting by title keyword. sparse_steady stays True until that filter ships.
 STATE_COUNCIL_LIST_URLS: dict[str, str] = {
-    # 国务院政策文件 (still listed but yields 0 rows post-2026-06 — SPA)
-    "state_council_doc": "http://www.gov.cn/zhengce/zuixin.htm",
-    # 以下 4 个 URL 已 404 — gov.cn 改版，等 SPA/sousuo API 接入：
-    # "state_council_meeting": "http://www.gov.cn/premier/changwu.htm",
-    # "miit_policy":           "http://www.gov.cn/lianbo/bumen/202401/index.htm",
-    # "ndrc_policy":           "http://www.gov.cn/lianbo/bumen/ndrc/index.htm",
-    # "mof_policy":            "http://www.gov.cn/lianbo/bumen/mof/index.htm",
+    # 国务院政策文件 (索引页, 53 article links per 2026-06 audit)
+    "state_council_doc": "https://www.gov.cn/zhengce/index.htm",
+    # 国务院常务会议 — same source, filtered downstream by title
+    "state_council_meeting": "https://www.gov.cn/zhengce/index.htm",
+    # 工信部政策发布
+    "miit_policy": "https://www.miit.gov.cn/zwgk/zcwj/wjfb/index.html",
+    # 发改委政策通知
+    "ndrc_policy": "https://www.ndrc.gov.cn/xxgk/zcfb/tz/",
+    # 财政部政策发布
+    "mof_policy": "https://www.mof.gov.cn/zhengwuxinxi/zhengcefabu/",
 }
 
 STATE_COUNCIL_POLICY_TYPES: frozenset[str] = frozenset(

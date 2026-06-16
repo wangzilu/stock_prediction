@@ -16,3 +16,8 @@ mlruns/
 .claude/
 catboost_info/
 .st_token
+.st_token.*
+
+# user-shared external library + token manual (lobster ST_CLIENT)
+proxy/
+ST_CLIENT.py.*.bak

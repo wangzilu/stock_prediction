@@ -154,6 +154,11 @@ JOB_DEPS: dict[str, list[str]] = {
     # the job correctly.
     "weekly_full_retrain": [],
     "predict_crash_daily": ["feature_cache_rebuild"],
+    # 2026-06-16: B.9 shadow Sp20 tracker — snapshots the post-smoke cache
+    # so the realized Sp20 can be computed once 5 trading days of forward
+    # returns are available. Gated on smoke so it always reads the cache
+    # the cron actually consumes.
+    "b9_shadow_sp20_tracker": ["lgb_after_close_smoke"],
     # ---- Shadow optimizer + paper trading depend on smoke test -----------
     "shadow_optimizer": ["lgb_after_close_smoke", "predict_crash_daily"],
     "paper_trading": ["lgb_after_close_smoke"],

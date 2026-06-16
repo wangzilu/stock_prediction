@@ -228,8 +228,13 @@ def save_checkpoint(all_dfs: list, path: Path, dedup_cols: list):
     # Coerce all object-dtype columns to str — preserves human-readable
     # values, eliminates the mixed-type-column trap, costs nothing for
     # already-string columns. Numeric columns are untouched.
+    #
+    # 2026-06-16: bug found by fund_flow corruption RCA — the bare
+    # ``astype(str)`` turns NaN → "nan" and None → "None" as STRING
+    # literals, which then accumulate every day. Real fix: keep nulls
+    # as nulls; only cast non-null values.
     for _col in result.select_dtypes(include="object").columns:
-        result[_col] = result[_col].astype(str)
+        result[_col] = result[_col].map(lambda x: str(x) if pd.notna(x) else None)
     result.to_parquet(path, index=False)
     logger.info(f"  Checkpoint: saved {len(result)} records to {path.name}")
 
@@ -658,8 +663,11 @@ def _save_with_merge(new_df: pd.DataFrame, path: Path, dedup_cols: list, label: 
             new_df.drop_duplicates(subset=dedup_cols, keep="last", inplace=True)
     path.parent.mkdir(parents=True, exist_ok=True)
     # 2026-06-08: see batch_fetch site for ggt_ss mixed-type root cause.
+    # 2026-06-16: mirror the null-preserving cast — bare astype(str) was
+    # stringifying NaN to "nan" / None to "None" each merge, accumulating
+    # 13M garbage rows in the 日期 column (see fund_flow_corruption_rca_20260616.md).
     for _col in new_df.select_dtypes(include="object").columns:
-        new_df[_col] = new_df[_col].astype(str)
+        new_df[_col] = new_df[_col].map(lambda x: str(x) if pd.notna(x) else None)
     new_df.to_parquet(path, index=False)
     logger.info(f"Saved {label} to {path} ({len(new_df)} rows)")
     if "trade_date" in new_df.columns:
