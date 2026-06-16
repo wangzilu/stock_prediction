@@ -76,13 +76,29 @@ def fetch_shareholder(codes: list) -> pd.DataFrame:
 
     logger.info(f"Fetching shareholder for {len(codes)} stocks (Q{quarter} {year})...")
 
+    # 2026-06-16: pre-fix the per-stock loop tried 4 (year, quarter) combos
+    # before giving up, multiplying baostock RPC cost ~4×. Per-stock budget
+    # was ~1.5s, so 5419 × 1.5 × 4 = 4.5 hrs worst case — past every
+    # reasonable timeout. Cron at 18:02 with timeout 10800 (3 hrs) couldn't
+    # complete, blocking feature_cache_rebuild → predict_crash_daily for
+    # 9 consecutive trading days. Real fix is migrating to ST_CLIENT batch
+    # (different fact set: holder_num vs share structure, separate task).
+    # Tonight: try the current quarter first; if no data fall back to the
+    # PREVIOUS quarter only (handles the ~4-week gap after each quarter
+    # close before new reports land), then give up. Reduces worst-case
+    # work to 5419 × 1.5 × 2 = 4.5 hrs → 2.25 hrs, comfortably inside 3 hr
+    # cron budget.
+    quarter_attempts = [(year, quarter)]
+    if quarter > 1:
+        quarter_attempts.append((year, quarter - 1))
+    else:
+        quarter_attempts.append((year - 1, 4))
+
     for i, code in enumerate(codes):
         bs_code = qlib_to_baostock(code)
         try:
-            # Get share structure from profit_data
             best_row = None
-            for y, q in [(year, quarter), (year, quarter - 1) if quarter > 1 else (year - 1, 4),
-                         (year - 1, 4), (year - 1, 3)]:
+            for y, q in quarter_attempts:
                 rs = bs.query_profit_data(code=bs_code, year=y, quarter=q)
                 rows = []
                 while rs.next():

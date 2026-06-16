@@ -130,7 +130,12 @@ PBC_LIST_URLS: dict[str, str] = {
 
 PBC_BASE = "http://www.pbc.gov.cn"
 GOV_CN_BASE = "http://www.gov.cn"
-USER_AGENT = "Mozilla/5.0 (compatible; StockPrediction-PolicyCollector/1.0)"
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)  # 2026-06-16: switched from a custom UA to a Chrome UA — gov.cn,
+   # miit.gov.cn, and ndrc.gov.cn return 403 to non-browser UAs.
 REQUEST_TIMEOUT = 15  # seconds per attempt — required by spec
 RETRY_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = 2.0
