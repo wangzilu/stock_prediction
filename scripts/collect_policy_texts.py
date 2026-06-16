@@ -404,14 +404,17 @@ def parse_list_page(html: str, base_url: str) -> list[PolicyLink]:
             #       sibling span / parent text)
             # 2026-06-06 fix: original parser only matched (b) so the live
             # OMO page (which uses (a)) returned 0 candidates. Match all.
+            # 2026-06-16: extend to .htm — gov.cn restructured pages use
+            # `.htm` not `.html` (e.g. `content_7071451.htm`). All other
+            # legacy `.html` patterns still match.
             looks_like_article = (
-                href.endswith(".html")
+                href.endswith((".html", ".htm"))
                 and (
-                    re.search(r"/\d{14,}/index\.html$", href) is not None
+                    re.search(r"/\d{14,}/index\.html?$", href) is not None
                     or re.search(r"/\d{4}/\d{1,2}/\d{1,2}/", href) is not None
-                    or re.search(r"_\d{4,}\.html$", href) is not None
+                    or re.search(r"_\d{4,}\.html?$", href) is not None
                     or re.search(r"/\d{4}-\d{1,2}/\d{1,2}/", href) is not None
-                    or re.search(r"/content_\d+\.html$", href) is not None
+                    or re.search(r"/content_\d+\.html?$", href) is not None
                 )
             )
             if not looks_like_article:
