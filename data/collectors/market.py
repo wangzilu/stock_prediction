@@ -300,33 +300,55 @@ class MarketCollector:
             self._spot_loaded = True
             return
 
-        # Try AKShare (eastmoney) with retries
-        # 2026-06-16: spot order stays AKShare → ST_CLIENT → Tencent.
-        # ST_CLIENT realtime_list IS available on the API but requires
-        # the "龙虾套餐" subscription tier — current token returns
-        # {code: 1, msg: "该接口为龙虾套餐专属"}. Until the subscription
-        # is upgraded, ST primary would waste one round-trip per call
-        # only to fail with auth error, and AKShare is the only viable
-        # full-market spot source. ST stays as layer 2 in case the
-        # subscription gets upgraded or AKShare goes down entirely.
+        # Layer 1: AKShare eastmoney (~5s typical, full universe).
+        # 2026-06-16: spot order stays AKShare → AKShare-Sina → ST_CLIENT → Tencent.
+        # The eastmoney upstream proxy (82.push2.eastmoney.com / 40.push2.eastmoney.com)
+        # has been intermittently RemoteDisconnected through June. Added Layer 2
+        # (`ak.stock_zh_a_spot` — Sina-backed, ~110s, full universe) as a
+        # last-mile parachute before the partial Tencent path.
         for attempt in range(MAX_RETRIES):
             try:
-                logger.info(f"Loading A-share spot data via AKShare (attempt {attempt+1})...")
+                logger.info(f"Loading A-share spot data via AKShare eastmoney (attempt {attempt+1})...")
                 self._spot_cache = ak.stock_zh_a_spot_em()
                 if self._spot_cache is not None and not self._spot_cache.empty:
-                    logger.info(f"Loaded {len(self._spot_cache)} stocks via AKShare")
-                    self._write_spot_disk_cache(self._spot_cache, "akshare")
+                    logger.info(f"Loaded {len(self._spot_cache)} stocks via AKShare eastmoney")
+                    self._write_spot_disk_cache(self._spot_cache, "akshare_em")
                     self._spot_loaded = True
                     return
             except Exception as e:
-                logger.warning(f"AKShare spot attempt {attempt+1}/{MAX_RETRIES}: {e}")
+                logger.warning(f"AKShare eastmoney spot attempt {attempt+1}/{MAX_RETRIES}: {e}")
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(RETRY_DELAY)
 
-        # Fallback Layer 2: ST_CLIENT / TuShare realtime_list (FULL MARKET).
+        # Layer 2: AKShare generic (Sina-backed batches). Slow (~110s for
+        # all ~5500 stocks across 70 batches) but uses a different upstream
+        # so RemoteDisconnected on eastmoney does not block this path.
         logger.warning(
-            "AKShare spot failed after %d retries — trying ST_CLIENT realtime_list fallback...",
-            MAX_RETRIES,
+            "AKShare eastmoney spot failed — trying AKShare Sina-batch fallback (slow, ~110s)..."
+        )
+        try:
+            sina_df = ak.stock_zh_a_spot()
+            if sina_df is not None and not sina_df.empty and len(sina_df) >= 4500:
+                logger.info("Loaded %d stocks via AKShare Sina (Layer 2)", len(sina_df))
+                self._spot_cache = sina_df
+                self._write_spot_disk_cache(sina_df, "akshare_sina")
+                self._spot_loaded = True
+                return
+            elif sina_df is not None:
+                logger.warning(
+                    "AKShare Sina returned %d stocks (< 4500 full-market threshold); "
+                    "treating as partial and continuing fallback chain", len(sina_df),
+                )
+        except Exception as e:
+            logger.warning("AKShare Sina spot fallback failed: %s", e)
+
+        # Layer 3: ST_CLIENT / TuShare realtime_list (FULL MARKET).
+        # As of 2026-06-16, the gateway returns "参数不能为空" even with the
+        # 龙虾 tier token — this path remains a dead-end placeholder until
+        # the gateway implementation is debugged. See
+        # docs/lobster_factor_roadmap_20260616.md for details.
+        logger.warning(
+            "AKShare paths exhausted — trying ST_CLIENT realtime_list fallback..."
         )
         st_df = self._load_spot_stclient()
         if st_df is not None and len(st_df) >= 4500:
