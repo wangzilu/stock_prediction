@@ -159,6 +159,10 @@ JOB_DEPS: dict[str, list[str]] = {
     # returns are available. Gated on smoke so it always reads the cache
     # the cron actually consumes.
     "b9_shadow_sp20_tracker": ["lgb_after_close_smoke"],
+    # 2026-06-16: C1 paper-shadow 209 vs 242. Same gating as the B.9 tracker
+    # — needs the post-smoke production cache as the 209 leg, then triggers
+    # a sibling xgb_242 inference pass against the same FeatureMerger state.
+    "c1_209_vs_242_tracker": ["lgb_after_close_smoke"],
     # ---- Shadow optimizer + paper trading depend on smoke test -----------
     "shadow_optimizer": ["lgb_after_close_smoke", "predict_crash_daily"],
     "paper_trading": ["lgb_after_close_smoke"],

@@ -516,6 +516,18 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                 "b9_shadow_sp20.log",
                 network="none", timeout_sec=300,
                 enforce_deps=True, dep_wait_seconds=10800),
+        # 2026-06-16: C1 paper-shadow xgb_209_chain_llm vs xgb_242. Runs a
+        # second inference pass with PRODUCTION_MODEL_PROFILE=xgb_242 against
+        # the same post-close features, snapshots both legs, computes Sp20
+        # for each (5-td forward, top20-bot20), appends running.csv with
+        # top-20 overlap. Design: docs/paper_trade_209_vs_242_design_20260616.md
+        # (Option B). Higher timeout because it triggers a fresh inference
+        # pass (~30s) on top of the per-snapshot Sp20 + qlib load (~10s).
+        CronJob("c1_209_vs_242_tracker", "39 18 * * 1-5",
+                [py, str(scripts / "track_c1_209_vs_242.py")],
+                "c1_209_vs_242.log",
+                network="none", timeout_sec=600,
+                enforce_deps=True, dep_wait_seconds=10800),
         CronJob("shadow_optimizer", "40 18 * * 1-5",
                 [py, str(scripts / "run_shadow_optimizer.py")], "shadow_optimizer.log",
                 network="none", timeout_sec=600,
