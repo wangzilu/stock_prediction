@@ -219,10 +219,15 @@ def save_with_merge(new_df: pd.DataFrame, out: Path, dedup_cols: list[str], labe
         logger.warning(f"{label}: skip dedup, missing columns: {missing}")
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    # 2026-06-08: ST_CLIENT's `date` column can come back as mixed
+    # 2026-06-08/10: ST_CLIENT's `date` column can come back as mixed
     # str/int (e.g. '2026-06-08' from new rows, 20260605 int from old
     # rows after a schema change). pyarrow.Table.from_pandas then
-    # raises ArrowTypeError. Same coerce pattern as fund_flow ggt_ss.
+    # raises ArrowTypeError. Coerce key columns explicitly before the
+    # object-column pass because pandas may keep a mixed scalar column
+    # as object until concat/dedup reshapes it.
+    for _col in dedup_cols:
+        if _col in merged.columns:
+            merged[_col] = merged[_col].astype(str)
     for _col in merged.select_dtypes(include="object").columns:
         merged[_col] = merged[_col].astype(str)
     merged.to_parquet(out, index=False)

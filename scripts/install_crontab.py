@@ -298,18 +298,28 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         # weekdays — SLA budget is 2 trading days so a single failed
         # weekday scrape can be recovered on Monday. Same shape as
         # PE-1/PE-2/PE-3: collect → extract → build.
-        CronJob("xinwen_lianbo_policy_texts", "45 15 * * 1-5",
+        #
+        # 2026-06-16: moved 15:45 → 20:00 (texts), 16:05 → 20:30 (events),
+        # 16:25 → 20:50 (factors). CCTV 新闻联播 airs daily 19:00-19:30;
+        # the previous 15:45 schedule fetched the previous day's headlines
+        # for 06-13/06-14/06-15 fallback but always missed THE CURRENT day
+        # (06-16's body wasn't published yet at 15:45). Post-broadcast
+        # window picks up today's body, fixing the recurring
+        # xinwen_lianbo_policy_events no_extracted failure. Still before
+        # evening_outlook 22:00 so the theme factor lands in the same
+        # business-day cycle.
+        CronJob("xinwen_lianbo_policy_texts", "0 20 * * 1-5",
                 [py, str(scripts / "collect_policy_texts.py"),
                  "--source", "xinwen_lianbo", "--fail-on-empty"],
                 "xinwen_lianbo_policy_texts.log",
                 network="domestic", timeout_sec=600),
-        CronJob("xinwen_lianbo_policy_events", "05 16 * * 1-5",
+        CronJob("xinwen_lianbo_policy_events", "30 20 * * 1-5",
                 [py, str(scripts / "extract_policy_events.py"),
                  "--source", "xinwen_lianbo"],
                 "xinwen_lianbo_policy_events.log",
                 network="llm", timeout_sec=1800,
                 enforce_deps=True),
-        CronJob("xinwen_lianbo_theme_factors", "25 16 * * 1-5",
+        CronJob("xinwen_lianbo_theme_factors", "50 20 * * 1-5",
                 [py, str(scripts / "build_policy_factors.py"),
                  "--source", "xinwen_lianbo"],
                 "xinwen_lianbo_theme_factors.log",
@@ -402,7 +412,7 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("valuation_update", "0 18 * * 1-5",
                 [py, str(scripts / "fetch_fundamental_valuation.py"), "--days", "10", "--incremental"],
                 "valuation_update.log",
-                network="domestic", timeout_sec=1200,
+                network="domestic", timeout_sec=7200,
                 enforce_deps=True, dep_wait_seconds=7200),
         CronJob("shareholder_update", "2 18 * * 1-5",
                 [py, str(scripts / "fetch_shareholder_data.py")],
@@ -440,7 +450,8 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         # path retires, this job can be removed.
         CronJob("feature_cache_rebuild", "25 18 * * 1-5",
                 [py, str(scripts / "build_feature_cache.py"), "--all"], "feature_cache_rebuild.log",
-                network="domestic", timeout_sec=1800, critical=True, enforce_deps=True),
+                network="domestic", timeout_sec=1800, critical=True,
+                enforce_deps=True, dep_wait_seconds=7200),
         # 2026-06-07 cx P1 #1 + #2 fix: feature_cache_rebuild only
         # touches the legacy 174-family cache. The xgb_209 production
         # champion + xgb_209_llm shadow candidate read separate
@@ -456,7 +467,7 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
                 [py, str(scripts / "build_champion_cache.py")],
                 "champion_cache_rebuild.log",
                 network="none", timeout_sec=1200,
-                enforce_deps=True),
+                enforce_deps=True, dep_wait_seconds=7200),
         # --- Prediction + Paper (none, critical) ---
         # Smoke depends on champion_cache_rebuild (xgb_209 / xgb_209_llm
         # 209-family parquets it actually reads); downstream paper/shadow

@@ -22,12 +22,72 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import pandas as pd
 
-from config.settings import DATA_DIR
+from config.settings import DATA_DIR, ST_TOKEN
 
 logger = logging.getLogger(__name__)
 
 NEWS_DIR = DATA_DIR / "daily_news"
 NEWS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _get_st_token() -> str:
+    token_file = PROJECT_ROOT / ".st_token"
+    if token_file.exists():
+        return token_file.read_text().strip()
+    return str(ST_TOKEN or "").strip()
+
+
+def _parse_st_table(resp) -> list[dict]:
+    """Normalize StockToday table responses into list-of-dicts.
+
+    StockToday endpoints have returned both a raw list and the wrapped
+    ``{"data": {"fields": [...], "items": [...]}}`` shape in production.
+    The daily news liquid-universe path must support both; otherwise a
+    valid ST response looks empty and the pipeline falls into the flaky
+    AKShare branch.
+    """
+    if isinstance(resp, list):
+        return [r for r in resp if isinstance(r, dict)]
+    if not isinstance(resp, dict):
+        return []
+    data = resp.get("data", resp)
+    if isinstance(data, list):
+        return [r for r in data if isinstance(r, dict)]
+    if not isinstance(data, dict):
+        return []
+    rows = data.get("items") or data.get("data") or data.get("list") or []
+    fields = data.get("fields") or data.get("columns") or resp.get("fields") or []
+    if not isinstance(rows, list):
+        return []
+    if rows and isinstance(rows[0], dict):
+        return [r for r in rows if isinstance(r, dict)]
+    if fields and rows and isinstance(rows[0], (list, tuple)):
+        return [dict(zip(fields, row)) for row in rows]
+    return []
+
+
+def _fallback_qlib_stocks(top_n: int) -> list[dict]:
+    instruments_path = DATA_DIR / "qlib_data" / "cn_data" / "instruments" / "all.txt"
+    if not instruments_path.exists():
+        return []
+    results: list[dict] = []
+    with open(instruments_path, "r", encoding="utf-8") as f:
+        for line in f:
+            code = line.strip().split("\t", 1)[0].upper()
+            if not code.startswith(("SH", "SZ")) or len(code) < 8:
+                continue
+            raw = code[2:]
+            results.append({
+                "code": raw,
+                "name": raw,
+                "qlib_code": code,
+                "ts_code": f"{raw}.{'SH' if code.startswith('SH') else 'SZ'}",
+            })
+            if len(results) >= top_n:
+                break
+    if results:
+        logger.warning("Using local Qlib instrument fallback for %d stocks", len(results))
+    return results
 
 
 def get_liquid_stocks(top_n: int = 100) -> list[dict]:
@@ -38,8 +98,7 @@ def get_liquid_stocks(top_n: int = 100) -> list[dict]:
     # Try ST_CLIENT first
     try:
         from ST_CLIENT import StockToday
-        token_file = PROJECT_ROOT / ".st_token"
-        token = token_file.read_text().strip() if token_file.exists() else ""
+        token = _get_st_token()
         if token:
             st = StockToday(token=token)
             from datetime import timedelta
@@ -47,9 +106,13 @@ def get_liquid_stocks(top_n: int = 100) -> list[dict]:
             for days_back in range(0, 10):
                 date_str = (datetime.now() - timedelta(days=days_back)).strftime("%Y%m%d")
                 resp = st.bak_basic(trade_date=date_str)
-                logger.debug(f"bak_basic({date_str}): type={type(resp).__name__}, len={len(resp) if isinstance(resp, list) else 'N/A'}")
-                if isinstance(resp, list) and len(resp) > 100:
-                    result = resp
+                rows = _parse_st_table(resp)
+                logger.debug(
+                    "bak_basic(%s): type=%s, rows=%s",
+                    date_str, type(resp).__name__, len(rows),
+                )
+                if len(rows) > 100:
+                    result = rows
                     logger.info(f"bak_basic found {len(result)} stocks for {date_str}")
                     break
             if isinstance(result, list) and result:
@@ -77,7 +140,7 @@ def get_liquid_stocks(top_n: int = 100) -> list[dict]:
             else:
                 logger.warning(f"bak_basic returned no usable data (last response type: {type(resp).__name__})")
         else:
-            logger.warning("No ST_CLIENT token found at .st_token")
+            logger.warning("No ST_CLIENT token found")
     except Exception as e:
         logger.warning(f"ST_CLIENT stock list failed: {e}")
         import traceback
@@ -98,7 +161,7 @@ def get_liquid_stocks(top_n: int = 100) -> list[dict]:
         return results
     except Exception as e:
         logger.error(f"Failed to get liquid stocks: {e}")
-        return []
+        return _fallback_qlib_stocks(top_n)
 
 
 def get_portfolio_stocks() -> list[dict]:

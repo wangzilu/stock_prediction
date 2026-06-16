@@ -43,6 +43,58 @@ sys.path.insert(0, str(PROJECT_ROOT))
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 logger = logging.getLogger(__name__)
+_ANNOUNCEMENT_FALLBACK_USED = False
+
+
+def _write_jsonl_atomic(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    import json as _json
+    with open(tmp, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(_json.dumps(row, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
+def _ensure_news_file_from_announcements(
+    news_path: Path,
+    target_date: str,
+    ann_items: list[dict],
+) -> bool:
+    """Create a raw daily-news file from announcements when news APIs fail.
+
+    The event pipeline can still produce useful PIT-safe exchange
+    announcement events without Eastmoney/AKShare daily news. Returning
+    False only means there is genuinely no raw input for the day.
+    """
+    if news_path.exists():
+        return True
+    if not ann_items:
+        return False
+    global _ANNOUNCEMENT_FALLBACK_USED
+    _ANNOUNCEMENT_FALLBACK_USED = True
+    _write_jsonl_atomic(news_path, ann_items)
+    manifest = {
+        "target_date": target_date,
+        "collector_version": "announcement_fallback",
+        "filter_version": "announcement_fallback",
+        "recency_cutoff_days": 0,
+        "n_items": len(ann_items),
+        "use_portfolio": False,
+        "partial": True,
+        "fallback_reason": "daily_news_missing",
+        "collected_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    manifest_path = news_path.with_suffix(".manifest.json")
+    manifest_path.write_text(
+        __import__("json").dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    logger.warning(
+        "  Daily news file missing; wrote %d announcement fallback rows -> %s",
+        len(ann_items), news_path,
+    )
+    return True
 
 
 def _write_to_unified_store(events_path: Path, target_date: str) -> None:
@@ -116,6 +168,8 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
 
     logger.info(f"=== LLM Event Pipeline START for {target_date} ===")
     start_time = datetime.now()
+    global _ANNOUNCEMENT_FALLBACK_USED
+    _ANNOUNCEMENT_FALLBACK_USED = False
 
     # Step 0: Collect announcements (higher coverage than news)
     logger.info("[Step 0/3] Collecting announcements...")
@@ -160,7 +214,11 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
         )
         logger.info(f"  News collected -> {news_path}")
 
-        # Merge announcements into news file (append, dedup by stock+title)
+        # Merge announcements into news file (append, dedup by stock+title).
+        # If the news collector returns a path but upstream APIs produced no
+        # file, create an announcement-only raw file instead of failing the
+        # whole event pipeline.
+        _ensure_news_file_from_announcements(news_path, target_date, ann_items)
         if ann_items and news_path.exists():
             import json as _json2
             existing_keys = set()
@@ -182,7 +240,9 @@ def run_pipeline(target_date: str = None, use_portfolio: bool = False,
     except Exception as e:
         logger.error(f"  News collection failed: {e}")
         logger.debug(traceback.format_exc())
-        return False
+        news_path = DATA_DIR / "daily_news" / f"{target_date}.jsonl"
+        if not _ensure_news_file_from_announcements(news_path, target_date, ann_items):
+            return False
 
     # Step 1.5: L0 classify + ranking filter, then write filtered output.
     # L0 classify_l0() partitions items into: direct (rule-emits structured
@@ -517,12 +577,21 @@ def main():
                 n_items = 0
         write_health("llm_event_pipeline", HealthStatus(
             success=bool(success),
-            partial=not bool(success),
+            partial=(not bool(success)) or bool(_ANNOUNCEMENT_FALLBACK_USED),
             n_items=n_items,
             latest_date=target_date if success else "",
-            error_type="" if success else "PipelineFailed",
-            error_message="" if success else "LLM event pipeline returned False",
+            error_type=(
+                "AnnouncementFallback"
+                if success and _ANNOUNCEMENT_FALLBACK_USED
+                else "" if success else "PipelineFailed"
+            ),
+            error_message=(
+                "daily news API unavailable; used announcement-only fallback"
+                if success and _ANNOUNCEMENT_FALLBACK_USED
+                else "" if success else "LLM event pipeline returned False"
+            ),
             network_profile="llm",
+            extra={"announcement_fallback": bool(_ANNOUNCEMENT_FALLBACK_USED)},
         ))
     except Exception as health_exc:
         logger.warning("write_health(llm_event_pipeline) failed: %s", health_exc)

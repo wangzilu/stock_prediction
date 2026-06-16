@@ -954,8 +954,14 @@ def _write_chain_factor_health(
     error_type: str = "",
     error_message: str = "",
     partial: bool = False,
+    source: str = "rule",
 ) -> None:
-    write_health("global_chain_factors", HealthStatus(
+    health_source = (
+        "global_chain_factors_llm"
+        if source in ("llm", "llm_v2")
+        else "global_chain_factors"
+    )
+    write_health(health_source, HealthStatus(
         success=success,
         n_items=n_items,
         latest_date=target_date if success else "",
@@ -1046,12 +1052,14 @@ def main():
                 target_date=target_date,
                 error_type="NoFactors",
                 error_message="No events/factors produced; refusing to keep stale global_chain_factors parquet green",
+                source=args.source,
             )
             sys.exit(1)
         _write_chain_factor_health(
             success=True,
             target_date=target_date,
             n_items=len(df),
+            source=args.source,
         )
     except Exception as e:
         logger.error("Factor build failed: %s", e)
@@ -1060,6 +1068,7 @@ def main():
             target_date=target_date,
             error_type=type(e).__name__,
             error_message=str(e),
+            source=args.source,
         )
         import traceback
         traceback.print_exc()

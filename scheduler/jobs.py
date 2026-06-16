@@ -5,6 +5,7 @@ import logging
 import math
 import json
 import re
+import signal
 from dataclasses import is_dataclass, replace
 from datetime import datetime, timedelta
 
@@ -116,6 +117,42 @@ class DailyPipeline:
         self._rl_agent = None
         self._mid_model = None
         self._mid_model_checked = False
+
+    def _run_stage_with_timeout(self, label: str, fn, default, timeout: int = 90):
+        """Run an optional report stage without letting a stuck worker block cron."""
+        logger.info("[%s] start", label)
+        if not hasattr(signal, "SIGALRM"):
+            try:
+                result = fn()
+                logger.info("[%s] done", label)
+                return result
+            except Exception as exc:  # pragma: no cover - defensive around external feeds
+                logger.warning("[%s] failed: %s; using default", label, exc)
+                return default
+
+        def _timeout_handler(signum, frame):
+            raise TimeoutError(f"{label} exceeded {timeout}s")
+
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(timeout)
+        try:
+            result = fn()
+            logger.info("[%s] done", label)
+            return result
+        except TimeoutError:
+            logger.warning(
+                "[%s] exceeded %ss; using %s default and continuing",
+                label,
+                timeout,
+                type(default).__name__,
+            )
+            return default
+        except Exception as exc:  # pragma: no cover - defensive around external feeds
+            logger.warning("[%s] failed: %s; using default", label, exc)
+            return default
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
 
     def _get_crypto_collector(self):
         """Lazy accessor for the legacy CryptoCollector.
@@ -280,11 +317,11 @@ class DailyPipeline:
         if cached is not None:
             return cached
 
-        def _use_cache(reason: str, live_count: int = 0):
+        def _use_cache(reason: str, live_count: int = 0, force: bool = False):
             try:
                 from models.lgb_cache import load_prediction_cache
 
-                cache_preds, payload = load_prediction_cache()
+                cache_preds, payload = load_prediction_cache(force=force)
                 self._lgb_predictions = cache_preds
                 # 2026-06-07 cx P1 #1 fix: pre-fix this set status="ok"
                 # which made the downstream candidate builder (line
@@ -298,17 +335,26 @@ class DailyPipeline:
                     "status": "degraded",
                     "count": len(cache_preds),
                     "min_required": LGB_MIN_PREDICTIONS,
-                    "source": "cache",
+                    "source": "cache_forced" if force else "cache",
                     "latest_date": payload.get("latest_date", ""),
                     "error": "",
                     "fallback_reason": reason,
                 }
-                logger.warning(
-                    "Live LGB inference failed (%s); using cached LGB predictions: %s stocks, latest_date=%s",
-                    reason,
-                    len(cache_preds),
-                    payload.get("latest_date", ""),
-                )
+                if force:
+                    logger.warning(
+                        "[FORCE_CACHE] using stale LGB cache: %s stocks, "
+                        "latest_date=%s, reason=%s",
+                        len(cache_preds),
+                        payload.get("latest_date", ""),
+                        reason,
+                    )
+                else:
+                    logger.warning(
+                        "Live LGB inference failed (%s); using cached LGB predictions: %s stocks, latest_date=%s",
+                        reason,
+                        len(cache_preds),
+                        payload.get("latest_date", ""),
+                    )
                 return self._lgb_predictions
             except Exception as cache_exc:
                 self._lgb_predictions = {}
@@ -321,6 +367,24 @@ class DailyPipeline:
                 }
                 logger.warning("Failed to load LGB model/cache: %s", self._lgb_status["error"])
                 return self._lgb_predictions
+
+        # 2026-06-08 evening_outlook hang escape hatch: when set, skip
+        # live load_from_pickle entirely (qlib Alpha158 cold-build hangs
+        # for 30+ min on the current env — see
+        # docs/lgb_cache_force_2026-06-08.md). Crontab sets this only on
+        # the 22:00 evening_outlook line so morning/sell_check keep
+        # trying live and will auto-recover when the root cause is
+        # fixed. WARNING: the cache may be days stale; downstream sees
+        # status="degraded" source="cache_forced".
+        if os.environ.get("MITPS_LGB_FORCE_CACHE", "").strip() in ("1", "true", "TRUE"):
+            logger.warning(
+                "[FORCE_CACHE] MITPS_LGB_FORCE_CACHE=1 — skipping live "
+                "ShortTermModel.load_from_pickle, going straight to cache"
+            )
+            return _use_cache(
+                reason="MITPS_LGB_FORCE_CACHE=1 (evening hang escape hatch)",
+                force=True,
+            )
 
         # 2026-06-08 morning-hang root-cause diagnostic: when the morning
         # 09:20 cron hangs silently for 25 min before timeout-kill, the
@@ -586,13 +650,18 @@ class DailyPipeline:
             # low-coverage (model failed; using factor proxy). The
             # operator should see WHY the status is degraded so they
             # can decide whether to act on the signal at all.
-            if lgb_status.get("source") == "cache":
+            if lgb_status.get("source") in ("cache", "cache_forced"):
                 date_text = (
                     f"，数据日期{lgb_status.get('latest_date')}"
                     if lgb_status.get('latest_date') else ""
                 )
+                reason = (
+                    "强制缓存模式"
+                    if lgb_status.get("source") == "cache_forced"
+                    else "live 推理失败"
+                )
                 model_line = (
-                    f"短线模型：使用缓存信号（live 推理失败），"
+                    f"短线模型：使用缓存信号（{reason}），"
                     f"覆盖{lgb_status.get('count', 0)}只标的"
                     f"{date_text}"
                 )
@@ -2765,27 +2834,68 @@ class DailyPipeline:
                     len(recommendations),
                 )
 
-        # Fetch global market data for report. Crypto path quarantined
-        # behind LEGACY_MARKET_CONTEXT_ENABLED — when off (default), the
-        # helper returns {} and crypto sections of the report degrade
-        # gracefully.
-        crypto_data = self._fetch_crypto_market_data()
-        gold_data = self.gold_collector.fetch_realtime()
-        global_index_data, global_indices = self._fetch_global_indices()
-        morning_market_block, morning_market_records = self._build_morning_final_index_forecast(
-            geo_factors=geo,
-            lgb_preds=lgb_preds,
-            crypto_data=crypto_data,
-            gold_data=gold_data,
-            global_index_data=global_index_data,
+        model_quality = self._load_model_quality_line()
+        status_block = self._model_status_text()
+        if model_quality:
+            status_block = f"{status_block}\n{model_quality}"
+
+        if not top_recs:
+            logger.warning(
+                "No qualified morning recommendations; skipping optional "
+                "market context, index forecast and LLM report to avoid "
+                "post-empty-list cron hangs."
+            )
+            report = _sanitize_push_text(
+                f"{status_block}\n\n"
+                f"{horizon_block}\n\n"
+                "📋 今日早盘结论\n"
+                "─────────────\n"
+                "没有通过信号/阈值/风控过滤的标的，推荐列表保持为空。\n"
+                "系统不会在模型偏防守、行情数据不完整或缓存强制模式下硬凑股票。"
+            )
+            success = self.pusher.send_recommendation(report)
+            logger.info(
+                "Push %s: 0 recommendations (empty-list fast path)",
+                "success" if success else "failed",
+            )
+            return
+
+        # Fetch optional global market data for the richer report. Each
+        # external/report stage is bounded so a stale HTTP socket or heavy
+        # index forecast cannot keep the cron process alive until the outer
+        # timeout kills it.
+        crypto_data = self._run_stage_with_timeout(
+            "morning.crypto_market_data", self._fetch_crypto_market_data, {}, timeout=60,
+        )
+        gold_data = self._run_stage_with_timeout(
+            "morning.gold.fetch_realtime", self.gold_collector.fetch_realtime, {}, timeout=60,
+        )
+        global_index_data, global_indices = self._run_stage_with_timeout(
+            "morning.global_indices.fetch_all",
+            self._fetch_global_indices,
+            ({}, ""),
+            timeout=90,
+        )
+        morning_market_block, morning_market_records = self._run_stage_with_timeout(
+            "morning.build_final_index_forecast",
+            lambda: self._build_morning_final_index_forecast(
+                geo_factors=geo,
+                lgb_preds=lgb_preds,
+                crypto_data=crypto_data,
+                gold_data=gold_data,
+                global_index_data=global_index_data,
+            ),
+            ("", []),
+            timeout=120,
         )
         for prediction in morning_market_records:
             self.verifier.record_market_prediction(prediction)
 
         # Generate LLM-powered professional report (with fallback on timeout)
         logger.info("Generating LLM analyst report...")
-        try:
-            report = self.llm_analyst.generate_report(
+        report = self._run_stage_with_timeout(
+            "morning.llm_analyst.generate_report",
+            lambda: self.llm_analyst.generate_report(
                 headlines=self._headlines or [],
                 market_judgment=market_judgment,
                 recommendations=top_recs,
@@ -2794,10 +2904,10 @@ class DailyPipeline:
                 gold_data=gold_data,
                 global_indices_text=global_indices,
                 horizon_recommendations_text=horizon_block,
-            )
-        except Exception as e:
-            logger.warning(f"LLM report failed: {e}")
-            report = ""
+            ),
+            "",
+            timeout=90,
+        )
 
         # Fallback: if LLM failed, generate plain text report from candidates
         if not report or len(report.strip()) < 50:
@@ -2821,10 +2931,6 @@ class DailyPipeline:
                 except (TypeError, ValueError):
                     lines.append(f"  {i+1}. {code} {name} (score=n/a)")
             report = "\n".join(lines)
-        model_quality = self._load_model_quality_line()
-        status_block = self._model_status_text()
-        if model_quality:
-            status_block = f"{status_block}\n{model_quality}"
         report = _sanitize_push_text(
             f"{status_block}\n\n{morning_market_block}\n\n{horizon_block}\n\n{report}"
         )
@@ -2920,7 +3026,14 @@ class DailyPipeline:
             if market != MARKET_STOCK:
                 continue
             try:
-                posts = self.sentiment_collector.fetch_all(code, limit_per_source=10)
+                posts = self._run_stage_with_timeout(
+                    f"risk.sentiment.{code}",
+                    lambda c=code: self.sentiment_collector.fetch_all(
+                        c, limit_per_source=5
+                    ),
+                    [],
+                    timeout=20,
+                )
                 sentiment = self.sentiment_scorer.score_batch(posts)
                 sentiment_by_stock[code] = {
                     "name": name,
@@ -2931,7 +3044,12 @@ class DailyPipeline:
                 logger.warning(f"Sentiment fetch failed for {code}: {e}")
 
         # Run all risk checks
-        alerts = self.risk_monitor.check_all(geo, sentiment_by_stock)
+        alerts = self._run_stage_with_timeout(
+            "risk.monitor.check_all",
+            lambda: self.risk_monitor.check_all(geo, sentiment_by_stock),
+            [],
+            timeout=60,
+        )
 
         if not alerts:
             logger.info("No risk alerts")
@@ -2979,31 +3097,54 @@ class DailyPipeline:
         self._headlines = None
         geo = self._fetch_geo_factors()
         lgb_preds = self._load_lgb_predictions()
+        logger.info("[intraday.buy_candidates] start")
         buy_items = self._build_intraday_buy_candidates(lgb_preds, limit=10)
+        logger.info("[intraday.buy_candidates] done: %s", len(buy_items))
 
-        crypto_data = self._fetch_crypto_market_data()
-        gold_data = self.gold_collector.fetch_realtime()
-        global_index_data, _ = self._fetch_global_indices()
-        _, index_forecast_text = self._build_intraday_index_forecast(
-            geo_factors=geo,
-            lgb_preds=lgb_preds,
-            crypto_data=crypto_data,
-            gold_data=gold_data,
-            global_index_data=global_index_data,
+        crypto_data = self._run_stage_with_timeout(
+            "intraday.crypto_market_data", self._fetch_crypto_market_data, {}, timeout=60,
+        )
+        gold_data = self._run_stage_with_timeout(
+            "intraday.gold.fetch_realtime", self.gold_collector.fetch_realtime, {}, timeout=60,
+        )
+        global_index_data, _ = self._run_stage_with_timeout(
+            "intraday.global_indices.fetch_all",
+            self._fetch_global_indices,
+            ({}, ""),
+            timeout=90,
+        )
+        _, index_forecast_text = self._run_stage_with_timeout(
+            "intraday.build_index_forecast",
+            lambda: self._build_intraday_index_forecast(
+                geo_factors=geo,
+                lgb_preds=lgb_preds,
+                crypto_data=crypto_data,
+                gold_data=gold_data,
+                global_index_data=global_index_data,
+            ),
+            (None, "一、下一开盘日指数预测\n当前外部市场数据获取超时，本次仅推送个股买卖检查。"),
+            timeout=120,
         )
 
+        logger.info("[intraday.sell_items] start")
         recent_recs = self.verifier.get_recent_recommendations(days=20)
         sell_items = self._build_sell_items(recent_recs, lgb_preds)
+        logger.info("[intraday.sell_items] done: %s", len(sell_items))
+        logger.info("[intraday.format_report] start")
         report = self._format_intraday_decision_report(
             index_forecast_text=index_forecast_text,
             buy_items=buy_items,
             sell_items=sell_items,
         )
+        logger.info("[intraday.format_report] done")
 
         if hasattr(self.pusher, "send_intraday_decision"):
+            logger.info("[intraday.push] send_intraday_decision start")
             success = self.pusher.send_intraday_decision(report)
         else:
+            logger.info("[intraday.push] send_sell_check start")
             success = self.pusher.send_sell_check(report)
+        logger.info("[intraday.push] done")
         logger.info(
             "Intraday decision push %s: %s buy candidates, %s mandatory sells",
             "success" if success else "failed",

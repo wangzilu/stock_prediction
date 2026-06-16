@@ -72,6 +72,7 @@ def run_smoke(
     min_predictions: int,
     qlib_dir: Path | None = None,
     output: Path | None = LGB_PREDICTION_CACHE_PATH,
+    inference_end_date: str | None = None,
 ) -> dict:
     _override_qlib_provider(qlib_dir)
 
@@ -90,7 +91,9 @@ def run_smoke(
                 "error": f"model file not found: {model_path}",
                 "model_path": str(model_path),
             }
-        model = ShortTermModel.load_from_pickle(str(model_path))
+        model = ShortTermModel.load_from_pickle(
+            str(model_path), inference_end_date=inference_end_date
+        )
     else:
         # Resolve effective path for logging/cache metadata; mirror the
         # active-profile resolution that load_from_pickle(None) performs.
@@ -98,7 +101,9 @@ def run_smoke(
         from config.settings import DATA_DIR as _DATA_DIR
         preferred = Path(_DATA_DIR) / production_model_filename()
         effective_path = preferred if preferred.exists() else Path(_DATA_DIR) / "lgb_model.pkl"
-        model = ShortTermModel.load_from_pickle(None)
+        model = ShortTermModel.load_from_pickle(
+            None, inference_end_date=inference_end_date
+        )
         model_path = effective_path
     preds = model.predict_batch()
     finite_items = {
@@ -156,6 +161,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-predictions", type=int, default=LGB_MIN_PREDICTIONS)
     parser.add_argument("--qlib-dir", type=Path, default=None)
     parser.add_argument(
+        "--date",
+        default=None,
+        help=(
+            "Business date for upstream freshness checks and health output "
+            "(YYYY-MM-DD). Defaults to today."
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=LGB_PREDICTION_CACHE_PATH,
@@ -163,6 +176,19 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--no-cache", action="store_true", help="Do not write prediction cache")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--skip-gate", action="store_true",
+        help=(
+            "Bypass the upstream-source freshness gate. ONLY for manual "
+            "rescue when the cron chain has been stuck and you accept "
+            "that the resulting prediction cache is based on stale "
+            "upstream signals. The output will still record the actual "
+            "latest_date from the feature cache so consumers know how "
+            "fresh the prediction window is. Use case: 2026-06-14 cron "
+            "chain blocked 5 trading days, manually run smoke on the "
+            "06-09 feature cache so users stop getting the same picks."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -172,20 +198,31 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
 
     # --- Freshness gate: check upstream data before predicting ---
-    gate_result = check_training_gate()
+    gate_result = check_training_gate(args.date)
     gate = gate_result["gate"]
 
     if gate == "fail":
-        logger.error(
-            "Training gate FAILED — skipping prediction. Reason: %s",
-            gate_result.get("reason", "unknown"),
-        )
-        write_health("lgb_after_close_smoke", HealthStatus(
-            success=False,
-            error_type="GateFail",
-            error_message=gate_result.get("reason", "upstream data stale")[:200],
-        ))
-        return 1
+        if args.skip_gate:
+            logger.warning(
+                "Training gate FAIL but --skip-gate set: proceeding with "
+                "stale upstream signals. Reason: %s",
+                gate_result.get("reason", "unknown"),
+            )
+        else:
+            logger.error(
+                "Training gate FAILED — skipping prediction. Reason: %s",
+                gate_result.get("reason", "unknown"),
+            )
+            write_health(
+                "lgb_after_close_smoke",
+                HealthStatus(
+                    success=False,
+                    error_type="GateFail",
+                    error_message=gate_result.get("reason", "upstream data stale")[:200],
+                ),
+                date=args.date,
+            )
+            return 1
 
     if gate == "degrade":
         logger.warning(
@@ -195,7 +232,13 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     try:
         output = None if args.no_cache else args.output
-        result = run_smoke(args.model_path, args.min_predictions, args.qlib_dir, output)
+        result = run_smoke(
+            args.model_path,
+            args.min_predictions,
+            args.qlib_dir,
+            output,
+            inference_end_date=args.date,
+        )
     except Exception as exc:
         result = {
             "ok": False,
@@ -220,18 +263,26 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     # Write health status
     if result["ok"]:
-        write_health("lgb_after_close_smoke", HealthStatus(
-            success=True,
-            n_items=result.get("finite_prediction_count", 0),
-            latest_date=result.get("cache_latest_date", ""),
-            network_profile="domestic",
-        ))
+        write_health(
+            "lgb_after_close_smoke",
+            HealthStatus(
+                success=True,
+                n_items=result.get("finite_prediction_count", 0),
+                latest_date=result.get("cache_latest_date", ""),
+                network_profile="domestic",
+            ),
+            date=args.date,
+        )
     else:
-        write_health("lgb_after_close_smoke", HealthStatus(
-            success=False,
-            error_type="PredictionFailure",
-            error_message=str(result.get("error", ""))[:200],
-        ))
+        write_health(
+            "lgb_after_close_smoke",
+            HealthStatus(
+                success=False,
+                error_type="PredictionFailure",
+                error_message=str(result.get("error", ""))[:200],
+            ),
+            date=args.date,
+        )
 
     return 0 if result["ok"] else 1
 

@@ -301,6 +301,14 @@ class MarketCollector:
             return
 
         # Try AKShare (eastmoney) with retries
+        # 2026-06-16: spot order stays AKShare → ST_CLIENT → Tencent.
+        # ST_CLIENT realtime_list IS available on the API but requires
+        # the "龙虾套餐" subscription tier — current token returns
+        # {code: 1, msg: "该接口为龙虾套餐专属"}. Until the subscription
+        # is upgraded, ST primary would waste one round-trip per call
+        # only to fail with auth error, and AKShare is the only viable
+        # full-market spot source. ST stays as layer 2 in case the
+        # subscription gets upgraded or AKShare goes down entirely.
         for attempt in range(MAX_RETRIES):
             try:
                 logger.info(f"Loading A-share spot data via AKShare (attempt {attempt+1})...")
@@ -316,10 +324,6 @@ class MarketCollector:
                     time.sleep(RETRY_DELAY)
 
         # Fallback Layer 2: ST_CLIENT / TuShare realtime_list (FULL MARKET).
-        # cx code review 2026-06-04 P0: AKShare→Tencent skipped the
-        # available ST_CLIENT realtime path, causing the 2026-06-03 22:00
-        # incident where universe silently shrank to 300 stocks (Tencent
-        # watchlist). ST_CLIENT returns the full 5000+ universe.
         logger.warning(
             "AKShare spot failed after %d retries — trying ST_CLIENT realtime_list fallback...",
             MAX_RETRIES,
@@ -391,7 +395,11 @@ class MarketCollector:
             try:
                 from ST_CLIENT import StockToday
             except ImportError as e:
-                logger.warning("ST_CLIENT not importable for spot fallback: %s", e)
+                logger.error(
+                    "[ST_SPOT] ImportError: ST_CLIENT package not installed (%s) — "
+                    "spot collector will fall through to AKShare/Tencent. "
+                    "Fix: pip install ST_CLIENT.", e,
+                )
                 return None
 
             token = None
@@ -405,14 +413,48 @@ class MarketCollector:
                 if token_file.exists():
                     token = token_file.read_text().strip()
             if not token:
-                logger.warning("ST_CLIENT token unavailable; skipping realtime spot fallback")
+                logger.error(
+                    "[ST_SPOT] Token unavailable: neither config.settings.ST_TOKEN "
+                    "nor .st_token file resolved a token — spot collector will "
+                    "fall through to AKShare/Tencent. Fix: set ST_TOKEN env or "
+                    "write .st_token in project root."
+                )
                 return None
 
             st = StockToday(token=token)
             try:
                 raw = st.realtime_list()
             except Exception as e:  # noqa: BLE001
-                logger.warning("ST_CLIENT realtime_list failed: %s", e)
+                logger.error(
+                    "[ST_SPOT] realtime_list() raised %s: %s — spot collector "
+                    "will fall through to AKShare/Tencent.",
+                    type(e).__name__, e,
+                )
+                return None
+
+            # Detect ST_CLIENT API envelope with auth/subscription error
+            # before normalizing to rows. ST returns
+            # ``{"code": 1, "data": None, "msg": "...套餐..."}`` for endpoints
+            # the current subscription tier can't access — that's a stable
+            # state (not a transient failure), so we log it once at INFO
+            # to avoid flooding the log every cron run.
+            if isinstance(raw, dict) and raw.get("code") not in (0, None) and raw.get("data") is None:
+                msg = str(raw.get("msg", "")).strip()
+                if "套餐" in msg or "subscription" in msg.lower() or "权限" in msg:
+                    logger.info(
+                        "[ST_SPOT] realtime_list not available on current "
+                        "subscription tier (code=%s msg=%s) — falling through "
+                        "to AKShare. Upgrade the ST_CLIENT subscription if you "
+                        "want ST realtime as primary.",
+                        raw.get("code"), msg[:100],
+                    )
+                    return None
+                # Other non-OK code: treat as real error
+                logger.error(
+                    "[ST_SPOT] realtime_list API error code=%s msg=%s — "
+                    "falling through to AKShare/Tencent.",
+                    raw.get("code"), msg[:200],
+                )
                 return None
 
             # Normalize shape — server may return list of dicts OR
@@ -421,9 +463,22 @@ class MarketCollector:
             if isinstance(raw, dict):
                 rows = raw.get("data") or raw.get("items") or []
             if not rows:
+                logger.error(
+                    "[ST_SPOT] realtime_list returned empty payload (raw type=%s, "
+                    "len=%s) — spot collector will fall through to AKShare/Tencent. "
+                    "This is usually upstream-side: market closed early, ST mirror "
+                    "rate-limited, or transient backend failure.",
+                    type(raw).__name__,
+                    len(raw) if hasattr(raw, "__len__") else "?",
+                )
                 return None
             df = pd.DataFrame(rows)
             if df.empty:
+                logger.error(
+                    "[ST_SPOT] realtime_list returned %d rows but DataFrame "
+                    "construction yielded empty — spot collector will fall "
+                    "through to AKShare/Tencent.", len(rows),
+                )
                 return None
 
             # Normalize column names to MarketCollector's expected
@@ -453,9 +508,11 @@ class MarketCollector:
             required = ["代码", "名称", "最新价", "涨跌幅", "成交量"]
             missing = [c for c in required if c not in df.columns]
             if missing:
-                logger.warning(
-                    "ST_CLIENT spot fallback missing columns %s — refusing "
-                    "to return a partial frame", missing,
+                logger.error(
+                    "[ST_SPOT] schema drift: missing columns %s (have %s) — "
+                    "refusing partial frame. ST_CLIENT realtime_list response "
+                    "format may have changed; spot collector will fall through "
+                    "to AKShare/Tencent.", missing, list(df.columns)[:20],
                 )
                 return None
             # Non-empty fraction on the must-have identifying cols
@@ -472,17 +529,21 @@ class MarketCollector:
             chg_numeric = pd.to_numeric(df["涨跌幅"], errors="coerce").notna().mean()
             vol_numeric = pd.to_numeric(df["成交量"], errors="coerce").notna().mean()
             if id_nonempty < 0.98 or name_nonempty < 0.98:
-                logger.warning(
-                    "ST_CLIENT spot fallback identifying-col non-empty "
-                    "rate too low (code=%.2f%%, name=%.2f%%) — refusing.",
-                    id_nonempty * 100, name_nonempty * 100,
+                logger.error(
+                    "[ST_SPOT] identifying cols mostly empty (code=%.2f%%, "
+                    "name=%.2f%%, n=%d) — refusing. ST mirror likely returned "
+                    "structurally-correct but content-empty rows; falling "
+                    "through to AKShare/Tencent.",
+                    id_nonempty * 100, name_nonempty * 100, len(df),
                 )
                 return None
             if price_numeric < 0.95 or chg_numeric < 0.95 or vol_numeric < 0.90:
-                logger.warning(
-                    "ST_CLIENT spot fallback numeric-col parseable rate "
-                    "too low (price=%.2f%%, chg=%.2f%%, vol=%.2f%%) — refusing.",
-                    price_numeric * 100, chg_numeric * 100, vol_numeric * 100,
+                logger.error(
+                    "[ST_SPOT] numeric cols unparseable (price=%.2f%%, "
+                    "chg=%.2f%%, vol=%.2f%%, n=%d) — refusing. Likely "
+                    "upstream serialization format drift; falling through to "
+                    "AKShare/Tencent.",
+                    price_numeric * 100, chg_numeric * 100, vol_numeric * 100, len(df),
                 )
                 return None
 
@@ -493,7 +554,11 @@ class MarketCollector:
             )
             return df
         except Exception as e:  # noqa: BLE001
-            logger.warning("ST_CLIENT spot fallback raised: %s", e)
+            logger.error(
+                "[ST_SPOT] outer exception: %s: %s — spot collector will "
+                "fall through to AKShare/Tencent.",
+                type(e).__name__, e, exc_info=True,
+            )
             return None
 
     def _load_spot_tencent(self) -> pd.DataFrame:

@@ -271,7 +271,7 @@ class ShortTermModel:
         return df.head(TOP_K_STOCKS)
 
     @classmethod
-    def load_from_pickle(cls, model_path: str = None):
+    def load_from_pickle(cls, model_path: str = None, inference_end_date: str = None):
         """Load pre-trained model and rebuild dataset for inference.
 
         2026-06-04 cx round 8 P2-5: removed the ``dataset_path``
@@ -312,8 +312,12 @@ class ShortTermModel:
         with open(model_path, "rb") as f:
             instance._model = pickle.load(f)
 
-        # Rebuild dataset fresh — avoids Alpha158 pickle issues
-        today = datetime.now()
+        # Rebuild dataset fresh — avoids Alpha158 pickle issues.  For
+        # manual cross-day recovery, let callers pin the inference window
+        # to the business date being repaired; otherwise a 06-16 rescue
+        # run for 06-15 would gate/write health as 06-15 but build the
+        # feature window through the system date.
+        today = pd.Timestamp(inference_end_date).to_pydatetime() if inference_end_date else datetime.now()
         test_start = (today - timedelta(days=29)).strftime("%Y-%m-%d")
         test_end = today.strftime("%Y-%m-%d")
 

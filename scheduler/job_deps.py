@@ -78,7 +78,9 @@ JOB_DEPS: dict[str, list[str]] = {
     "shareholder_update": ["qlib_data_update"],
     "regime_daily_update": ["qlib_data_update"],
     "global_chain_extract": ["global_industry_news"],
+    "global_chain_llm_extract": ["global_chain_extract"],
     "global_chain_factors": ["global_chain_extract"],
+    "global_chain_factors_llm": ["global_chain_llm_extract"],
     # Feature cache rebuild reads qlib + holder + flow + valuation +
     # regime into a single parquet.
     # 2026-06-04 cx round 6 P1-7: added valuation_update,
@@ -112,12 +114,9 @@ JOB_DEPS: dict[str, list[str]] = {
     # add the LLM pipeline.
     "champion_cache_rebuild": [
         "qlib_data_update",
-        "fund_flow_update",
         "st_daily_factors_update",
-        "valuation_update",
-        "shareholder_update",
-        "regime_daily_update",
         "llm_event_pipeline",
+        "global_chain_factors_llm",
     ],
     # ---- Training and inference depend on fresh cache --------------------
     # 2026-06-07 cx batch D P1 #4: lgb_after_close_smoke moved off
@@ -136,7 +135,18 @@ JOB_DEPS: dict[str, list[str]] = {
     # cx batch D P1 #4 (commit 24a0122): smoke now gates on
     # champion_cache_rebuild — the 209-family caches that smoke + paper
     # actually consume. Legacy feature_cache_rebuild is research-only.
-    "lgb_after_close_smoke": ["champion_cache_rebuild"],
+    #
+    # 2026-06-16: also depend on valuation_update. Pre-fix the smoke
+    # cron at 18:35 raced valuation_update (18:00 start, 2h budget):
+    # smoke would pass the enforce-deps wait once champion_cache_rebuild
+    # completed, then fail the internal check_training_gate because
+    # valuation_update health for today wasn't yet written. The 2026-06-16
+    # incident dropped today's lgb_latest_predictions.json cache; morning
+    # the next day fell back on stale FORCE_CACHE picks.
+    "lgb_after_close_smoke": [
+        "champion_cache_rebuild",
+        "valuation_update",
+    ],
     # cx batch G P1 #3: weekly_full_retrain runs Sat 04:00 against
     # Friday's 18:25 cache — the gate lives in JOB_DEPS_PREV_BDAY so
     # check_upstream_full walks the previous business day's status
@@ -229,6 +239,16 @@ JOB_DEPS_PREV_BDAY: dict[str, list[str]] = {
         "champion_cache_rebuild",
     ],
     "shadow_paper_trade_backfill": ["lgb_after_close_smoke"],
+}
+
+# Jobs whose cross-day dependency may be satisfied by a same-day
+# after-close run when it already completed. Example: Sunday evening
+# outlook must use Friday's qlib_data_update because no Sunday qlib
+# cron exists; Monday-Thursday evening outlook should use the same-day
+# post-close qlib update if it is green, rather than being blocked by
+# a failed previous trading day that has already been superseded.
+JOB_DEPS_PREV_BDAY_SAME_DAY_OVERRIDE: dict[str, list[str]] = {
+    "evening_outlook": ["qlib_data_update"],
 }
 
 
@@ -417,7 +437,19 @@ def check_upstream_full(
     prev_bday = _prev_business_day(date) if prev_deps else date
     prev_completed: list[str] = []
     prev_missing: list[str] = []
+    same_day_overrides = set(JOB_DEPS_PREV_BDAY_SAME_DAY_OVERRIDE.get(job_name, []))
     for dep in prev_deps:
+        if dep in same_day_overrides:
+            same_status = _read_status(dep, date)
+            if same_status is not None and same_status.get("success"):
+                fresh, reason = _is_status_fresh(same_status, run_started_at=run_started_at)
+                if fresh:
+                    prev_completed.append(dep)
+                    continue
+                logger.warning(
+                    "Same-day override upstream %s (date=%s) demoted to missing: %s",
+                    dep, date, reason,
+                )
         status = _read_status(dep, prev_bday)
         if status is None or not status.get("success"):
             prev_missing.append(dep)

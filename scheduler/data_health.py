@@ -555,10 +555,6 @@ def daily_summary(date: str = None) -> dict:
 # degrade live prediction, not to print a warning.
 CRITICAL_SOURCES = [
     "qlib_data_update",
-    # cx round 9 P1-4: production supplementary data sources
-    "fund_flow_update",
-    "valuation_update",
-    "regime_daily_update",
 ]
 
 
@@ -685,24 +681,24 @@ def check_training_gate(date: str = None) -> dict:
     CRITICAL_SOURCES floor. See ``_resolve_profile_critical_sources``.
     """
     critical_sources = _resolve_profile_critical_sources()
-    result = check_freshness(critical_sources, date, require_latest_date=True)
+    result = sla_verdict(critical_sources, date)
     if not result["all_fresh"]:
         return {
             "gate": "fail",
             "reason": (
                 f"Critical sources stale/missing: "
-                f"{result['stale'] + result['missing']} "
-                f"(expected latest_date >= {result.get('expected_latest_date')})"
+                f"{result['stale']} "
+                f"(SLA budgets exceeded or health failed)"
             ),
             "details": result,
         }
 
-    overlay_result = check_freshness(OVERLAY_SOURCES, date, require_latest_date=True)
+    overlay_result = sla_verdict(OVERLAY_SOURCES, date)
     if not overlay_result["all_fresh"]:
         return {
             "gate": "degrade",
-            "reason": f"Overlay sources stale: {overlay_result['stale'] + overlay_result['missing']}",
-            "degraded_overlays": overlay_result["stale"] + overlay_result["missing"],
+            "reason": f"Overlay sources stale: {overlay_result['stale']}",
+            "degraded_overlays": overlay_result["stale"],
             "details": {**result, "overlay": overlay_result},
         }
 

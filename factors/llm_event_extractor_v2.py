@@ -116,13 +116,23 @@ class LLMEventExtractorV2:
     def __init__(self,
                  api_key: str = None,
                  model: str = "MiniMax-Text-01",
-                 max_calls_per_minute: int = 60):
+                 max_calls_per_minute: int | None = None):
         self.api_key = api_key or MINIMAX_API_KEY
         if not self.api_key:
             raise ValueError("MINIMAX_API_KEY required")
         self.model = model
         self.api_url = "https://api.minimax.io/v1/chat/completions"
-        self.max_calls_per_minute = max_calls_per_minute
+        self.max_calls_per_minute = int(
+            max_calls_per_minute
+            or os.environ.get("LLM_EVENT_MAX_CALLS_PER_MINUTE", "20")
+        )
+        self.max_workers = max(
+            1,
+            int(os.environ.get(
+                "LLM_EVENT_MAX_WORKERS",
+                str(min(2, self.max_calls_per_minute)),
+            )),
+        )
         self._call_timestamps = []
         self._rate_lock = threading.Lock()
         # Accounting (thread-safe via _stats_lock)
@@ -175,12 +185,12 @@ class LLMEventExtractorV2:
         """
         import random
         sys_prompt = system_prompt if system_prompt is not None else SYSTEM_PROMPT_V2
-        self._rate_limit()
         last_err = None
         last_was_429 = False
         backoffs_429 = [5.0, 15.0, 45.0]
         for attempt in range(4):
             try:
+                self._rate_limit()
                 resp = requests.post(
                     self.api_url,
                     headers={"Authorization": f"Bearer {self.api_key}",
@@ -449,7 +459,7 @@ class LLMEventExtractorV2:
             return ("fail", None)
 
         with open(output_path, "w", encoding="utf-8") as f:
-            with ThreadPoolExecutor(max_workers=16) as executor:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 futures = {executor.submit(_process, t): i for i, t in enumerate(tasks)}
                 done = 0
                 for future in as_completed(futures):

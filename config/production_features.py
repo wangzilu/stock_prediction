@@ -59,7 +59,7 @@ import os
 # task #112 (retrain 174 + 24-split + cost-adjusted backtest →
 # challenge gate → maybe flip default).
 PRODUCTION_MODEL_PROFILE: str = os.environ.get(
-    "PRODUCTION_MODEL_PROFILE", "xgb_209",
+    "PRODUCTION_MODEL_PROFILE", "xgb_209_chain_llm",
 ).strip().lower()
 # 2026-06-06: default flipped xgb_242 → xgb_209 after Phase B.4
 # 24-split verdict (docs/phase_b4_verdict_20260606.md) showed
@@ -120,21 +120,17 @@ SUPPLEMENTARY_GROUPS_BY_PROFILE: dict[str, tuple[str, ...]] = {
         "st_holder_number",
         "global_chain",
     ),
-    # xgb_209_chain_llm — SHADOW (B.9 cleared Sp20-aware secondary
-    # gate; NOT production-default until paper-trade canary AND
-    # retrain artifact both exist). xgb_209 + global supply chain
-    # LLM-extracted factors (4 cols: global_chain_alpha + event_count
-    # + pos_score + neg_score). Built from extract_global_chain_llm.py.
-    # B.9 24-split LOO (end=2026-05-19): ΔRankIC +0.0041 (BELOW primary
-    # +0.005 RankIC branch — does NOT clear champion-swap hurdle per
-    # Harvey-Liu-Zhu multiple-testing argument) BUT clears Sp20-aware
-    # secondary branch for sparse top-tail signals: ΔSp20 +9.92 bps,
-    # ΔICIR +0.031, ΔPosRatio +3.36 pp. 0.46% non-zero signal lifts
-    # high-conviction picks where Paper OMS realizes return.
-    # Champion swap pre-requisites:
-    #   1. Paper-trade canary 5-10 trading days, realized ΔSp20 ≥ +5 bps
-    #   2. weekly_full_retrain emits xgb_209_chain_llm artifact + contract
-    #   3. lgb_after_close_smoke green on the new artifact
+    # xgb_209_chain_llm — PROMOTE via Phase B.9 Sp20-aware branch.
+    # xgb_209 + global supply chain LLM-extracted factors (6 cols:
+    # global_chain_alpha + event_count + pos_score + neg_score +
+    # company_level_alpha + industry_level_alpha). Built from
+    # extract_global_chain_llm.py output. B.9 24-split LOO
+    # (end=2026-06-05): ΔRankIC +0.0041 (below the primary +0.005
+    # RankIC branch) BUT clears the Sp20-aware promotion branch:
+    # ΔSp20 +9.92 bps, ΔICIR +0.031, ΔPosRatio +3.36 pp. This sparse
+    # top-tail signal (0.46% non-zero) lifts high-conviction picks where
+    # Paper OMS realizes return. Operational flip still requires the
+    # profile-specific model artifact + contract and green smoke.
     # See docs/phase_b9_verdict_20260609.md.
     "xgb_209_chain_llm": (
         "fundamental",
@@ -414,7 +410,7 @@ PROFILE_EXPECTED_COUNTS: dict[str, dict[str, int]] = {
         "qlib_custom": 0,
         "total": 212,
     },
-    # xgb_209_chain / xgb_209_chain_llm — 6 supply-chain alpha cols
+    # xgb_209_chain — 6 rule-based supply-chain alpha cols
     # (global_chain_alpha + event_count + pos_score + neg_score +
     # company_level_alpha + industry_level_alpha; "level" is text and
     # excluded by the loader).
@@ -424,9 +420,10 @@ PROFILE_EXPECTED_COUNTS: dict[str, dict[str, int]] = {
         "qlib_custom": 0,
         "total": 215,
     },
+    # xgb_209_chain_llm — B.9 promoted 6-col LLM supply-chain signal.
     "xgb_209_chain_llm": {
         "alpha158": 158,
-        "supplementary": 57,    # same shape as chain rule-based
+        "supplementary": 57,    # 51 base + 6 chain_llm
         "qlib_custom": 0,
         "total": 215,
     },

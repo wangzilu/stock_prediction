@@ -83,7 +83,7 @@ def main():
             "update_qlib_data.py",
             "--provider", os.environ.get("QLIB_DATA_PROVIDER", "auto"),
             "--universe", os.environ.get("LGB_INFERENCE_UNIVERSE", "all"),
-            "--universe-source", os.environ.get("QLIB_UNIVERSE_SOURCE", "baostock"),
+            "--universe-source", os.environ.get("QLIB_UNIVERSE_SOURCE", "auto"),
             "--refresh-universe",
             "--min-health-instruments", os.environ.get("LGB_MIN_DATA_INSTRUMENTS", "4500"),
             "--min-lgb-data-instruments", os.environ.get("LGB_MIN_DATA_INSTRUMENTS", "4500"),

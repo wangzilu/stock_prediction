@@ -20,7 +20,7 @@ SPOT_CACHE_TTL_SECONDS = int(os.environ.get("SPOT_CACHE_TTL_SECONDS", "300"))
 
 QLIB_PROVIDER_URI = os.environ.get("QLIB_PROVIDER_URI", str(QLIB_DATA_DIR / "cn_data"))
 QLIB_DATA_PROVIDER = os.environ.get("QLIB_DATA_PROVIDER", "auto")
-QLIB_UNIVERSE_SOURCE = os.environ.get("QLIB_UNIVERSE_SOURCE", "baostock")
+QLIB_UNIVERSE_SOURCE = os.environ.get("QLIB_UNIVERSE_SOURCE", "auto")
 
 HIGH_THRESHOLD = 0.7
 MID_THRESHOLD = 0.3

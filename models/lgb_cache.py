@@ -109,6 +109,7 @@ def load_prediction_cache(
     min_predictions: int = LGB_MIN_PREDICTIONS,
     max_age_days: int = LGB_CACHE_MAX_AGE_DAYS,
     allow_red: bool = False,
+    force: bool = False,
 ) -> tuple[dict[str, float], dict]:
     """Load and validate a cached LGB prediction map.
 
@@ -123,6 +124,14 @@ def load_prediction_cache(
         allow_red: tests / debug only. When True the caller is
             explicitly opting in to consume a RED cache (you will
             usually NOT want this for live trading paths).
+        force: 2026-06-08 evening_outlook hang escape hatch. When True,
+            bypass the calendar-age and CN trading-day freshness gates
+            (still enforces min_predictions and distribution health).
+            Used by evening_outlook when live ShortTermModel.load_from_pickle
+            hangs in qlib's Alpha158 setup — better to emit a forecast
+            on stale predictions than to silently zero-fill every signal
+            because the wrapper killed the process at the cron timeout.
+            Caller MUST log loudly that stale cache was used.
     """
     from models.prediction_health import (
         classify_status,
@@ -155,7 +164,7 @@ def load_prediction_cache(
             f"LGB prediction cache latest_date={latest_date!r} unparseable — "
             f"refusing to use a prediction file with no provenance date"
         )
-    if age_days > max_age_days:
+    if age_days > max_age_days and not force:
         raise RuntimeError(
             f"LGB prediction cache latest_date={latest_date} is {age_days} days old "
             f"(max={max_age_days})"
@@ -167,20 +176,21 @@ def load_prediction_cache(
     # A-share recommendations — it effectively let last week's
     # predictions feed today's signal. Trading-date check refuses
     # any cache that pre-dates the last trading session.
-    try:
-        from scheduler.data_health import _expected_latest_trading_date
-        expected = _expected_latest_trading_date()
-        if latest_date < expected:
-            raise RuntimeError(
-                f"LGB prediction cache latest_date={latest_date} is older "
-                f"than last trading date {expected} (CN trading-day gate)"
-            )
-    except RuntimeError:
-        raise
-    except Exception:
-        # Fallback to calendar-day check (still applied above) if the
-        # trading-day helper isn't available for any reason.
-        pass
+    if not force:
+        try:
+            from scheduler.data_health import _expected_latest_trading_date
+            expected = _expected_latest_trading_date()
+            if latest_date < expected:
+                raise RuntimeError(
+                    f"LGB prediction cache latest_date={latest_date} is older "
+                    f"than last trading date {expected} (CN trading-day gate)"
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            # Fallback to calendar-day check (still applied above) if the
+            # trading-day helper isn't available for any reason.
+            pass
 
     # Distribution health gate. Prefer the writer-recorded status
     # (faster, no recomputation), fall back to classifying live for

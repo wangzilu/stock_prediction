@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import traceback
 from datetime import datetime, timedelta
@@ -40,9 +41,11 @@ class JobStatusStore:
 
     def save(self, payload: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_suffix(f"{self.path.suffix}.tmp")
+        tmp_path = self.path.with_name(
+            f"{self.path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
         tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-        tmp_path.replace(self.path)
+        os.replace(tmp_path, self.path)
 
     def update_job(self, job_id: str, **fields: Any) -> None:
         payload = self.load()

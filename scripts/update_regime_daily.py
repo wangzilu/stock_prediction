@@ -81,37 +81,59 @@ def get_st_client():
     return StockToday(token=token)
 
 
+def _extract_items(result) -> list | None:
+    """Extract row list from ST_CLIENT TuShare-compatible envelope.
+
+    Real shape is ``{"code": 0, "data": {"fields": [...], "items": [...]}}``.
+    The previous version checked ``isinstance(data, list)`` against the wrapper
+    dict, which is always False, so every call silently returned
+    "no data" and the parquet stopped updating at 2026-05-12. Fixed
+    2026-06-16 — see `docs/regime_t_plus_1_silent_fail_20260616.md`.
+    """
+    if not isinstance(result, dict):
+        return None
+    inner = result.get("data")
+    # Direct list form (older API or already-unwrapped)
+    if isinstance(inner, list):
+        return inner
+    # Envelope form {fields, items}
+    if isinstance(inner, dict):
+        items = inner.get("items")
+        if isinstance(items, list):
+            return items
+    return None
+
+
 def update_margin(st, date: str) -> SubResult:
     """Append today's margin data to existing parquet, return per-source health."""
     logger.info("  Updating margin_detail...")
     res = SubResult(source="margin_detail")
     try:
         result = st.margin_detail(trade_date=date.replace("-", ""))
-        if isinstance(result, dict):
-            data = result.get("data")
-            if data and isinstance(data, list):
-                new_df = pd.DataFrame(data)
-                for col in new_df.columns:
-                    if new_df[col].dtype == object:
-                        new_df[col] = new_df[col].astype(str)
+        items = _extract_items(result)
+        if items:
+            new_df = pd.DataFrame(items)
+            for col in new_df.columns:
+                if new_df[col].dtype == object:
+                    new_df[col] = new_df[col].astype(str)
 
-                path = DATA_DIR / "st_margin_detail.parquet"
-                if path.exists():
-                    old_df = pd.read_parquet(path)
-                    combined = pd.concat([old_df, new_df], ignore_index=True)
-                    if "trade_date" in combined.columns and "ts_code" in combined.columns:
-                        combined = combined.drop_duplicates(
-                            subset=["trade_date", "ts_code"], keep="last"
-                        )
-                    combined.to_parquet(str(path), index=False)
-                else:
-                    new_df.to_parquet(str(path), index=False)
+            path = DATA_DIR / "st_margin_detail.parquet"
+            if path.exists():
+                old_df = pd.read_parquet(path)
+                combined = pd.concat([old_df, new_df], ignore_index=True)
+                if "trade_date" in combined.columns and "ts_code" in combined.columns:
+                    combined = combined.drop_duplicates(
+                        subset=["trade_date", "ts_code"], keep="last"
+                    )
+                combined.to_parquet(str(path), index=False)
+            else:
+                new_df.to_parquet(str(path), index=False)
 
-                logger.info(f"    ✅ margin: +{len(new_df)} records for {date}")
-                res.ok = True
-                res.n_rows = len(new_df)
-                res.latest_date = date
-                return res
+            logger.info(f"    ✅ margin: +{len(new_df)} records for {date}")
+            res.ok = True
+            res.n_rows = len(new_df)
+            res.latest_date = date
+            return res
         logger.info(f"    margin: no data for {date}")
         res.error = f"no data for {date}"
     except Exception as e:
@@ -126,31 +148,30 @@ def update_limit_list(st, date: str) -> SubResult:
     res = SubResult(source="limit_list_d")
     try:
         result = st.limit_list_d(trade_date=date.replace("-", ""))
-        if isinstance(result, dict):
-            data = result.get("data")
-            if data and isinstance(data, list):
-                new_df = pd.DataFrame(data)
-                for col in new_df.columns:
-                    if new_df[col].dtype == object:
-                        new_df[col] = new_df[col].astype(str)
+        items = _extract_items(result)
+        if items:
+            new_df = pd.DataFrame(items)
+            for col in new_df.columns:
+                if new_df[col].dtype == object:
+                    new_df[col] = new_df[col].astype(str)
 
-                path = DATA_DIR / "st_limit_list_d.parquet"
-                if path.exists():
-                    old_df = pd.read_parquet(path)
-                    combined = pd.concat([old_df, new_df], ignore_index=True)
-                    if "trade_date" in combined.columns and "ts_code" in combined.columns:
-                        combined = combined.drop_duplicates(
-                            subset=["trade_date", "ts_code"], keep="last"
-                        )
-                    combined.to_parquet(str(path), index=False)
-                else:
-                    new_df.to_parquet(str(path), index=False)
+            path = DATA_DIR / "st_limit_list_d.parquet"
+            if path.exists():
+                old_df = pd.read_parquet(path)
+                combined = pd.concat([old_df, new_df], ignore_index=True)
+                if "trade_date" in combined.columns and "ts_code" in combined.columns:
+                    combined = combined.drop_duplicates(
+                        subset=["trade_date", "ts_code"], keep="last"
+                    )
+                combined.to_parquet(str(path), index=False)
+            else:
+                new_df.to_parquet(str(path), index=False)
 
-                logger.info(f"    ✅ limit_list: +{len(new_df)} records for {date}")
-                res.ok = True
-                res.n_rows = len(new_df)
-                res.latest_date = date
-                return res
+            logger.info(f"    ✅ limit_list: +{len(new_df)} records for {date}")
+            res.ok = True
+            res.n_rows = len(new_df)
+            res.latest_date = date
+            return res
         logger.info(f"    limit_list: no data for {date}")
         res.error = f"no data for {date}"
     except Exception as e:
@@ -165,31 +186,30 @@ def update_hsgt(st, date: str) -> SubResult:
     res = SubResult(source="moneyflow_hsgt")
     try:
         result = st.moneyflow_hsgt(trade_date=date.replace("-", ""))
-        if isinstance(result, dict):
-            data = result.get("data")
-            if data and isinstance(data, list):
-                new_df = pd.DataFrame(data)
-                for col in new_df.columns:
-                    if new_df[col].dtype == object:
-                        new_df[col] = new_df[col].astype(str)
+        items = _extract_items(result)
+        if items:
+            new_df = pd.DataFrame(items)
+            for col in new_df.columns:
+                if new_df[col].dtype == object:
+                    new_df[col] = new_df[col].astype(str)
 
-                path = DATA_DIR / "st_moneyflow_hsgt.parquet"
-                if path.exists():
-                    old_df = pd.read_parquet(path)
-                    combined = pd.concat([old_df, new_df], ignore_index=True)
-                    if "trade_date" in combined.columns:
-                        combined = combined.drop_duplicates(
-                            subset=["trade_date"], keep="last"
-                        )
-                    combined.to_parquet(str(path), index=False)
-                else:
-                    new_df.to_parquet(str(path), index=False)
+            path = DATA_DIR / "st_moneyflow_hsgt.parquet"
+            if path.exists():
+                old_df = pd.read_parquet(path)
+                combined = pd.concat([old_df, new_df], ignore_index=True)
+                if "trade_date" in combined.columns:
+                    combined = combined.drop_duplicates(
+                        subset=["trade_date"], keep="last"
+                    )
+                combined.to_parquet(str(path), index=False)
+            else:
+                new_df.to_parquet(str(path), index=False)
 
-                logger.info(f"    ✅ hsgt: +{len(new_df)} records for {date}")
-                res.ok = True
-                res.n_rows = len(new_df)
-                res.latest_date = date
-                return res
+            logger.info(f"    ✅ hsgt: +{len(new_df)} records for {date}")
+            res.ok = True
+            res.n_rows = len(new_df)
+            res.latest_date = date
+            return res
         logger.info(f"    hsgt: no data for {date}")
         res.error = f"no data for {date}"
     except Exception as e:
@@ -326,11 +346,37 @@ def _aggregate_health(results: list[SubResult], today: str) -> dict:
     }
 
 
+def _prev_trading_day(today_str: str) -> str:
+    """Walk back from ``today_str`` to the prior trading day (Mon-Fri).
+
+    Tushare publishes margin_detail/limit_list_d/moneyflow_hsgt **T+1** —
+    on a given calendar day, the latest available trade_date is the
+    previous trading day. Without this shift, the 18:05 cron tried to
+    fetch ``today`` and got 0 rows every weekday, and the parquet
+    silently stopped updating after 2026-05-12. See
+    docs/regime_t_plus_1_silent_fail_20260616.md.
+
+    Holidays not honored here — Tushare returns 0 rows for non-trading
+    days and we fall back further; for now Mon-Fri is sufficient.
+    """
+    d = datetime.strptime(today_str, "%Y-%m-%d")
+    # Walk back at least 1 day
+    d = d - timedelta(days=1)
+    while d.weekday() >= 5:  # 5=Sat, 6=Sun
+        d = d - timedelta(days=1)
+    return d.strftime("%Y-%m-%d")
+
+
 def main():
     from scheduler.data_health import write_health, HealthStatus
 
     today = datetime.now().strftime("%Y-%m-%d")
-    logger.info(f"=== Daily Regime Data Update: {today} ===")
+    # 2026-06-16: critical ST sources are T+1 publish — fetch previous
+    # trading day, not today. Aggregate health latest_date still reflects
+    # the actual trade_date fetched (= previous trading day) so downstream
+    # freshness gates see the truth.
+    st_fetch_date = _prev_trading_day(today)
+    logger.info(f"=== Daily Regime Data Update: today={today} st_fetch_date={st_fetch_date} (T+1 lag) ===")
 
     results: list[SubResult] = []
 
@@ -348,11 +394,12 @@ def main():
         st = None
 
     if st is not None:
-        results.append(update_margin(st, today))
-        results.append(update_limit_list(st, today))
-        results.append(update_hsgt(st, today))
+        results.append(update_margin(st, st_fetch_date))
+        results.append(update_limit_list(st, st_fetch_date))
+        results.append(update_hsgt(st, st_fetch_date))
 
-    # AKShare data (no auth)
+    # AKShare data (no auth) — these stay on `today` semantics; AKShare
+    # futures + USDCNY are intraday and return today's quote.
     results.append(update_futures_akshare())
     results.append(update_usdcny_akshare())
 

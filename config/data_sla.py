@@ -117,8 +117,11 @@ SLA_BY_SOURCE: dict[str, SourceSLA] = {
         "Daily PE/PB/PS valuation parquet via baostock.",
     ),
     "st_daily_basic_update": SourceSLA(
-        "daily", 1,
-        "Daily ST_CLIENT daily_basic factors.",
+        "daily", 3,
+        "Daily ST_CLIENT daily_basic factors. These are mostly valuation / "
+        "market-cap / turnover fields and the endpoint has recurring sparse "
+        "publication gaps; allow a 3-trading-day budget while hard daily "
+        "price and moneyflow sources stay at 1.",
     ),
     "st_moneyflow_update": SourceSLA(
         "daily", 1,
@@ -158,6 +161,12 @@ SLA_BY_SOURCE: dict[str, SourceSLA] = {
         "daily", 2,
         "Daily global supply-chain factor build. Same 2-day budget so a "
         "single failed scrape does not immediately disable the overlay.",
+    ),
+    "global_chain_factors_llm": SourceSLA(
+        "daily", 2,
+        "Daily global supply-chain LLM factor build. Production "
+        "xgb_209_chain_llm consumes this source, so it must have its own "
+        "SLA rather than piggybacking on the rule-based factor health.",
     ),
     # ── PE-1 PBOC monetary policy chain (Phase E.1) ─────────────────
     "pbc_policy_texts": SourceSLA(

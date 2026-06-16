@@ -1645,7 +1645,13 @@ def publish_health(
     *,
     target_date: str,
     health_source: str = HEALTH_SOURCE_NAME,
+    sparse_steady: bool = False,
 ) -> None:
+    """``sparse_steady=True`` mirrors collect_policy_texts.publish_health —
+    when the upstream texts source is sparse-by-design (e.g. state_council
+    while gov.cn list URLs are broken), 0 extracted events is the steady
+    state and must not flip the SLA gate red. Added 2026-06-16.
+    """
     try:
         from scheduler.data_health import HealthStatus, write_health
     except Exception as e:  # pragma: no cover — broken install
@@ -1654,24 +1660,29 @@ def publish_health(
 
     n_total = int(summary.get("n_extracted", 0))
     n_failed = int(summary.get("n_failed", 0))
+    is_success = (n_total > 0) or sparse_steady
     status = HealthStatus(
-        success=n_total > 0,
+        success=is_success,
         n_items=n_total,
         latest_date=target_date,
         partial=(n_total > 0 and n_failed > 0),
-        error_type="" if n_total > 0 else "no_extracted",
+        error_type="" if is_success else "no_extracted",
         error_message=(
             "; ".join(
                 f"{e.get('stage')}:{e.get('url', '')}"
                 for e in summary.get("errors", [])[:3]
             )
-            if n_failed else ""
+            if n_failed else
+            "sparse_by_design: upstream texts sparse_steady"
+            if sparse_steady and n_total == 0
+            else ""
         ),
         network_profile="ashare",
         extra={
             "n_input": summary.get("n_input", 0),
             "n_failed": n_failed,
             "n_downgraded": summary.get("n_downgraded", 0),
+            "sparse_steady": sparse_steady,
         },
     )
     write_health(health_source, status, date=target_date)
@@ -1743,11 +1754,18 @@ def main(argv: list[str] | None = None) -> int:
     dates = _date_range(start, end)
     overall = {"n_input": 0, "n_extracted": 0, "n_failed": 0, "n_downgraded": 0}
     last_date = end
+    # 2026-06-16: state_council is sparse_steady (see collect_policy_texts);
+    # propagate that downstream so the extracted=0 case doesn't flip the
+    # SLA gate red. Other sources stay strict.
+    is_sparse_steady = args.source == "state_council"
     for d in dates:
         s = extract_fn(target_date=d)
         for k in overall:
             overall[k] += s.get(k, 0)
-        publish_health(s, target_date=d, health_source=health_source)
+        publish_health(
+            s, target_date=d, health_source=health_source,
+            sparse_steady=is_sparse_steady,
+        )
         last_date = d
 
     logger.info(

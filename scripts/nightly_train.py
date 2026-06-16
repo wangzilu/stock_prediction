@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = sys.executable
 QLIB_DATA_PROVIDER = os.environ.get("QLIB_DATA_PROVIDER", "auto")
-QLIB_UNIVERSE_SOURCE = os.environ.get("QLIB_UNIVERSE_SOURCE", "baostock")
+QLIB_UNIVERSE_SOURCE = os.environ.get("QLIB_UNIVERSE_SOURCE", "auto")
 LGB_INFERENCE_UNIVERSE = os.environ.get("LGB_INFERENCE_UNIVERSE", "all")
 LGB_MIN_DATA_INSTRUMENTS = os.environ.get("LGB_MIN_DATA_INSTRUMENTS", "4500")
 
