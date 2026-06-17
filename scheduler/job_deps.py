@@ -74,6 +74,12 @@ JOB_DEPS: dict[str, list[str]] = {
     "st_holder_number_update": [],
     "fundamental_update": [],
     "valuation_update": ["qlib_data_update"],
+    # 2026-06-17: ST_CLIENT bak_basic mega-pull — replaces baostock
+    # valuation + shareholder in steady state. Gates on qlib_data_update
+    # so the trade_date is fresh. While we soak (1-2 days), it runs in
+    # parallel to the baostock paths; downstream still gates on baostock
+    # through valuation_update / shareholder_update.
+    "st_bak_basic_update": ["qlib_data_update"],
     "quality_update": [],
     "shareholder_update": ["qlib_data_update"],
     "regime_daily_update": ["qlib_data_update"],

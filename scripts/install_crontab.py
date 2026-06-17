@@ -409,6 +409,22 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         # cx batch G P1 #3 (2026-06-07): enforce_deps wired up — these
         # all gate on qlib_data_update per scheduler/job_deps.py and
         # feed into feature_cache_rebuild downstream.
+        #
+        # 2026-06-17: st_bak_basic_update is the ST_CLIENT mega-pull that
+        # replaces baostock valuation + shareholder. Single ~6 second call
+        # gets PE/PB/total_share/float_share/EPS/BVPS/holder_num/rev_yoy/
+        # profit_yoy/gpr/npr for all ~5,500 stocks. Fires at 17:50 — right
+        # after qlib_data_update (17:45) and well before the slow baostock
+        # paths (18:00/18:02) which we keep in shadow until FeatureMerger
+        # migration is validated.
+        # Health-source name: st_bak_basic_update. Critical=True is NOT set
+        # while we soak — downstream still gates on the existing baostock
+        # paths.
+        CronJob("st_bak_basic_update", "50 17 * * 1-5",
+                [py, str(scripts / "fetch_st_bak_basic.py")],
+                "st_bak_basic_update.log",
+                network="domestic", timeout_sec=600,
+                enforce_deps=True, dep_wait_seconds=3600),
         CronJob("valuation_update", "0 18 * * 1-5",
                 [py, str(scripts / "fetch_fundamental_valuation.py"), "--days", "10", "--incremental"],
                 "valuation_update.log",
