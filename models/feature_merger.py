@@ -1460,6 +1460,12 @@ class FeatureMerger:
             # Freeze to the xgb_209 / B.9 validated schema. The upstream
             # ST parquet may grow extra numeric columns; those require a
             # separate ablation before joining production training.
+            # 2026-06-17: added st_div_yield. The factor list was previously
+            # missing the more-populated dividend yield field — st_dv_ratio
+            # is 5.7% covered (16,072 rows) while st_div_yield is 33.4%
+            # covered (93,924 rows) in the same parquet. Adding DP yield
+            # is one of the academic-first-class P0 factors (per the
+            # 2026-06-16 lobster factor roadmap §Tier 1).
             factor_cols = [
                 c for c in (
                     "st_pe_ttm",
@@ -1469,6 +1475,7 @@ class FeatureMerger:
                     "st_total_mv",
                     "st_circ_mv",
                     "st_dv_ratio",
+                    "st_div_yield",
                 )
                 if c in df.columns
             ]
