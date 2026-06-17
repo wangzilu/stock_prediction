@@ -787,6 +787,14 @@ class FeatureMerger:
             if pbc is not None:
                 frames.append(pbc)
 
+        # 2026-06-17: SUE / PEAD factor (forecast surprise). Built by
+        # scripts/build_sue_factor.py from forecast_vip + income historical.
+        # Quarterly cadence — PIT date is the income statement ann_date.
+        if allowed is None or "sue" in allowed:
+            sue = _run("sue", self._load_sue)
+            if sue is not None:
+                frames.append(sue)
+
         # cx C.P1 #2 (2026-06-07): XWLB (新闻联播) theme factors. The
         # underlying parquet is keyed by (datetime, THEME_<NAME>); per
         # C.P1 #3 it gets broadcast onto stock-keyed training samples
@@ -1014,6 +1022,40 @@ class FeatureMerger:
             index=index,
             columns=macro_cols,
         )
+
+    def _load_sue(self, index: pd.MultiIndex) -> pd.DataFrame:
+        """Load SUE / PEAD factor — forecast surprise vs realized earnings.
+
+        Quarterly cadence. PIT date is the income statement ann_date
+        (when the actual becomes public). _align_pit_stock_factors picks
+        ann_date over the synthetic asof_date alias we keep for human
+        readability in the parquet.
+        """
+        path = self.data_dir / "sue_factor_history.parquet"
+        if not path.exists():
+            return None
+        try:
+            df = pd.read_parquet(path)
+            if df.empty or "qlib_code" not in df.columns:
+                return None
+            # `_align_pit_stock_factors` looks for ann_date / f_ann_date /
+            # publish_date / disclosure_date. Our schema uses asof_date as
+            # the human-readable name; rename in-place so the PIT helper
+            # finds it without changing the parquet.
+            if "ann_date" not in df.columns and "asof_date" in df.columns:
+                df["ann_date"] = df["asof_date"]
+            factor_cols = [
+                c for c in ("sue_yoy", "sue_fcst", "fcst_surprise_pct")
+                if c in df.columns
+            ]
+            if not factor_cols:
+                return None
+            return self._align_pit_stock_factors(
+                df, index, factor_cols, prefix="sue", label="SUE",
+            )
+        except Exception as e:
+            logger.warning(f"SUE load failed: {e}")
+            return None
 
     def _load_shareholder(self, index: pd.MultiIndex) -> pd.DataFrame:
         """Load shareholder features."""

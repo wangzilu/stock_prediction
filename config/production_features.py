@@ -143,6 +143,27 @@ SUPPLEMENTARY_GROUPS_BY_PROFILE: dict[str, tuple[str, ...]] = {
         "st_holder_number",
         "global_chain_llm",
     ),
+    # xgb_209_chain_llm_sue — CANDIDATE profile, ablation gate against
+    # B.9 champion. xgb_209_chain_llm + SUE/PEAD factor group (3 cols:
+    # sue_yoy / sue_fcst / fcst_surprise_pct). Built from
+    # sue_factor_history.parquet via scripts/build_sue_factor.py
+    # (forecast_vip + income historical, 72,838 rows / 5,687 stocks /
+    # 30 quarters of overnight backfilled history). Quarterly cadence,
+    # PIT date = income statement ann_date. Promotion gated by 24-split
+    # LOO ΔRankIC + Sp20 verdict vs xgb_209_chain_llm — same Phase-B
+    # standard. Not in production until verdict lands.
+    "xgb_209_chain_llm_sue": (
+        "fundamental",
+        "macro_zero_baseline",
+        "valuation",
+        "northbound",
+        "quality",
+        "st_daily_basic",
+        "st_moneyflow",
+        "st_holder_number",
+        "global_chain_llm",
+        "sue",
+    ),
     # xgb_209_pbc — CANDIDATE profile for PE-1 PBOC liquidity input.
     # xgb_209 + 4 PBC liquidity cols (zscore_20d / easing_dummy /
     # tightening_dummy / short_rate_pressure). These are MARKET-level
@@ -426,6 +447,15 @@ PROFILE_EXPECTED_COUNTS: dict[str, dict[str, int]] = {
         "supplementary": 57,    # 51 base + 6 chain_llm
         "qlib_custom": 0,
         "total": 215,
+    },
+    # xgb_209_chain_llm_sue — chain_llm + 3 SUE/PEAD cols (sue_yoy /
+    # sue_fcst / fcst_surprise_pct). Cardinality 215 + 3 = 218.
+    # Ablation candidate against xgb_209_chain_llm B.9 champion.
+    "xgb_209_chain_llm_sue": {
+        "alpha158": 158,
+        "supplementary": 60,    # 51 base + 6 chain_llm + 3 sue
+        "qlib_custom": 0,
+        "total": 218,
     },
     # xgb_209_llm — xgb_209 + 12 LLM event factor cols. The L1
     # fact-count rebuild on 2026-06-06 21:25 grew the parquet from
