@@ -523,10 +523,15 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         # top-20 overlap. Design: docs/paper_trade_209_vs_242_design_20260616.md
         # (Option B). Higher timeout because it triggers a fresh inference
         # pass (~30s) on top of the per-snapshot Sp20 + qlib load (~10s).
+        # 2026-06-17: bumped 600 → 1800. C1 tracker runs TWO inference
+        # passes (209_chain_llm + xgb_242) plus snapshot + Sp20 compute.
+        # First cron run timed out at 600s on 06-17 — xgb_242 inference
+        # alone is ~4 min standalone, but under cron-contention it
+        # exceeded the budget. 1800s mirrors the smoke budget.
         CronJob("c1_209_vs_242_tracker", "39 18 * * 1-5",
                 [py, str(scripts / "track_c1_209_vs_242.py")],
                 "c1_209_vs_242.log",
-                network="none", timeout_sec=600,
+                network="none", timeout_sec=1800,
                 enforce_deps=True, dep_wait_seconds=10800),
         CronJob("shadow_optimizer", "40 18 * * 1-5",
                 [py, str(scripts / "run_shadow_optimizer.py")], "shadow_optimizer.log",
