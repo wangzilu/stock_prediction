@@ -853,13 +853,19 @@ class PaperOMS:
                 # cx round 5 P1-3: ALSO expose to the optimizer so the
                 # constraint contract holds at every layer, not just
                 # this filter.
-                risk_info["cannot_buy"] = set(risk.cannot_buy)
+                # 2026-06-17 bug fix: store as sorted list, not set —
+                # risk_info gets dumped to JSON via pending_orders write
+                # at oms.py:972 (paper_trading 06-17 cron crashed with
+                # "Object of type set is not JSON serializable").
+                # Downstream _generate_target_optimizer reads it back as
+                # set via line 315.
+                risk_info["cannot_buy"] = sorted(risk.cannot_buy)
 
             # cx round 5 P1-3: forward cannot_sell to the optimizer too,
             # so target weights respect the no-trade-today set instead
             # of silently diverging from actual fills.
             if risk.cannot_sell:
-                risk_info["cannot_sell"] = set(risk.cannot_sell)
+                risk_info["cannot_sell"] = sorted(risk.cannot_sell)
 
             # Surface reduce_weight for the optimizer downstream
             if risk.reduce_weight:
