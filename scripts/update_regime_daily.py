@@ -189,9 +189,32 @@ def update_hsgt(st, date: str) -> SubResult:
         items = _extract_items(result)
         if items:
             new_df = pd.DataFrame(items)
+            # 2026-06-17 bug: hsgt cols are mostly numeric ("hgt", "sgt", etc.)
+            # but ST returns them as numeric STRINGS ("169210.59"). The bare
+            # ``astype(str)`` kept them as str; pyarrow then refused concat
+            # with the existing float64 column. Smart cast: try numeric for
+            # genuinely-numeric value cols, keep str for explicit identifier
+            # cols (trade_date, ts_code, name) so dtype matches the existing
+            # parquet schema.
+            STR_KEYWORDS = ("date", "code", "name", "type", "category")
             for col in new_df.columns:
-                if new_df[col].dtype == object:
-                    new_df[col] = new_df[col].astype(str)
+                if new_df[col].dtype != object:
+                    continue
+                col_lower = col.lower()
+                if any(k in col_lower for k in STR_KEYWORDS):
+                    new_df[col] = new_df[col].map(
+                        lambda x: str(x) if pd.notna(x) else None
+                    )
+                    continue
+                numeric = pd.to_numeric(new_df[col], errors="coerce")
+                non_null = new_df[col].notna().sum()
+                parse_rate = numeric.notna().sum() / max(non_null, 1)
+                if parse_rate > 0.9:
+                    new_df[col] = numeric
+                else:
+                    new_df[col] = new_df[col].map(
+                        lambda x: str(x) if pd.notna(x) else None
+                    )
 
             path = DATA_DIR / "st_moneyflow_hsgt.parquet"
             if path.exists():
