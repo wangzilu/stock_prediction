@@ -1578,7 +1578,14 @@ def main(argv: list[str] | None = None) -> int:
     # 4 of 5 list URLs are commented out, the remaining state_council_doc
     # is SPA-rendered with no scrapeable static content. Treat 0 rows as
     # steady-state until the sousuo-API rewrite ships.
-    is_sparse_steady = args.source == "state_council"
+    # 2026-06-17: also mark NBS sparse_steady. NBS publishes monthly
+    # macro releases (CPI/PPI/PMI/retail sales around the 10th-15th).
+    # On non-release days the list pages have many candidate links but
+    # all are older than the 7-day publish-budget filter — 0 rows is
+    # the steady state. The 35-day SLA budget covers a full release
+    # cycle, but raw health was flipping to FAIL on quiet days which
+    # generated false alerts.
+    is_sparse_steady = args.source in ("state_council", "nbs")
     publish_health(
         summary, target_date=end, health_source=health_source,
         sparse_steady=is_sparse_steady,

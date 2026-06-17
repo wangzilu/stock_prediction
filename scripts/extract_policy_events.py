@@ -1757,7 +1757,10 @@ def main(argv: list[str] | None = None) -> int:
     # 2026-06-16: state_council is sparse_steady (see collect_policy_texts);
     # propagate that downstream so the extracted=0 case doesn't flip the
     # SLA gate red. Other sources stay strict.
-    is_sparse_steady = args.source == "state_council"
+    # 2026-06-17: NBS also sparse_steady — monthly release cycle, on
+    # quiet days input texts are 0 → 0 events extracted → was flipping
+    # health to FAIL even though the SLA gate's 35-day budget covers it.
+    is_sparse_steady = args.source in ("state_council", "nbs")
     for d in dates:
         s = extract_fn(target_date=d)
         for k in overall:
