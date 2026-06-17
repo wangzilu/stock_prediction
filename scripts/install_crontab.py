@@ -645,6 +645,15 @@ def managed_jobs(python_bin: str = DEFAULT_PYTHON, project_root: Path = PROJECT_
         CronJob("weekly_regime_data", "20 3 * * 6",
                 [py, str(scripts / "fetch_fund_holdings.py"), "--macro", "--regime"], "regime_data.log",
                 network="domestic", timeout_sec=3600),
+        # 2026-06-17: SUE / PEAD factor rebuilt weekly. The inputs
+        # (st_forecast_vip_historical + st_income_historical) only
+        # update at earnings-season cadence (1 quarter), so daily would
+        # waste compute. Sat 03:30 puts it after weekly_regime_data and
+        # well before the Mon morning_recommendation. Pure compute
+        # (no network), cheap.
+        CronJob("sue_factor_rebuild", "30 3 * * 6",
+                [py, str(scripts / "build_sue_factor.py")], "sue_factor.log",
+                network="none", timeout_sec=600),
     ]
     return jobs
 
